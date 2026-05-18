@@ -17,9 +17,37 @@ spec:
       command: ["sh", "-c"]
       args:
         - |
-          echo "CXI devices visible:"; ls -la /dev/cxi* || echo "none";
-          echo "sysfs mount:"; ls /run/cxi/ || echo "none";
+          echo "=== CXI devices ==="
+          ls -la /dev/cxi* || echo "none"
+          echo "=== CXI service files (from NRI plugin) ==="
+          ls -la /run/cxi/ || echo "none"
+          cat /run/cxi/cxi0-service.yaml 2>/dev/null || echo "no service file for cxi0"
+          echo "=== libfabric providers ==="
+          fi_info --provider cxi 2>&1 || echo "fi_info not found or no CXI provider"
           sleep 3600
       resources:
         claims:
           - name: cxi
+      env:
+        - name: LD_LIBRARY_PATH      
+          value: "/usr/lib64/:/extras/lib/:/hostlibs"
+        - name: CXIP_DEFAULT_LINK
+          value: "1"
+        - name: CXIP_DEFAULT_SPEED
+          value: "200000"
+        - name: CXIP_SKIP_AMA_CHECK
+          value: "1"
+      volumeMounts:
+        - name: libcxi
+          mountPath: /hostlibs
+        - name: build
+          mountPath: /extras
+  volumes:
+    - name: libcxi
+      hostPath:
+        path: /usr/lib64/
+        type: Directory
+    - name: build
+      hostPath:
+        path: /home/brics/jwatson.brics/k8s-on-compute/shs-libfabric/build-output
+        type: Directory

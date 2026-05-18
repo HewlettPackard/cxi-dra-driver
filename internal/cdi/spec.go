@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"syscall"
 
 	specs "tags.cncf.io/container-device-interface/specs-go"
 
@@ -20,8 +21,10 @@ func DeviceID(driverName, devName string) string {
 }
 
 // WriteSpec generates a CDI spec for dev and writes it under cdiRoot.
-// The spec mounts /dev/cxiN (character device) and the device's sysfs subtree
-// into the container so libfabric can discover the HSN path.
+// DeviceNodes tells containerd to add the device to the container's cgroup
+// BPF allowlist at container creation time (before the process starts), which
+// is necessary for unprivileged containers to open /dev/cxiN. The sysfs
+// bind-mount lets libfabric discover the HSN path.
 func WriteSpec(cdiRoot, driverName string, dev *cxi.Device) error {
 	if err := os.MkdirAll(cdiRoot, 0o755); err != nil {
 		return err
@@ -33,6 +36,16 @@ func WriteSpec(cdiRoot, driverName string, dev *cxi.Device) error {
 	}
 	containerSysfsPath := "/run/cxi/" + dev.Name
 
+	// Stat the device on the host to get its major/minor numbers.
+	// These are needed for the CDI DeviceNode entry so containerd can add the
+	// correct cgroup BPF allowance rule.
+	var st syscall.Stat_t
+	if err := syscall.Stat(hostDevPath, &st); err != nil {
+		return fmt.Errorf("stat %s: %w", hostDevPath, err)
+	}
+	major := int64((uint64(st.Rdev) >> 8) & 0xfff)
+	minor := int64((uint64(st.Rdev) & 0xff) | ((uint64(st.Rdev) >> 12) & 0xfff00))
+
 	spec := &specs.Spec{
 		Version: cdiVersion,
 		Kind:    driverName + "/cxi",
@@ -40,12 +53,20 @@ func WriteSpec(cdiRoot, driverName string, dev *cxi.Device) error {
 			{
 				Name: dev.Name,
 				ContainerEdits: specs.ContainerEdits{
-					Mounts: []*specs.Mount{
+					// DeviceNodes causes containerd to create the device node in
+					// the container and add a cgroup BPF allowance for it — both
+					// happen before the container process starts.
+					DeviceNodes: []*specs.DeviceNode{
 						{
-							HostPath:      hostDevPath,
-							ContainerPath: dev.DevPath,
-							Options:       []string{"bind", "rw"},
+							Path:        dev.DevPath,
+							HostPath:    hostDevPath,
+							Type:        "c",
+							Major:       major,
+							Minor:       minor,
+							Permissions: "rwm",
 						},
+					},
+					Mounts: []*specs.Mount{
 						{
 							HostPath:      dev.SysfsPath,
 							ContainerPath: containerSysfsPath,
