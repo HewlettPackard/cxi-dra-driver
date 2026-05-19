@@ -78,6 +78,13 @@ sed \
   "${SCRIPT_DIR}/daemonset-mock.yaml" \
   | kubectl apply -f -
 
+echo "==> Creating mock device files on worker node"
+WORKER_NODE=$(kubectl get nodes --selector='feature.node.kubernetes.io/cxi=true' -o jsonpath='{.items[0].metadata.name}')
+"${CONTAINER_CLI}" exec "${WORKER_NODE}" mkdir -p /tmp/mock-cxi
+for i in $(seq 0 $((MOCK_DEVICES - 1))); do
+  "${CONTAINER_CLI}" exec "${WORKER_NODE}" touch /tmp/mock-cxi/cxi${i}
+done
+
 echo "==> Waiting for DaemonSet to be ready"
 kubectl -n kube-system rollout status daemonset/cxi-dra-driver --timeout=90s
 
