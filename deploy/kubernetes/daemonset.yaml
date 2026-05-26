@@ -27,7 +27,7 @@ spec:
 
       containers:
         - name: driver
-          image: ghcr.io/jakewatson-bristol/cxi-dra:main
+          image: docker.io/pirese/cxi-dra-driver:latest
           imagePullPolicy: Always
           command:
             - /cxi-dra-driver
@@ -60,6 +60,11 @@ spec:
               mountPath: /var/lib/kubelet/plugins_registry
             - name: cdi
               mountPath: /var/run/cdi
+            - name: nri
+              mountPath: /var/run/nri
+            - name: netns
+              mountPath: /var/run/netns
+              readOnly: true
 
       volumes:
         - name: sys
@@ -78,4 +83,12 @@ spec:
         - name: cdi
           hostPath:
             path: /var/run/cdi
+            type: DirectoryOrCreate
+        - name: nri
+          hostPath:
+            path: /var/run/nri
+            type: DirectoryOrCreate
+        - name: netns
+          hostPath:
+            path: /var/run/netns
             type: DirectoryOrCreate

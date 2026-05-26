@@ -20,6 +20,7 @@ func MockDevices(n int) []*Device {
 			NUMANode:    i % 2,
 			PCIeRoot:    fmt.Sprintf("0000:%02x:00.0", 0x81+i),
 			HSNIface:    fmt.Sprintf("hsn%d", i*2),
+			Capacity:    DefaultResourceSet(),
 		}
 	}
 	return devices

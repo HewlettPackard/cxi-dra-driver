@@ -23,12 +23,16 @@ type Driver struct {
 	kubeClient   kubernetes.Interface
 	mockDevices  []*cxi.Device
 	devices      []*cxi.Device
+	store        *AllocationStore
+	vniAllocator VNIAllocator
+	tracker      *ResourceTracker
 }
 
 func New(
 	nodeName, podUID, driverName, cdiRoot, pluginDir, registrarDir string,
 	kubeClient kubernetes.Interface,
 	mockDevices []*cxi.Device,
+	vniAllocator VNIAllocator,
 ) *Driver {
 	return &Driver{
 		nodeName:     nodeName,
@@ -39,7 +43,15 @@ func New(
 		registrarDir: registrarDir,
 		kubeClient:   kubeClient,
 		mockDevices:  mockDevices,
+		store:        NewAllocationStore(),
+		vniAllocator: vniAllocator,
+		// tracker is initialised in Run() once devices are discovered.
 	}
+}
+
+// Store returns the allocation store, so it can be passed to the NRI plugin.
+func (d *Driver) Store() *AllocationStore {
+	return d.store
 }
 
 // Run discovers devices, writes CDI specs, starts the kubelet plugin, and
@@ -60,6 +72,11 @@ func (d *Driver) Run(ctx context.Context) error {
 			return fmt.Errorf("writing CDI spec for %s: %w", dev.Name, err)
 		}
 	}
+
+	// Initialise resource tracker now that devices are known.
+	// TODO: reconcile with live cxil_get_svc_list once CGo/libcxi is available,
+	// so reservations from services that survived a driver restart are accounted for.
+	d.tracker = NewResourceTracker(d.devices)
 
 	opts := []kubeletplugin.Option{
 		kubeletplugin.KubeClient(d.kubeClient),

@@ -18,9 +18,12 @@ nodes:
           kubeletExtraArgs:
             feature-gates: "DynamicResourceAllocation=true"
 
-# Enable CDI in containerd on all nodes.
+# Enable CDI and NRI in containerd on all nodes.
 containerdConfigPatches:
   - |-
     [plugins."io.containerd.grpc.v1.cri"]
       enable_cdi = true
       cdi_spec_dirs = ["/var/run/cdi"]
+    [plugins."io.containerd.nri.v1.nri"]
+      disable = false
+      socket_path = "/var/run/nri/nri.sock"

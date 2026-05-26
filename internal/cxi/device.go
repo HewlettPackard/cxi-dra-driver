@@ -20,6 +20,13 @@ type Device struct {
 	NUMANode    int    // NUMA node affinity (-1 if unknown)
 	PCIeRoot    string // PCI slot name, e.g. "0000:81:00.0"
 	HSNIface    string // paired HSN interface, e.g. "hsn2" (set by PairDevice)
+
+	// Capacity holds the total hardware resource limits for this device.
+	// On real hardware these are read from the device via libcxi at discovery
+	// time. In mock mode DefaultResourceSet() is used.
+	//
+	// TODO: populate Max values from cxil_devinfo when CGo/libcxi is available.
+	Capacity ResourceSet
 }
 
 // Discover walks /sys/class/cxi_user and returns one Device per cxi* entry.
@@ -52,6 +59,9 @@ func Discover() ([]*Device, error) {
 			SysfsPath: sysfsPath,
 			NUMANode:  readIntFile(filepath.Join(sysfsPath, "device", "numa_node"), -1),
 			PCIeRoot:  readPCISlot(filepath.Join(sysfsPath, "device", "uevent")),
+			// TODO: read real capacity from cxil_devinfo once CGo/libcxi is available.
+			// For now use defaults so the ResourceSlice and ResourceTracker are populated.
+			Capacity: DeviceCapacity(),
 		}
 
 		if err := PairDevice(dev); err != nil {

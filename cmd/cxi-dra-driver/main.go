@@ -15,6 +15,7 @@ import (
 
 	"github.com/slingshot/cxi-dra-driver/internal/cxi"
 	"github.com/slingshot/cxi-dra-driver/internal/driver"
+	"github.com/slingshot/cxi-dra-driver/internal/nri"
 )
 
 const defaultDriverName = "cxi.slingshot.hpe.com"
@@ -43,10 +44,11 @@ func main() {
 		os.Exit(1)
 	}
 
-	var mock []*cxi.Device
-	if *mockDevices > 0 {
-		mock = cxi.MockDevices(*mockDevices)
-		for _, dev := range mock {
+	mock := *mockDevices > 0
+	var mockDevList []*cxi.Device
+	if mock {
+		mockDevList = cxi.MockDevices(*mockDevices)
+		for _, dev := range mockDevList {
 			if err := os.MkdirAll(dev.SysfsPath, 0o755); err != nil {
 				fmt.Fprintf(os.Stderr, "error: creating mock sysfs dir %s: %v\n", dev.SysfsPath, err)
 				os.Exit(1)
@@ -57,9 +59,32 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	d := driver.New(*nodeName, *podUID, *driverName, *cdiRoot, *pluginDir, *registrarDir, kubeClient, mock)
+	d := driver.New(*nodeName, *podUID, *driverName, *cdiRoot, *pluginDir, *registrarDir, kubeClient, mockDevList,
+		// TODO: replace StaticVNIAllocator with a real cluster-wide VNI pool
+		// allocator once the VNI ResourceSlice phase is implemented.
+		&driver.StaticVNIAllocator{VNI: 1},
+	)
+
+	nriPlugin, err := nri.New(d.Store(), mock)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: failed to create NRI plugin: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Run the NRI plugin concurrently with the DRA driver. If either exits,
+	// the signal context will eventually cancel the other.
+	nriErrCh := make(chan error, 1)
+	go func() {
+		nriErrCh <- nriPlugin.Run(ctx)
+	}()
+
 	if err := d.Run(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "error: driver exited: %v\n", err)
+		os.Exit(1)
+	}
+
+	if err := <-nriErrCh; err != nil {
+		fmt.Fprintf(os.Stderr, "error: NRI plugin exited: %v\n", err)
 		os.Exit(1)
 	}
 }
