@@ -5,9 +5,9 @@ package cxi
 // file-writing implementation.
 type ServiceManager interface {
 	// CreateService creates a CXI service on deviceName scoped to the network
-	// namespace identified by netnsInode, using the given VNI.
-	// It returns the allocated service ID (svc_id) on success.
-	CreateService(deviceName string, netnsInode uint64, vni int) (int, error)
+	// namespace identified by netnsInode, using the given VNI and resource
+	// limits. It returns the allocated service ID (svc_id) on success.
+	CreateService(deviceName string, netnsInode uint64, vni int, resources ResourceSet) (int, error)
 
 	// DeleteService destroys the CXI service on deviceName associated with
 	// netnsInode. It locates the service by scanning the live service list for

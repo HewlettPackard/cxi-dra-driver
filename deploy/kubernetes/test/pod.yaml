@@ -9,7 +9,7 @@ spec:
   # Each pod gets its own ephemeral claim from the template.
   resourceClaims:
     - name: cxi
-      resourceClaimTemplateName: cxi-claim-template
+      resourceClaimTemplateName: cxi-quarter
 
   containers:
     - name: workload

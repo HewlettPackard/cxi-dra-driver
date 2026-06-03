@@ -19,7 +19,8 @@ func (d *Driver) UnprepareResourceClaims(
 		// Release resource reservations and store entries for every pod that
 		// held this claim.
 		for _, podUID := range d.store.PodUIDsForClaim(claim.UID) {
-			d.tracker.Release(podUID)
+			// TODO: tracker.Release when tracker is reconciled against live
+			// cxil_get_svc_list on driver restart.
 			d.vniAllocator.Release(podUID)
 			d.store.Delete(podUID)
 		}

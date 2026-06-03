@@ -1,104 +1,132 @@
 package cxi
 
-// ResourceLimits holds the maximum and reserved counts for a single CXI
-// hardware resource type on one device.
-type ResourceLimits struct {
-	Max int64
-	Res int64
-}
+import "fmt"
 
-// ResourceSet describes the full set of allocatable hardware resources on a
-// single CXI device. Field names match the cxi_svc_desc resource names used
-// by libcxi and the cxi_service CLI.
+// TLEPoolSize is the hardware allocation granularity for Trigger List Entries.
+// TLEs are allocated in pools of this size — reserving even 1 TLE consumes a
+// full pool. Defined once here; parameterise if future hardware versions differ.
+const TLEPoolSize = 512
+
+// LEPoolSize is the hardware allocation granularity for List Entries.
+// LEs are allocated in pools of this size — reserving even 1 LE consumes a
+// full pool. Defined once here; parameterise if future hardware versions differ.
+const LEPoolSize = 1024
+
+// ResourceSet describes a set of CXI hardware resources. It is used in three
+// contexts:
 //
-// On real hardware these values are read from the device at discovery time.
-// In mock mode, DefaultResourceSet() provides sensible defaults derived from
-// the Slurm HPE Slingshot switch plugin (switch_hpe_slingshot.h).
+//  1. Hardware total — the raw device maxima from cxil_devinfo.
+//  2. User request — the resources a pod is asking for (from claim config or
+//     driver defaults). TLEs and LEs are expressed as pool counts, converted
+//     to absolute values before service creation.
+//  3. Available — hardware total minus sum of reserved across all live services,
+//     with LE/TLE rounded up to pool boundaries.
+//
+// Field names match the cxi_svc_desc resource names used by libcxi and the
+// cxi_service CLI.
 type ResourceSet struct {
-	TXQs ResourceLimits // Transmit Queues
-	TGQs ResourceLimits // Target (Get) Queues
-	EQs  ResourceLimits // Event Queues
-	CTs  ResourceLimits // Counting Triggers
-	TLEs ResourceLimits // Trigger List Entries
-	PTEs ResourceLimits // Portal Table Entries
-	LEs  ResourceLimits // List Entries
-	ACs  ResourceLimits // Address Contexts
+	TXQs int64 // Transmit Queues
+	TGQs int64 // Target (Get) Queues
+	EQs  int64 // Event Queues
+	CTs  int64 // Counting Triggers
+	TLEs int64 // Trigger List Entries (absolute value; pool-rounded externally)
+	PTEs int64 // Portal Table Entries
+	LEs  int64 // List Entries (absolute value; pool-rounded externally)
+	ACs  int64 // Address Contexts
 }
 
-// DefaultResourceSet returns the per-service resource reservation for a single
-// CXI service. Only the Res fields are meaningful here — they represent how
-// much of each resource type one service consumes. The Max fields are left zero
-// because this is a request, not a capacity descriptor.
-//
-// Values are taken from the Slurm HPE Slingshot switch plugin
-// (src/plugins/switch/hpe_slingshot/switch_hpe_slingshot.h) and match the
-// caps-tum CNI reference implementation.
-func DefaultResourceSet() ResourceSet {
+// DeviceCapacity returns the total hardware resource limits for a CXI device.
+// Used in non-cxi builds (CI, mock mode). Production builds read real values
+// from cxil_devinfo — see capacity_cgo.go.
+func DeviceCapacity() ResourceSet {
 	return ResourceSet{
-		TXQs: ResourceLimits{Res: 2},
-		TGQs: ResourceLimits{Res: 1},
-		EQs:  ResourceLimits{Res: 2},
-		CTs:  ResourceLimits{Res: 1},
-		TLEs: ResourceLimits{Res: 1},
-		PTEs: ResourceLimits{Res: 6},
-		LEs:  ResourceLimits{Res: 1},
-		ACs:  ResourceLimits{Res: 4},
+		TXQs: 1024,
+		TGQs: 512,
+		EQs:  2047,
+		CTs:  2047,
+		TLEs: 2048,
+		PTEs: 2048,
+		LEs:  16384,
+		ACs:  1022,
 	}
 }
 
-// Add returns a new ResourceSet with the Res fields summed. Used by the
-// ResourceTracker to accumulate reserved resources across active services.
-func (r ResourceSet) Add(other ResourceSet) ResourceSet {
-	return ResourceSet{
-		TXQs: ResourceLimits{Max: r.TXQs.Max, Res: r.TXQs.Res + other.TXQs.Res},
-		TGQs: ResourceLimits{Max: r.TGQs.Max, Res: r.TGQs.Res + other.TGQs.Res},
-		EQs:  ResourceLimits{Max: r.EQs.Max, Res: r.EQs.Res + other.EQs.Res},
-		CTs:  ResourceLimits{Max: r.CTs.Max, Res: r.CTs.Res + other.CTs.Res},
-		TLEs: ResourceLimits{Max: r.TLEs.Max, Res: r.TLEs.Res + other.TLEs.Res},
-		PTEs: ResourceLimits{Max: r.PTEs.Max, Res: r.PTEs.Res + other.PTEs.Res},
-		LEs:  ResourceLimits{Max: r.LEs.Max, Res: r.LEs.Res + other.LEs.Res},
-		ACs:  ResourceLimits{Max: r.ACs.Max, Res: r.ACs.Res + other.ACs.Res},
-	}
+// PoolsToLEs converts a pool count to an absolute LE count.
+func PoolsToLEs(pools int64) int64 {
+	return pools * LEPoolSize
 }
 
-// Sub returns a new ResourceSet with the Res fields decremented. Used by the
-// ResourceTracker when a service is released.
+// PoolsToTLEs converts a pool count to an absolute TLE count.
+func PoolsToTLEs(pools int64) int64 {
+	return pools * TLEPoolSize
+}
+
+// RoundUpToLEPool rounds an absolute LE count up to the nearest pool boundary.
+// Used when computing available capacity from live reserved totals.
+func RoundUpToLEPool(les int64) int64 {
+	if les == 0 {
+		return 0
+	}
+	return ((les + LEPoolSize - 1) / LEPoolSize) * LEPoolSize
+}
+
+// RoundUpToTLEPool rounds an absolute TLE count up to the nearest pool boundary.
+func RoundUpToTLEPool(tles int64) int64 {
+	if tles == 0 {
+		return 0
+	}
+	return ((tles + TLEPoolSize - 1) / TLEPoolSize) * TLEPoolSize
+}
+
+// Fits returns true if r (a request) fits within available. For LEs and TLEs
+// the check is against pool-rounded values — the caller is responsible for
+// passing an available ResourceSet with LEs/TLEs already rounded up to pool
+// boundaries (i.e. the true consumed pool space).
+func (r ResourceSet) Fits(available ResourceSet) bool {
+	return r.TXQs <= available.TXQs &&
+		r.TGQs <= available.TGQs &&
+		r.EQs <= available.EQs &&
+		r.CTs <= available.CTs &&
+		r.TLEs <= available.TLEs &&
+		r.PTEs <= available.PTEs &&
+		r.LEs <= available.LEs &&
+		r.ACs <= available.ACs
+}
+
+// Sub returns available minus reserved — used to compute remaining capacity
+// after summing all live service reservations.
 func (r ResourceSet) Sub(other ResourceSet) ResourceSet {
 	return ResourceSet{
-		TXQs: ResourceLimits{Max: r.TXQs.Max, Res: r.TXQs.Res - other.TXQs.Res},
-		TGQs: ResourceLimits{Max: r.TGQs.Max, Res: r.TGQs.Res - other.TGQs.Res},
-		EQs:  ResourceLimits{Max: r.EQs.Max, Res: r.EQs.Res - other.EQs.Res},
-		CTs:  ResourceLimits{Max: r.CTs.Max, Res: r.CTs.Res - other.CTs.Res},
-		TLEs: ResourceLimits{Max: r.TLEs.Max, Res: r.TLEs.Res - other.TLEs.Res},
-		PTEs: ResourceLimits{Max: r.PTEs.Max, Res: r.PTEs.Res - other.PTEs.Res},
-		LEs:  ResourceLimits{Max: r.LEs.Max, Res: r.LEs.Res - other.LEs.Res},
-		ACs:  ResourceLimits{Max: r.ACs.Max, Res: r.ACs.Res - other.ACs.Res},
+		TXQs: r.TXQs - other.TXQs,
+		TGQs: r.TGQs - other.TGQs,
+		EQs:  r.EQs - other.EQs,
+		CTs:  r.CTs - other.CTs,
+		TLEs: r.TLEs - other.TLEs,
+		PTEs: r.PTEs - other.PTEs,
+		LEs:  r.LEs - other.LEs,
+		ACs:  r.ACs - other.ACs,
 	}
 }
 
-// Fits returns true if adding other's Res values would not exceed this
-// ResourceSet's Max values. Used to check admission before creating a service.
-func (r ResourceSet) Fits(other ResourceSet) bool {
-	return r.TXQs.Res+other.TXQs.Res <= r.TXQs.Max &&
-		r.TGQs.Res+other.TGQs.Res <= r.TGQs.Max &&
-		r.EQs.Res+other.EQs.Res <= r.EQs.Max &&
-		r.CTs.Res+other.CTs.Res <= r.CTs.Max &&
-		r.TLEs.Res+other.TLEs.Res <= r.TLEs.Max &&
-		r.PTEs.Res+other.PTEs.Res <= r.PTEs.Max &&
-		r.LEs.Res+other.LEs.Res <= r.LEs.Max &&
-		r.ACs.Res+other.ACs.Res <= r.ACs.Max
+// Add returns the sum of two ResourceSets — used to accumulate reserved totals
+// across all live services.
+func (r ResourceSet) Add(other ResourceSet) ResourceSet {
+	return ResourceSet{
+		TXQs: r.TXQs + other.TXQs,
+		TGQs: r.TGQs + other.TGQs,
+		EQs:  r.EQs + other.EQs,
+		CTs:  r.CTs + other.CTs,
+		TLEs: r.TLEs + other.TLEs,
+		PTEs: r.PTEs + other.PTEs,
+		LEs:  r.LEs + other.LEs,
+		ACs:  r.ACs + other.ACs,
+	}
 }
-// DeviceCapacity returns the total hardware resource limits for a CXI device
-// when real values cannot be read from hardware.
-func DeviceCapacity() ResourceSet {
-return ResourceSet{
-TXQs: ResourceLimits{Max: 1024},
-TGQs: ResourceLimits{Max: 512},
-EQs:  ResourceLimits{Max: 2047},
-CTs:  ResourceLimits{Max: 2047},
-TLEs: ResourceLimits{Max: 2048},
-PTEs: ResourceLimits{Max: 2048},
-LEs:  ResourceLimits{Max: 16384},
-ACs:  ResourceLimits{Max: 1022},
-}
+
+// String returns a compact human-readable representation, useful for logging.
+func (r ResourceSet) String() string {
+	return fmt.Sprintf(
+		"txqs=%d tgqs=%d eqs=%d cts=%d ptes=%d les=%d tles=%d acs=%d",
+		r.TXQs, r.TGQs, r.EQs, r.CTs, r.PTEs, r.LEs, r.TLEs, r.ACs,
+	)
 }

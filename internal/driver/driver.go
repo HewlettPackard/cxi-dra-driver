@@ -3,6 +3,7 @@ package driver
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
@@ -14,18 +15,27 @@ import (
 
 // Driver implements kubeletplugin.DRAPlugin for CXI devices.
 type Driver struct {
-	nodeName     string
-	podUID       string
-	driverName   string
-	cdiRoot      string
-	pluginDir    string
-	registrarDir string
-	kubeClient   kubernetes.Interface
-	mockDevices  []*cxi.Device
-	devices      []*cxi.Device
-	store        *AllocationStore
-	vniAllocator VNIAllocator
-	tracker      *ResourceTracker
+	nodeName        string
+	podUID          string
+	driverName      string
+	cdiRoot         string
+	pluginDir       string
+	registrarDir    string
+	kubeClient      kubernetes.Interface
+	mockDevices     []*cxi.Device
+	devices         []*cxi.Device
+	store           *AllocationStore
+	vniAllocator    VNIAllocator
+	overhead        cxi.ResourceSet // admin-configured per-device reserved overhead
+	defaults        cxi.ResourceSet // default resources when claim has no config
+	refreshInterval time.Duration   // how often to republish ResourceSlice with fresh avail attrs
+}
+
+// Config holds admin-configured driver parameters passed from flags.
+type Config struct {
+	Overhead        cxi.ResourceSet
+	Defaults        cxi.ResourceSet
+	RefreshInterval time.Duration
 }
 
 func New(
@@ -33,19 +43,22 @@ func New(
 	kubeClient kubernetes.Interface,
 	mockDevices []*cxi.Device,
 	vniAllocator VNIAllocator,
+	cfg Config,
 ) *Driver {
 	return &Driver{
-		nodeName:     nodeName,
-		podUID:       podUID,
-		driverName:   driverName,
-		cdiRoot:      cdiRoot,
-		pluginDir:    pluginDir,
-		registrarDir: registrarDir,
-		kubeClient:   kubeClient,
-		mockDevices:  mockDevices,
-		store:        NewAllocationStore(),
-		vniAllocator: vniAllocator,
-		// tracker is initialised in Run() once devices are discovered.
+		nodeName:        nodeName,
+		podUID:          podUID,
+		driverName:      driverName,
+		cdiRoot:         cdiRoot,
+		pluginDir:       pluginDir,
+		registrarDir:    registrarDir,
+		kubeClient:      kubeClient,
+		mockDevices:     mockDevices,
+		store:           NewAllocationStore(),
+		vniAllocator:    vniAllocator,
+		overhead:        cfg.Overhead,
+		defaults:        cfg.Defaults,
+		refreshInterval: cfg.RefreshInterval,
 	}
 }
 
@@ -54,8 +67,14 @@ func (d *Driver) Store() *AllocationStore {
 	return d.store
 }
 
+// logf prints a formatted driver log line to stdout.
+func (d *Driver) logf(format string, args ...any) {
+	fmt.Printf("cxi-dra-driver: "+format+"\n", args...)
+}
+
 // Run discovers devices, writes CDI specs, starts the kubelet plugin, and
-// publishes a ResourceSlice. Blocks until ctx is cancelled.
+// publishes a ResourceSlice. Refreshes available-capacity attributes on the
+// configured interval. Blocks until ctx is cancelled.
 func (d *Driver) Run(ctx context.Context) error {
 	if d.mockDevices != nil {
 		d.devices = d.mockDevices
@@ -73,11 +92,6 @@ func (d *Driver) Run(ctx context.Context) error {
 		}
 	}
 
-	// Initialise resource tracker now that devices are known.
-	// TODO: reconcile with live cxil_get_svc_list once CGo/libcxi is available,
-	// so reservations from services that survived a driver restart are accounted for.
-	d.tracker = NewResourceTracker(d.devices)
-
 	opts := []kubeletplugin.Option{
 		kubeletplugin.KubeClient(d.kubeClient),
 		kubeletplugin.NodeName(d.nodeName),
@@ -94,16 +108,31 @@ func (d *Driver) Run(ctx context.Context) error {
 	}
 	defer helper.Stop()
 
-	if err := helper.PublishResources(ctx, d.buildDriverResources()); err != nil {
+	publish := func() error {
+		return helper.PublishResources(ctx, d.buildDriverResources())
+	}
+
+	if err := publish(); err != nil {
 		return fmt.Errorf("publishing resources: %w", err)
 	}
 
-	<-ctx.Done()
-	return nil
+	// Periodically republish with refreshed available-capacity attributes.
+	ticker := time.NewTicker(d.refreshInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+			if err := publish(); err != nil {
+				d.logf("warning: refreshing resource slice: %v", err)
+			}
+		}
+	}
 }
 
 // HandleError is called by the kubelet plugin helper for background errors
 // (e.g. ResourceSlice controller failures).
 func (d *Driver) HandleError(_ context.Context, err error, msg string) {
-	fmt.Printf("cxi-dra-driver background error: %s: %v\n", msg, err)
+	d.logf("background error: %s: %v", msg, err)
 }

@@ -6,7 +6,7 @@ import (
 type MockServiceManager struct{}
 var _ ServiceManager = MockServiceManager{}
 const mockServiceDir = "/tmp/cxi-services"
-func (MockServiceManager) CreateService(deviceName string, netnsInode uint64, vni int) (int, error) {
+func (MockServiceManager) CreateService(deviceName string, netnsInode uint64, vni int, resources ResourceSet) (int, error) {
 	if err := os.MkdirAll(mockServiceDir, 0o755); err != nil {
 		return 0, fmt.Errorf("creating mock service dir: %w", err)
 	}
@@ -19,35 +19,45 @@ restricted_tcs: 0
 exclusive_cp: 0
 limits:
   - name: ACs
-    max: 1022
-    res: 4
+    max: %d
+    res: %d
   - name: CTs
-    max: 2047
-    res: 1
+    max: %d
+    res: %d
   - name: EQs
-    max: 2047
-    res: 2
+    max: %d
+    res: %d
   - name: LEs
-    max: 16384
-    res: 1
+    max: %d
+    res: %d
   - name: PTEs
-    max: 2048
-    res: 6
+    max: %d
+    res: %d
   - name: TGQs
-    max: 512
-    res: 1
+    max: %d
+    res: %d
   - name: TXQs
-    max: 1024
-    res: 2
+    max: %d
+    res: %d
   - name: TLEs
-    max: 2048
-    res: 1
+    max: %d
+    res: %d
 vnis:
   vni: %d
 members:
   - type: netns
     id: %d
-`, deviceName, vni, netnsInode)
+`,
+		deviceName,
+		resources.ACs, resources.ACs,
+		resources.CTs, resources.CTs,
+		resources.EQs, resources.EQs,
+		resources.LEs, resources.LEs,
+		resources.PTEs, resources.PTEs,
+		resources.TGQs, resources.TGQs,
+		resources.TXQs, resources.TXQs,
+		resources.TLEs, resources.TLEs,
+		vni, netnsInode)
 	path := MockServicePath(deviceName, netnsInode)
 	if err := os.WriteFile(path, []byte(yaml), 0o644); err != nil {
 		return 0, fmt.Errorf("writing mock service file %s: %w", path, err)

@@ -100,7 +100,7 @@ func (p *Plugin) RunPodSandbox(_ context.Context, pod *api.PodSandbox) error {
 	for _, alloc := range allocs {
 		fmt.Printf("cxi-nri: creating CXI service: pod=%s device=%s hsn=%s netns=%s inode=%d vni=%d\n",
 			podUID, alloc.DeviceName, alloc.HSNIface, netnsPath, inode, alloc.VNI)
-		svcID, err := p.svcMgr.CreateService(alloc.DeviceName, inode, alloc.VNI)
+		svcID, err := p.svcMgr.CreateService(alloc.DeviceName, inode, alloc.VNI, alloc.Resources)
 		if err != nil {
 			return fmt.Errorf("creating CXI service for %s: %w", alloc.DeviceName, err)
 		}
