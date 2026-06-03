@@ -1,10 +1,14 @@
 package cxi
+
 import (
 	"fmt"
 	"os"
 )
+
 type MockServiceManager struct{}
+
 var _ ServiceManager = MockServiceManager{}
+
 const mockServiceDir = "/tmp/cxi-services"
 func (MockServiceManager) CreateService(deviceName string, netnsInode uint64, vni int, resources ResourceSet) (int, error) {
 	if err := os.MkdirAll(mockServiceDir, 0o755); err != nil {

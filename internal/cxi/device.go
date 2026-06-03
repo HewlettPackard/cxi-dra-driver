@@ -93,9 +93,9 @@ func readPCISlot(ueventPath string) string {
 	if err != nil {
 		return ""
 	}
-	for _, line := range strings.Split(string(data), "\n") {
-		if strings.HasPrefix(line, "PCI_SLOT_NAME=") {
-			return strings.TrimPrefix(line, "PCI_SLOT_NAME=")
+	for line := range strings.SplitSeq(string(data), "\n") {
+		if v, ok := strings.CutPrefix(line, "PCI_SLOT_NAME="); ok {
+			return v
 		}
 	}
 	return ""

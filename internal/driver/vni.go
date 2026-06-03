@@ -7,7 +7,34 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 )
 
-// VNIAllocator is the interface for obtaining a VNI for a pod.
+const (
+	// MinVNI and MaxVNI bound the usable Slingshot fabric VNI space. VNI is a
+	// uint16 hardware field (see internal/cxi/service_cgo.go, which casts to
+	// uint16), and 0 is reserved — the flags treat 0 as "pool disabled".
+	MinVNI = 1
+	MaxVNI = 65535
+)
+
+// ValidVNI reports whether vni is within the usable fabric VNI range. It guards
+// the hardware boundary: an out-of-range VNI would silently truncate to uint16
+// and could scope a service to the wrong fabric network.
+func ValidVNI(vni int) bool {
+	return vni >= MinVNI && vni <= MaxVNI
+}
+
+// ValidateVNIRange checks that [start, end] is a usable cluster-wide VNI pool
+// range: MinVNI <= start <= end <= MaxVNI.
+func ValidateVNIRange(start, end int) error {
+	if start < MinVNI || end > MaxVNI || start > end {
+		return fmt.Errorf("invalid VNI range [%d, %d]: must satisfy %d <= start <= end <= %d",
+			start, end, MinVNI, MaxVNI)
+	}
+	return nil
+}
+
+// VNIAllocator is the fallback interface for obtaining a VNI for a pod when no
+// VNI ResourceClaim is present. The primary path extracts the VNI directly from
+// the pod's allocated VNI pool claim (see vniFromClaims in prepare.go).
 //
 // Each pod must receive a unique VNI: cxil_svc_set_vni_range returns -EEXIST
 // if the requested VNI range is already owned by another service on the same
@@ -41,6 +68,12 @@ type PoolVNIAllocator struct {
 	max   int
 	inUse map[types.UID]int // podUID → allocated VNI
 	byVNI map[int]types.UID // VNI → owning podUID (reverse index for O(1) vacancy check)
+}
+
+// StaticVNIAllocator always returns the same VNI. Used as a fallback when no
+// VNI ResourceClaim is present and no node-local pool is configured.
+type StaticVNIAllocator struct {
+	VNI int
 }
 
 // NewPoolVNIAllocator creates a VNI allocator over the inclusive range [min, max].
@@ -96,3 +129,6 @@ func (a *PoolVNIAllocator) Release(podUID types.UID) {
 	delete(a.inUse, podUID)
 	delete(a.byVNI, vni)
 }
+
+func (a *StaticVNIAllocator) Allocate(_ types.UID) (int, error) { return a.VNI, nil }
+func (a *StaticVNIAllocator) Release(_ types.UID)                {}

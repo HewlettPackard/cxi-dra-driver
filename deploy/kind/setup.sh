@@ -52,9 +52,9 @@ echo "==> Generating go.sum"
 (cd "${REPO_ROOT}" && go mod tidy)
 
 echo "==> Building driver image with ${CONTAINER_CLI}"
-"${CONTAINER_CLI}" build --no-cache -t "${IMAGE}" "${REPO_ROOT}"
+"${CONTAINER_CLI}" build --no-cache -f "${REPO_ROOT}/Dockerfile.ci" -t "${IMAGE}" "${REPO_ROOT}"
 
-echo "==> Loading image into kind"
+echo "==> Loading driver image into kind"
 if [[ "${CONTAINER_CLI}" == "podman" ]]; then
   # kind's podman provider can pull directly from podman's image store
   "${CONTAINER_CLI}" save "${IMAGE}" -o /tmp/cxi-dra-image.tar
@@ -64,12 +64,24 @@ else
   kind load docker-image "${IMAGE}" --name "${CLUSTER_NAME}"
 fi
 
+# Pre-load busybox so VNI test pods start immediately (imagePullPolicy: Never).
+echo "==> Pre-loading busybox:stable into kind (for VNI test pods)"
+"${CONTAINER_CLI}" pull busybox:stable
+if [[ "${CONTAINER_CLI}" == "podman" ]]; then
+  "${CONTAINER_CLI}" save busybox:stable -o /tmp/busybox-image.tar
+  kind load image-archive /tmp/busybox-image.tar --name "${CLUSTER_NAME}"
+  rm -f /tmp/busybox-image.tar
+else
+  kind load docker-image busybox:stable --name "${CLUSTER_NAME}"
+fi
+
 # ---------------------------------------------------------------------------
 # Deploy
 # ---------------------------------------------------------------------------
-echo "==> Applying RBAC and DeviceClass"
+echo "==> Applying RBAC and DeviceClasses"
 kubectl apply -f "${REPO_ROOT}/deploy/kubernetes/clusterrole.yaml"
 kubectl apply -f "${REPO_ROOT}/deploy/kubernetes/deviceclass.yaml"
+kubectl apply -f "${REPO_ROOT}/deploy/kubernetes/deviceclass-vni.yaml"
 
 echo "==> Patching DaemonSet for mock mode (${MOCK_DEVICES} devices, no nodeSelector)"
 sed \
@@ -100,8 +112,11 @@ echo ""
 echo "Your kubeconfig is at: ${KUBECONFIG_PATH}"
 echo "Run 'direnv allow' in the repo root to activate it automatically via .envrc."
 echo ""
-echo "Run the test workload:"
+echo "Run the CXI device test workload:"
 echo "  kubectl apply -f ${REPO_ROOT}/deploy/kubernetes/test/"
+echo ""
+echo "Run the VNI pool tests:"
+echo "  ${SCRIPT_DIR}/test-vni.sh"
 echo ""
 echo "Tear down:"
 echo "  kind delete cluster --name ${CLUSTER_NAME}"

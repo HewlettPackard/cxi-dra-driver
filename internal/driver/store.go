@@ -33,11 +33,15 @@ func NewAllocationStore() *AllocationStore {
 	}
 }
 
-// Set stores the allocations for a pod, replacing any previous entry.
+// Set stores the allocations for a pod, replacing any previous entry. The input
+// slice is copied so later mutation of the caller's slice cannot alter the stored
+// allocation — prepareClaim reuses one slice across every pod sharing a claim.
 func (s *AllocationStore) Set(podUID types.UID, allocs []PodAllocation) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.byPodUID[podUID] = allocs
+	stored := make([]PodAllocation, len(allocs))
+	copy(stored, allocs)
+	s.byPodUID[podUID] = stored
 }
 
 // SetClaimPods records that claimUID was reserved by podUID. Multiple calls
