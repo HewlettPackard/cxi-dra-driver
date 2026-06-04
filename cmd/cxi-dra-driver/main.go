@@ -46,18 +46,6 @@ func main() {
 		reservedACs     = flag.Int64("reserved-acs", 0, "ACs reserved by pre-existing system services")
 		reservedLEPools = flag.Int64("reserved-le-pools", 0, "LE pools reserved by pre-existing system services (1 pool = 1024 LEs)")
 		reservedTLEPools = flag.Int64("reserved-tle-pools", 0, "TLE pools reserved by pre-existing system services (1 pool = 512 TLEs)")
-
-		// Default resources allocated when the user's claim has no config.
-		// Roughly one quarter of hardware capacity; LEs and TLEs default to
-		// zero to avoid pool exhaustion from pre-existing services.
-		defaultTXQs    = flag.Int64("default-txqs", 256, "Default TXQs per service when claim has no resource config")
-		defaultTGQs    = flag.Int64("default-tgqs", 128, "Default TGQs per service")
-		defaultEQs     = flag.Int64("default-eqs", 511, "Default EQs per service")
-		defaultCTs     = flag.Int64("default-cts", 511, "Default CTs per service")
-		defaultPTEs    = flag.Int64("default-ptes", 512, "Default PTEs per service")
-		defaultACs     = flag.Int64("default-acs", 255, "Default ACs per service")
-		defaultLEPools  = flag.Int64("default-le-pools", 0, "Default LE pools per service (0 = none; 1 pool = 1024 LEs)")
-		defaultTLEPools = flag.Int64("default-tle-pools", 0, "Default TLE pools per service (0 = none; 1 pool = 512 TLEs)")
 	)
 	flag.Parse()
 
@@ -88,17 +76,6 @@ func main() {
 		TLEs: *reservedTLEPools * cxi.TLEPoolSize,
 	}
 
-	defaults := cxi.ResourceSet{
-		TXQs: *defaultTXQs,
-		TGQs: *defaultTGQs,
-		EQs:  *defaultEQs,
-		CTs:  *defaultCTs,
-		PTEs: *defaultPTEs,
-		ACs:  *defaultACs,
-		LEs:  *defaultLEPools * cxi.LEPoolSize,
-		TLEs: *defaultTLEPools * cxi.TLEPoolSize,
-	}
-
 	var mockDevList []*cxi.Device
 	if mock {
 		mockDevList = cxi.MockDevices(*mockDevices)
@@ -111,7 +88,6 @@ func main() {
 		&driver.StaticVNIAllocator{VNI: 1},
 		driver.Config{
 			Overhead:        overhead,
-			Defaults:        defaults,
 			RefreshInterval: *refreshInterval,
 		},
 	)

@@ -34,21 +34,26 @@ spec:
       expression: >
         object.spec.devices.requests.size() > 0
 
-    # Only process claims whose first request has no selectors yet
+    # Only process claims whose first request has exactly set but no selectors yet.
+    # We require exactly to be present because the JSONPatch target path
+    # /spec/devices/requests/0/exactly/selectors requires the parent to exist.
     - name: no-existing-selectors
       expression: >
-        !has(object.spec.devices.requests[0].exactly) ||
-        !has(object.spec.devices.requests[0].exactly.selectors) ||
-        object.spec.devices.requests[0].exactly.selectors.size() == 0
+        has(object.spec.devices.requests[0].exactly) &&
+        (
+          !has(object.spec.devices.requests[0].exactly.selectors) ||
+          object.spec.devices.requests[0].exactly.selectors.size() == 0
+        )
 
-    # Only process claims that have our driver's opaque config
+    # Only process claims where config[0] is our driver's opaque config.
+    # The mutation reads config[0] directly, so we assert it is the CXI entry
+    # rather than using exists() which would not guarantee config[0] matches.
     - name: has-cxi-config
       expression: >
         has(object.spec.devices.config) &&
-        object.spec.devices.config.exists(c,
-          has(c.opaque) &&
-          c.opaque.driver == "cxi.slingshot.hpe.com"
-        )
+        object.spec.devices.config.size() > 0 &&
+        has(object.spec.devices.config[0].opaque) &&
+        object.spec.devices.config[0].opaque.driver == "cxi.slingshot.hpe.com"
 
   mutations:
     - patchType: JSONPatch

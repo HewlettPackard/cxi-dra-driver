@@ -27,14 +27,12 @@ type Driver struct {
 	store           *AllocationStore
 	vniAllocator    VNIAllocator
 	overhead        cxi.ResourceSet // admin-configured per-device reserved overhead
-	defaults        cxi.ResourceSet // default resources when claim has no config
 	refreshInterval time.Duration   // how often to republish ResourceSlice with fresh avail attrs
 }
 
 // Config holds admin-configured driver parameters passed from flags.
 type Config struct {
 	Overhead        cxi.ResourceSet
-	Defaults        cxi.ResourceSet
 	RefreshInterval time.Duration
 }
 
@@ -57,7 +55,6 @@ func New(
 		store:           NewAllocationStore(),
 		vniAllocator:    vniAllocator,
 		overhead:        cfg.Overhead,
-		defaults:        cfg.Defaults,
 		refreshInterval: cfg.RefreshInterval,
 	}
 }
@@ -117,6 +114,9 @@ func (d *Driver) Run(ctx context.Context) error {
 	}
 
 	// Periodically republish with refreshed available-capacity attributes.
+	if d.refreshInterval <= 0 {
+		return fmt.Errorf("--resource-refresh-interval must be > 0 (got %s)", d.refreshInterval)
+	}
 	ticker := time.NewTicker(d.refreshInterval)
 	defer ticker.Stop()
 	for {

@@ -47,8 +47,8 @@ func (d *Driver) prepareClaim(claim *resourceapi.ResourceClaim) kubeletplugin.Pr
 			continue
 		}
 
-		// Resolve the requested resources: claim config takes priority,
-		// driver defaults apply when no config is present.
+		// Resolve the requested resources from the claim's opaque config.
+		// Claims without config are rejected — all fields are required.
 		requested, err := d.resolveResources(claim, alloc)
 		if err != nil {
 			return kubeletplugin.PrepareResult{
@@ -124,28 +124,29 @@ func (d *Driver) resolveResources(
 	claim *resourceapi.ResourceClaim,
 	alloc resourceapi.DeviceRequestAllocationResult,
 ) (cxi.ResourceSet, error) {
-	// Look for opaque config entries targeting this driver and request.
-	if claim.Status.Allocation != nil {
-		for _, cfg := range claim.Status.Allocation.Devices.Config {
-			if cfg.Opaque == nil || cfg.Opaque.Driver != d.driverName {
+	// Look for opaque config entries in the claim spec targeting this driver
+	// and request. We read from spec (where the user wrote it) rather than
+	// status.allocation.devices.config, which is a scheduler-copied mirror
+	// and may not be present if the claim was allocated by an older scheduler.
+	for _, cfg := range claim.Spec.Devices.Config {
+		if cfg.Opaque == nil || cfg.Opaque.Driver != d.driverName {
+			continue
+		}
+		// Config applies to this request if Requests is empty (applies to
+		// all) or explicitly names this request.
+		if len(cfg.Requests) > 0 {
+			found := false
+			for _, r := range cfg.Requests {
+				if r == alloc.Request {
+					found = true
+					break
+				}
+			}
+			if !found {
 				continue
 			}
-			// Config applies to this request if Requests is empty (applies to
-			// all) or explicitly names this request.
-			if len(cfg.Requests) > 0 {
-				found := false
-				for _, r := range cfg.Requests {
-					if r == alloc.Request {
-						found = true
-						break
-					}
-				}
-				if !found {
-					continue
-				}
-			}
-			return parseResourceConfig(cfg.Opaque.Parameters.Raw)
 		}
+		return parseResourceConfig(cfg.Opaque.Parameters.Raw)
 	}
 	return cxi.ResourceSet{}, fmt.Errorf(
 		"claim %s/%s has no CXI resource config for request %q — "+
@@ -202,6 +203,12 @@ func parseResourceConfig(raw []byte) (cxi.ResourceSet, error) {
 	}
 	if len(missing) > 0 {
 		return cxi.ResourceSet{}, fmt.Errorf("CXI resource config missing required fields: %v", missing)
+	}
+	// Reject negative values — they would pass Fits checks (e.g. -1 <= available)
+	// and then overflow to very large unsigned values in the CGo service creation path.
+	if *cfg.TXQs < 0 || *cfg.TGQs < 0 || *cfg.EQs < 0 || *cfg.CTs < 0 ||
+		*cfg.PTEs < 0 || *cfg.ACs < 0 || *cfg.LEPools < 0 || *cfg.TLEPools < 0 {
+		return cxi.ResourceSet{}, fmt.Errorf("CXI resource config values must be non-negative")
 	}
 	return cxi.ResourceSet{
 		TXQs: *cfg.TXQs,
