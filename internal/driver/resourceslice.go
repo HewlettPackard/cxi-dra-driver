@@ -44,6 +44,10 @@ func (d *Driver) buildDevices() []resourceapi.Device {
 			d.logf("warning: reading available capacity for %s: %v", dev.Name, err)
 			avail = cxi.ResourceSet{}
 		}
+		// Subtract admin-configured overhead so the published avail_* attributes
+		// match the usable ceiling enforced at prepare time. Clamped to zero in
+		// case overhead exceeds what the hardware currently reports.
+		avail = avail.Sub(d.overhead).ClampToZero()
 
 		out = append(out, resourceapi.Device{
 			Name: dev.Name,

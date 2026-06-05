@@ -93,6 +93,28 @@ func (r ResourceSet) Fits(available ResourceSet) bool {
 		r.ACs <= available.ACs
 }
 
+// ClampToZero returns a copy of r with any negative fields set to zero.
+// Used when subtracting overhead from available capacity to avoid publishing
+// negative attribute values if overhead exceeds what the hardware reports.
+func (r ResourceSet) ClampToZero() ResourceSet {
+	clamp := func(v int64) int64 {
+		if v < 0 {
+			return 0
+		}
+		return v
+	}
+	return ResourceSet{
+		TXQs: clamp(r.TXQs),
+		TGQs: clamp(r.TGQs),
+		EQs:  clamp(r.EQs),
+		CTs:  clamp(r.CTs),
+		TLEs: clamp(r.TLEs),
+		PTEs: clamp(r.PTEs),
+		LEs:  clamp(r.LEs),
+		ACs:  clamp(r.ACs),
+	}
+}
+
 // Sub returns available minus reserved — used to compute remaining capacity
 // after summing all live service reservations.
 func (r ResourceSet) Sub(other ResourceSet) ResourceSet {

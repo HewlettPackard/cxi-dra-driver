@@ -29,10 +29,12 @@ spec:
         operations:  ["CREATE"]
         resources:   ["resourceclaims"]
   matchConditions:
-    # Only process claims with at least one device request
+    # Only process claims with exactly one device request.
+    # The mutation patches requests[0] only; claims with multiple requests
+    # would have subsequent requests left without selectors.
     - name: has-requests
       expression: >
-        object.spec.devices.requests.size() > 0
+        object.spec.devices.requests.size() == 1
 
     # Only process claims whose first request has exactly set but no selectors yet.
     # We require exactly to be present because the JSONPatch target path

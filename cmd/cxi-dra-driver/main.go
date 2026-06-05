@@ -65,6 +65,12 @@ func main() {
 
 	mock := *mockDevices > 0
 
+	if *reservedTXQs < 0 || *reservedTGQs < 0 || *reservedEQs < 0 || *reservedCTs < 0 ||
+		*reservedPTEs < 0 || *reservedACs < 0 || *reservedLEPools < 0 || *reservedTLEPools < 0 {
+		fmt.Fprintln(os.Stderr, "error: --reserved-* values must be non-negative")
+		os.Exit(1)
+	}
+
 	overhead := cxi.ResourceSet{
 		TXQs: *reservedTXQs,
 		TGQs: *reservedTGQs,
