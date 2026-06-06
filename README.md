@@ -214,9 +214,9 @@ The CXI service (VNI scoping + netns binding) is created in the NRI `RunPodSandb
 
 ## CXI Service Programming
 
-Each pod receives a CXI service scoped to its network namespace inode and VNI. libfabric reads `FI_CXI_SVC_ID` (injected as an env var by the NRI plugin) and uses it instead of allocating its own service, ensuring the pod operates within its allocated fabric resources.
+Each pod receives a CXI service scoped to its network namespace inode and a unique VNI. libfabric reads `FI_CXI_SVC_ID` (injected as an env var by the NRI plugin) and uses it instead of allocating its own service, ensuring the pod operates within its allocated fabric resources.
 
-Current VNI allocation uses a static allocator (`VNI=1`). A cluster-wide VNI pool allocator is planned.
+VNIs are allocated from a configurable node-local pool (`--vni-min` / `--vni-max`). Each pod receives a distinct VNI — the kernel returns `-EEXIST` from `cxil_svc_set_vni_range` if two services attempt to claim the same VNI range. Released VNIs are returned to the pool when the pod is torn down. The allocator is in-memory; VNI assignments are lost on driver restart (see Known Limitations).
 
 ## Project Layout
 
