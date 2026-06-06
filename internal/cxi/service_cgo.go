@@ -105,9 +105,11 @@ static int cxi_sum_reserved(const char *device, resource_args *out)
 
 // cxi_create_service allocates a CXI service and then associates the network
 // namespace and VNI via the SHS14 dedicated ioctls (cxil_svc_set_netns and
-// cxil_svc_set_vni_range). In SHS12/Friese the netns and VNI were embedded
-// directly in cxi_svc_desc (restricted_members / restricted_vnis fields);
-// SHS14 removed those desc fields and introduced separate post-creation calls.
+// cxil_svc_set_vni_range). In SHS12/Friese the netns was embedded in
+// cxi_svc_desc via members[].type=CXI_SVC_MEMBER_NET_NS and the VNI via
+// restricted_vnis/vnis[]. SHS14 removed those desc fields and introduced
+// separate post-creation ioctls. restricted_members is still a desc field in
+// SHS14 and must be set to 1 for cxil_svc_set_netns to accept the call.
 static int cxi_create_service(const char *device, uint64_t netns_inode, int vni,
                                resource_args res)
 {
@@ -123,6 +125,9 @@ static int cxi_create_service(const char *device, uint64_t netns_inode, int vni,
 
     struct cxi_svc_desc desc = {0};
     desc.resource_limits = 1;
+    // restricted_members=1 is required for cxil_svc_set_netns to succeed;
+    // without it the kernel returns EEXIST regardless of other parameters.
+    desc.restricted_members = 1;
 
     // Resource limits: max == res — the service may not burst beyond its share.
     // Values validated against available capacity before reaching here.
@@ -145,18 +150,43 @@ static int cxi_create_service(const char *device, uint64_t netns_inode, int vni,
     }
     int svc_id = rc;
 
+    // SHS14: cxil_svc_set_netns requires the service to be disabled first;
+    // re-enable after. See libcxi tests/libcxi_test_svc.c and utils/cxi_service.c.
+    rc = cxil_svc_enable(dev, svc_id, false);
+    if (rc != 0) {
+        fprintf(stderr, "cxi_wrapper: cxil_svc_enable(%d, false) failed: %d\n", svc_id, rc);
+        int drc = cxil_destroy_svc(dev, svc_id);
+        if (drc != 0)
+            fprintf(stderr, "cxi_wrapper: cxil_destroy_svc(%d) in cleanup failed: %d — service may be orphaned\n", svc_id, drc);
+        cxil_close_device(dev);
+        return rc;
+    }
+
     // SHS14: associate the pod network namespace with this service.
     rc = cxil_svc_set_netns(dev, svc_id, (unsigned int)netns_inode);
     if (rc != 0) {
         fprintf(stderr, "cxi_wrapper: cxil_svc_set_netns(%d, inode=%llu) failed: %d\n",
                 svc_id, (unsigned long long)netns_inode, rc);
-        cxil_destroy_svc(dev, svc_id);
+        cxil_svc_enable(dev, svc_id, true); // best-effort re-enable before destroy
+        int drc = cxil_destroy_svc(dev, svc_id);
+        if (drc != 0)
+            fprintf(stderr, "cxi_wrapper: cxil_destroy_svc(%d) in cleanup failed: %d — service may be orphaned\n", svc_id, drc);
+        cxil_close_device(dev);
+        return rc;
+    }
+
+    rc = cxil_svc_enable(dev, svc_id, true);
+    if (rc != 0) {
+        fprintf(stderr, "cxi_wrapper: cxil_svc_enable(%d, true) failed: %d\n", svc_id, rc);
+        int drc = cxil_destroy_svc(dev, svc_id);
+        if (drc != 0)
+            fprintf(stderr, "cxi_wrapper: cxil_destroy_svc(%d) in cleanup failed: %d — service may be orphaned\n", svc_id, drc);
         cxil_close_device(dev);
         return rc;
     }
 
     // SHS14: restrict service to the allocated VNI via a range (min==max for a
-    // single VNI). restricted_vnis must NOT be set in the desc for this call.
+    // single VNI). No disable/enable required for cxil_svc_set_vni_range.
     rc = cxil_svc_set_vni_range(dev, svc_id, (uint16_t)vni, (uint16_t)vni);
     if (rc != 0) {
         fprintf(stderr, "cxi_wrapper: cxil_svc_set_vni_range(%d, vni=%d) failed: %d\n",
