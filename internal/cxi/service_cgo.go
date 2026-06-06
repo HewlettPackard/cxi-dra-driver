@@ -103,6 +103,11 @@ static int cxi_sum_reserved(const char *device, resource_args *out)
     return 0;
 }
 
+// cxi_create_service allocates a CXI service and then associates the network
+// namespace and VNI via the SHS14 dedicated ioctls (cxil_svc_set_netns and
+// cxil_svc_set_vni_range). In SHS12/Friese the netns and VNI were embedded
+// directly in cxi_svc_desc (restricted_members / restricted_vnis fields);
+// SHS14 removed those desc fields and introduced separate post-creation calls.
 static int cxi_create_service(const char *device, uint64_t netns_inode, int vni,
                                resource_args res)
 {
@@ -115,10 +120,9 @@ static int cxi_create_service(const char *device, uint64_t netns_inode, int vni,
         fprintf(stderr, "cxi_wrapper: cxil_open_device(%d) failed: %d\n", dev_idx, rc);
         return rc;
     }
+
     struct cxi_svc_desc desc = {0};
-    desc.resource_limits    = 1;
-    desc.restricted_members = 1;
-    desc.restricted_vnis    = 1;
+    desc.resource_limits = 1;
 
     // Resource limits: max == res — the service may not burst beyond its share.
     // Values validated against available capacity before reaching here.
@@ -131,28 +135,51 @@ static int cxi_create_service(const char *device, uint64_t netns_inode, int vni,
     desc.limits.les.res  = (uint32_t)res.les;  desc.limits.les.max  = (uint32_t)res.les;
     desc.limits.acs.res  = (uint16_t)res.acs;  desc.limits.acs.max  = (uint16_t)res.acs;
 
-    desc.num_vld_vnis = 1;
-    desc.vnis[0]      = (uint16_t)vni;
-    desc.members[0].type             = CXI_SVC_MEMBER_NET_NS;
-    desc.members[0].svc_member.netns = (unsigned int)netns_inode;
-
     struct cxi_svc_fail_info fail_info = {0};
     rc = cxil_alloc_svc(dev, &desc, &fail_info);
     if (rc <= 0) {
         fprintf(stderr, "cxi_wrapper: cxil_alloc_svc failed: %d\n", rc);
         if (rc == 0) rc = -1;
-    } else {
-        fprintf(stderr, "cxi_wrapper: created service id=%d on %s inode=%llu vni=%d "
-                "txqs=%lld tgqs=%lld eqs=%lld cts=%lld tles=%lld ptes=%lld les=%lld acs=%lld\n",
-                rc, device, (unsigned long long)netns_inode, vni,
-                (long long)res.txqs, (long long)res.tgqs, (long long)res.eqs,
-                (long long)res.cts,  (long long)res.tles, (long long)res.ptes,
-                (long long)res.les,  (long long)res.acs);
+        cxil_close_device(dev);
+        return rc;
     }
+    int svc_id = rc;
+
+    // SHS14: associate the pod network namespace with this service.
+    rc = cxil_svc_set_netns(dev, svc_id, (unsigned int)netns_inode);
+    if (rc != 0) {
+        fprintf(stderr, "cxi_wrapper: cxil_svc_set_netns(%d, inode=%llu) failed: %d\n",
+                svc_id, (unsigned long long)netns_inode, rc);
+        cxil_destroy_svc(dev, svc_id);
+        cxil_close_device(dev);
+        return rc;
+    }
+
+    // SHS14: restrict service to the allocated VNI via a range (min==max for a
+    // single VNI). restricted_vnis must NOT be set in the desc for this call.
+    rc = cxil_svc_set_vni_range(dev, svc_id, (uint16_t)vni, (uint16_t)vni);
+    if (rc != 0) {
+        fprintf(stderr, "cxi_wrapper: cxil_svc_set_vni_range(%d, vni=%d) failed: %d\n",
+                svc_id, vni, rc);
+        cxil_destroy_svc(dev, svc_id);
+        cxil_close_device(dev);
+        return rc;
+    }
+
+    fprintf(stderr, "cxi_wrapper: created service id=%d on %s inode=%llu vni=%d "
+            "txqs=%lld tgqs=%lld eqs=%lld cts=%lld tles=%lld ptes=%lld les=%lld acs=%lld\n",
+            svc_id, device, (unsigned long long)netns_inode, vni,
+            (long long)res.txqs, (long long)res.tgqs, (long long)res.eqs,
+            (long long)res.cts,  (long long)res.tles, (long long)res.ptes,
+            (long long)res.les,  (long long)res.acs);
     cxil_close_device(dev);
-    return rc;
+    return svc_id;
 }
 
+// cxi_delete_service finds the service associated with the given netns inode
+// and destroys it. SHS14 stores the netns association out-of-band (via
+// cxil_svc_set_netns), so we probe each service with cxil_svc_get_netns
+// rather than scanning the members[] array that existed in SHS12.
 static int cxi_delete_service(const char *device, uint64_t netns_inode)
 {
     struct cxil_dev *dev = NULL;
@@ -173,16 +200,14 @@ static int cxi_delete_service(const char *device, uint64_t netns_inode)
     }
     unsigned int target_id = 0;
     for (unsigned int i = 0; i < list->count; i++) {
-        const struct cxi_svc_desc *d = &list->descs[i];
-        for (unsigned int m = 0; m < CXI_SVC_MAX_MEMBERS; m++) {
-            if (d->members[m].type == CXI_SVC_MEMBER_NET_NS &&
-                d->members[m].svc_member.netns == (unsigned int)netns_inode) {
-                target_id = d->svc_id;
-                break;
-            }
-        }
-        if (target_id)
+        unsigned int svc_id = list->descs[i].svc_id;
+        unsigned int svc_netns = 0;
+        if (cxil_svc_get_netns(dev, svc_id, &svc_netns) != 0)
+            continue;
+        if (svc_netns == (unsigned int)netns_inode) {
+            target_id = svc_id;
             break;
+        }
     }
     cxil_free_svc_list(list);
     if (!target_id) {

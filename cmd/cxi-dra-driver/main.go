@@ -91,7 +91,8 @@ func main() {
 		*nodeName, *podUID, *driverName, *cdiRoot, *pluginDir, *registrarDir,
 		kubeClient, mockDevList,
 		// TODO: replace StaticVNIAllocator with a cluster-wide VNI pool allocator.
-		&driver.StaticVNIAllocator{VNI: 1},
+		// VNI 5 chosen to avoid conflict with DEFAULT service (VNIs 1, 10).
+		&driver.StaticVNIAllocator{VNI: 5},
 		driver.Config{
 			Overhead:        overhead,
 			RefreshInterval: *refreshInterval,
