@@ -4,7 +4,7 @@
 # without opaque config will be rejected at prepare time with a clear error.
 #
 # LEs and TLEs are expressed as pool counts:
-#   le_pools:  1 pool = 256  LEs
+#   le_pools:  1 pool = 1024 LEs
 #   tle_pools: 1 pool = 512  TLEs
 #
 # The driver performs a live fit-check at service creation time against the
@@ -15,7 +15,7 @@
 # requests landing on the same physical device will fail at service creation
 # time due to TOCTOU between the fit-check and the second service create.
 ---
-# Quarter-device: suitable for most jobs. Requests four LE pools (1024 LEs) and
+# Quarter-device: suitable for most jobs. Requests four LE pools (4096 LEs) and
 # one TLE pool (512 TLEs); set le_pools/tle_pools to 0 if your job does not use
 # triggered ops.
 apiVersion: resource.k8s.io/v1

@@ -129,7 +129,14 @@ static int cxi_create_service(const char *device, uint64_t netns_inode, int vni,
     // without it the kernel returns EEXIST regardless of other parameters.
     desc.restricted_members = 1;
 
-    // Resource limits: max == res — the service may not burst beyond its share.
+    // Resource limits: max == res for all resources except LEs.
+    //
+    // For LEs, max must be set to the hardware pool capacity (dev->info.num_les),
+    // NOT to les.res. The kernel uses les.max as a normalization denominator and
+    // will scale les.res down if les.max < hardware_num_les. All other resource
+    // types do not exhibit this behaviour. See libcxi_test_svc.c le_tle test:
+    // the test always sets les.max = C_LPE_STS_LIST_ENTRIES_ENTRIES / C_PE_COUNT
+    // (i.e. dev->info.num_les), confirming this is the expected API usage.
     // Values validated against available capacity before reaching here.
     desc.limits.txqs.res = (uint16_t)res.txqs; desc.limits.txqs.max = (uint16_t)res.txqs;
     desc.limits.tgqs.res = (uint16_t)res.tgqs; desc.limits.tgqs.max = (uint16_t)res.tgqs;
@@ -137,7 +144,7 @@ static int cxi_create_service(const char *device, uint64_t netns_inode, int vni,
     desc.limits.cts.res  = (uint16_t)res.cts;  desc.limits.cts.max  = (uint16_t)res.cts;
     desc.limits.tles.res = (uint16_t)res.tles; desc.limits.tles.max = (uint16_t)res.tles;
     desc.limits.ptes.res = (uint16_t)res.ptes; desc.limits.ptes.max = (uint16_t)res.ptes;
-    desc.limits.les.res  = (uint32_t)res.les;  desc.limits.les.max  = (uint32_t)res.les;
+    desc.limits.les.res  = (uint32_t)res.les;  desc.limits.les.max  = (uint32_t)dev->info.num_les;
     desc.limits.acs.res  = (uint16_t)res.acs;  desc.limits.acs.max  = (uint16_t)res.acs;
 
     struct cxi_svc_fail_info fail_info = {0};
