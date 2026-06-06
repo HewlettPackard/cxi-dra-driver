@@ -32,6 +32,13 @@ func main() {
 		kubeconfig   = flag.String("kubeconfig", "", "Path to kubeconfig (omit for in-cluster config)")
 		mockDevices  = flag.Int("mock-devices", 0, "Generate N synthetic CXI devices instead of real discovery (for kind/local testing)")
 
+		// VNI pool: each pod receives a unique VNI so cxil_svc_set_vni_range
+		// does not return -EEXIST when two pods share the same device.
+		// Avoid VNI 1 (Slingshot default/untagged) and any VNIs reserved by
+		// system services visible in `cxi service show`.
+		vniMin = flag.Int("vni-min", 2, "Lowest VNI the driver may allocate (inclusive, >= 1)")
+		vniMax = flag.Int("vni-max", 4094, "Highest VNI the driver may allocate (inclusive, >= vni-min)")
+
 		refreshInterval = flag.Duration("resource-refresh-interval", 30*time.Second,
 			"How often to republish the ResourceSlice with refreshed available-capacity attributes")
 
@@ -44,7 +51,7 @@ func main() {
 		reservedCTs     = flag.Int64("reserved-cts", 0, "CTs reserved by pre-existing system services")
 		reservedPTEs    = flag.Int64("reserved-ptes", 0, "PTEs reserved by pre-existing system services")
 		reservedACs     = flag.Int64("reserved-acs", 0, "ACs reserved by pre-existing system services")
-		reservedLEPools = flag.Int64("reserved-le-pools", 0, "LE pools reserved by pre-existing system services (1 pool = 1024 LEs)")
+		reservedLEPools = flag.Int64("reserved-le-pools", 0, "LE pools reserved by pre-existing system services (1 pool = 256 LEs)")
 		reservedTLEPools = flag.Int64("reserved-tle-pools", 0, "TLE pools reserved by pre-existing system services (1 pool = 512 TLEs)")
 	)
 	flag.Parse()
@@ -70,6 +77,14 @@ func main() {
 		fmt.Fprintln(os.Stderr, "error: --reserved-* values must be non-negative")
 		os.Exit(1)
 	}
+	if *vniMin < 1 {
+		fmt.Fprintln(os.Stderr, "error: --vni-min must be >= 1")
+		os.Exit(1)
+	}
+	if *vniMax < *vniMin {
+		fmt.Fprintf(os.Stderr, "error: --vni-max (%d) must be >= --vni-min (%d)\n", *vniMax, *vniMin)
+		os.Exit(1)
+	}
 
 	overhead := cxi.ResourceSet{
 		TXQs: *reservedTXQs,
@@ -90,9 +105,7 @@ func main() {
 	d := driver.New(
 		*nodeName, *podUID, *driverName, *cdiRoot, *pluginDir, *registrarDir,
 		kubeClient, mockDevList,
-		// TODO: replace StaticVNIAllocator with a cluster-wide VNI pool allocator.
-		// VNI 5 chosen to avoid conflict with DEFAULT service (VNIs 1, 10).
-		&driver.StaticVNIAllocator{VNI: 5},
+		driver.NewPoolVNIAllocator(*vniMin, *vniMax),
 		driver.Config{
 			Overhead:        overhead,
 			RefreshInterval: *refreshInterval,

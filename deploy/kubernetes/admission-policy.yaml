@@ -13,8 +13,8 @@
 #   - Skip if no opaque config (claim will be rejected at prepare time)
 #
 # LE/TLE pool conversion (must match LEPoolSize/TLEPoolSize in internal/cxi/resources.go):
-#   le_pools  * 1024 = LEs   (LEPoolSize)
-#   tle_pools * 512  = TLEs  (TLEPoolSize)
+#   le_pools  * 256 = LEs   (LEPoolSize)
+#   tle_pools * 512 = TLEs  (TLEPoolSize)
 apiVersion: admissionregistration.k8s.io/v1
 kind: MutatingAdmissionPolicy
 metadata:
@@ -86,7 +86,7 @@ spec:
                     ? "device.attributes[\"cxi.slingshot.hpe.com\"][\"avail_acs\"] >= " + string(int(object.spec.devices.config[0].opaque.parameters.acs)) + " && "
                     : "") +
                   (has(object.spec.devices.config[0].opaque.parameters.le_pools)
-                    ? "device.attributes[\"cxi.slingshot.hpe.com\"][\"avail_les\"] >= " + string(int(object.spec.devices.config[0].opaque.parameters.le_pools) * 1024) + " && "
+                    ? "device.attributes[\"cxi.slingshot.hpe.com\"][\"avail_les\"] >= " + string(int(object.spec.devices.config[0].opaque.parameters.le_pools) * 256) + " && "
                     : "") +
                   (has(object.spec.devices.config[0].opaque.parameters.tle_pools)
                     ? "device.attributes[\"cxi.slingshot.hpe.com\"][\"avail_tles\"] >= " + string(int(object.spec.devices.config[0].opaque.parameters.tle_pools) * 512) + " && "

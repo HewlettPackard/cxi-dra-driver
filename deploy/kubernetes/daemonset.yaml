@@ -44,6 +44,8 @@ spec:
             - --reserved-acs=4
             - --reserved-le-pools=2
             - --reserved-tle-pools=1
+            - --vni-min=2
+            - --vni-max=4094
           env:
             - name: NODE_NAME
               valueFrom:

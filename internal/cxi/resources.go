@@ -9,8 +9,10 @@ const TLEPoolSize = 512
 
 // LEPoolSize is the hardware allocation granularity for List Entries.
 // LEs are allocated in pools of this size — reserving even 1 LE consumes a
-// full pool. Defined once here; parameterise if future hardware versions differ.
-const LEPoolSize = 1024
+// full pool. Verified empirically: cxi service show reports 1024 LEs for
+// le_pools=4, confirming 4 × 256 = 1024 (not 4 × 1024 = 4096).
+// Defined once here; also referenced inline in admission-policy.yaml CEL.
+const LEPoolSize = 256
 
 // ResourceSet describes a set of CXI hardware resources. It is used in three
 // contexts:
