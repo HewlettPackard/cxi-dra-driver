@@ -118,7 +118,7 @@ func main() {
 			DriverName:    *driverName,
 			KubeClient:    kubeClient,
 			Namespace:     *podNamespace,
-			Identity:      *nodeName,
+			Identity:      fmt.Sprintf("%s/%s", *nodeName, *podUID),
 			DaemonSetName: *daemonSetName,
 			VNIStart:      *vniRangeStart,
 			VNIEnd:        *vniRangeEnd,
