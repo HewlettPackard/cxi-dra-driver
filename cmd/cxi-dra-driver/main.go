@@ -74,6 +74,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "error: --reserved-* values must be non-negative")
 		os.Exit(1)
 	}
+
 	overhead := cxi.ResourceSet{
 		TXQs: *reservedTXQs,
 		TGQs: *reservedTGQs,
@@ -93,7 +94,6 @@ func main() {
 	d := driver.New(
 		*nodeName, *podUID, *driverName, *cdiRoot, *pluginDir, *registrarDir,
 		kubeClient, mockDevList,
-		&driver.StaticVNIAllocator{VNI: 1}, // fallback; VNI always comes from a VNI ResourceClaim
 		driver.Config{
 			Overhead:        overhead,
 			RefreshInterval: *refreshInterval,

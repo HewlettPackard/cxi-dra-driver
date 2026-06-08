@@ -142,7 +142,19 @@ spec:
       - name: cxi
         exactly:
           deviceClassName: cxi-device
-          count: 1
+    config:
+      - requests: ["cxi"]
+        opaque:
+          driver: ${DRIVER}
+          parameters:
+            txqs: 2
+            tgqs: 1
+            eqs: 1
+            cts: 1
+            ptes: 1
+            acs: 1
+            le_pools: 0
+            tle_pools: 0
 EOF
 }
 

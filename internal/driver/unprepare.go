@@ -8,7 +8,7 @@ import (
 )
 
 // UnprepareResourceClaims is called when pods using CXI claims finish or are
-// removed. We release VNI allocations and store entries held for these claims.
+// removed. We release store entries held for these claims.
 // Note: CXI service destruction happens in the NRI StopPodSandbox hook, not here.
 func (d *Driver) UnprepareResourceClaims(
 	_ context.Context,
@@ -17,7 +17,6 @@ func (d *Driver) UnprepareResourceClaims(
 	result := make(map[types.UID]error, len(claims))
 	for _, claim := range claims {
 		for _, podUID := range d.store.PodUIDsForClaim(claim.UID) {
-			d.vniAllocator.Release(podUID)
 			d.store.Delete(podUID)
 		}
 		d.store.DeleteClaim(claim.UID)

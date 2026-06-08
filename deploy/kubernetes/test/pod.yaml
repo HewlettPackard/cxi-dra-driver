@@ -10,6 +10,8 @@ spec:
   resourceClaims:
     - name: cxi
       resourceClaimTemplateName: cxi-quarter
+    - name: vni
+      resourceClaimTemplateName: cxi-vni
 
   containers:
     - name: workload
@@ -28,6 +30,7 @@ spec:
       resources:
         claims:
           - name: cxi
+          - name: vni
       env:
         - name: LD_LIBRARY_PATH      
           value: "/usr/lib64/:/extras/lib/:/hostlibs:/xpmem/lib64"

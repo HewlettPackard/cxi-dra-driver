@@ -115,9 +115,9 @@ func (d *Driver) prepareClaim(claim *resourceapi.ResourceClaim, vniByPod map[typ
 		if alloc.Driver != d.driverName {
 			continue
 		}
-
 		if alloc.Pool == vniPoolName {
 			// VNI devices are logical — no CDI device and no hardware reservation.
+			// The VNI itself is extracted by vniFromClaims.
 			continue
 		}
 
@@ -168,18 +168,28 @@ func (d *Driver) prepareClaim(claim *resourceapi.ResourceClaim, vniByPod map[typ
 		podAllocs = append(podAllocs, pa)
 	}
 
+	var preparedPods []types.UID
+	rollback := func() {
+		for _, podUID := range preparedPods {
+			d.store.Delete(podUID)
+		}
+		d.store.DeleteClaim(claim.UID)
+	}
 	for _, ref := range claim.Status.ReservedFor {
 		if ref.Resource != "pods" {
 			continue
 		}
 		podUID := types.UID(ref.UID)
 
-		// VNI must be allocated from the cluster-wide K8s pool — a CXI claim
-		// must always be paired with a VNI ResourceClaim.
+		// VNI must come from the pod's allocated VNI ResourceClaim.
+		// Pods without a cxi-vni claim are rejected — all workloads must
+		// request a VNI from the cluster-wide pool.
 		vni, ok := vniByPod[podUID]
 		if !ok {
+			rollback()
 			return kubeletplugin.PrepareResult{
-				Err: fmt.Errorf("pod %s has no VNI allocated — a VNI ResourceClaim is required alongside any CXI device claim", podUID),
+				Err: fmt.Errorf("pod %s has no VNI allocated — add a cxi-vni ResourceClaim to the workload",
+					podUID),
 			}
 		}
 		for i := range podAllocs {
@@ -187,6 +197,7 @@ func (d *Driver) prepareClaim(claim *resourceapi.ResourceClaim, vniByPod map[typ
 		}
 		d.store.Set(podUID, podAllocs)
 		d.store.SetClaimPod(claim.UID, podUID)
+		preparedPods = append(preparedPods, podUID)
 	}
 
 	return kubeletplugin.PrepareResult{Devices: kubeletDevices}

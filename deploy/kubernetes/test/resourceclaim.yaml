@@ -70,3 +70,20 @@ spec:
               acs: 511
               le_pools: 8
               tle_pools: 2
+---
+# VNI claim: allocates one fabric VNI from the cluster-wide pool managed by the
+# leader-elected VNI pool publisher. Use one persistent ResourceClaim per
+# workload (shared by all its pods) rather than this template when multiple pods
+# must communicate on the same fabric service.
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata:
+  name: cxi-vni
+  namespace: default
+spec:
+  spec:
+    devices:
+      requests:
+        - name: vni
+          exactly:
+            deviceClassName: cxi-vni

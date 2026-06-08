@@ -1,7 +1,6 @@
 package driver
 
 import (
-	"encoding/json"
 	"testing"
 
 	resourceapi "k8s.io/api/resource/v1"
@@ -24,6 +23,11 @@ func cxiResult(device string) resourceapi.DeviceRequestAllocationResult {
 
 func claimWith(results ...resourceapi.DeviceRequestAllocationResult) *resourceapi.ResourceClaim {
 	return &resourceapi.ResourceClaim{
+		Spec: resourceapi.ResourceClaimSpec{
+			Devices: resourceapi.DeviceClaim{
+				Config: cxiConfig(),
+			},
+		},
 		Status: resourceapi.ResourceClaimStatus{
 			Allocation: &resourceapi.AllocationResult{
 				Devices: resourceapi.DeviceAllocationResult{Results: results},
@@ -32,25 +36,17 @@ func claimWith(results ...resourceapi.DeviceRequestAllocationResult) *resourceap
 	}
 }
 
-// minCXIConfig returns a runtime.RawExtension with minimum valid values for all
-// required CXI resource config fields.
-func minCXIConfig() runtime.RawExtension {
-	m := map[string]int64{
-		"txqs": 1, "tgqs": 1, "eqs": 1, "cts": 1,
-		"ptes": 1, "acs": 1, "le_pools": 1, "tle_pools": 1,
-	}
-	raw, _ := json.Marshal(m)
-	return runtime.RawExtension{Raw: raw}
-}
-
-// cxiOpaqueConfig returns a DeviceClaimConfiguration with opaque CXI resource
-// params for testDriver. Applies to all requests (Requests is empty).
-func cxiOpaqueConfig() resourceapi.DeviceClaimConfiguration {
-	return resourceapi.DeviceClaimConfiguration{
-		DeviceConfiguration: resourceapi.DeviceConfiguration{
-			Opaque: &resourceapi.OpaqueDeviceConfiguration{
-				Driver:     testDriver,
-				Parameters: minCXIConfig(),
+func cxiConfig() []resourceapi.DeviceClaimConfiguration {
+	return []resourceapi.DeviceClaimConfiguration{
+		{
+			Requests: []string{"cxi"},
+			DeviceConfiguration: resourceapi.DeviceConfiguration{
+				Opaque: &resourceapi.OpaqueDeviceConfiguration{
+					Driver: testDriver,
+					Parameters: runtime.RawExtension{
+						Raw: []byte(`{"txqs":2,"tgqs":1,"eqs":1,"cts":1,"ptes":1,"acs":1,"le_pools":0,"tle_pools":0}`),
+					},
+				},
 			},
 		},
 	}
@@ -59,10 +55,9 @@ func cxiOpaqueConfig() resourceapi.DeviceClaimConfiguration {
 func newTestDriver() *Driver {
 	devices := cxi.MockDevices(1) // "cxi0"
 	return &Driver{
-		driverName:   testDriver,
-		devices:      devices,
-		store:        NewAllocationStore(),
-		vniAllocator: &StaticVNIAllocator{VNI: 7},
+		driverName: testDriver,
+		devices:    devices,
+		store:      NewAllocationStore(),
 	}
 }
 
@@ -92,14 +87,13 @@ func TestIsVNIClaim(t *testing.T) {
 
 // M2: a mixed claim must still inject the CXI device — and must NOT treat the
 // logical VNI result as a hardware device (no CDI ID, no resource reservation).
-// The VNI must come from the VNI result in the same claim, not the fallback allocator.
 func TestPrepareClaimMixedSkipsVNIResult(t *testing.T) {
 	d := newTestDriver()
 	claim := &resourceapi.ResourceClaim{
 		ObjectMeta: metav1.ObjectMeta{UID: types.UID("claim-1")},
 		Spec: resourceapi.ResourceClaimSpec{
 			Devices: resourceapi.DeviceClaim{
-				Config: []resourceapi.DeviceClaimConfiguration{cxiOpaqueConfig()},
+				Config: cxiConfig(),
 			},
 		},
 		Status: resourceapi.ResourceClaimStatus{
@@ -128,20 +122,28 @@ func TestPrepareClaimMixedSkipsVNIResult(t *testing.T) {
 	if res.Devices[0].DeviceName != "cxi0" {
 		t.Errorf("device = %q, want cxi0", res.Devices[0].DeviceName)
 	}
+	// The pod's VNI must come from the VNI result in the same claim, not the fallback.
 	if got := d.store.Get("pod-a"); len(got) != 1 || got[0].VNI != 100 {
 		t.Errorf("stored allocation = %+v, want one entry with VNI 100", got)
 	}
 }
 
-// A pod requesting a CXI device must also request a VNI — prepareClaim must
-// return an error if vniByPod has no entry for the pod.
-func TestPrepareClaimRequiresVNIClaim(t *testing.T) {
-	d := newTestDriver()
+// L1: when multiple pods share a claim and a later pod has no VNI claim,
+// earlier store entries must be rolled back.
+func TestPrepareClaimRollsBackOnPartialFailure(t *testing.T) {
+	devices := cxi.MockDevices(1)
+	d := &Driver{
+		driverName: testDriver,
+		devices:    devices,
+		store:      NewAllocationStore(),
+	}
+
+	// One CXI device shared by two pods: pod-a has a VNI, pod-b does not.
 	claim := &resourceapi.ResourceClaim{
 		ObjectMeta: metav1.ObjectMeta{UID: types.UID("claim-1")},
 		Spec: resourceapi.ResourceClaimSpec{
 			Devices: resourceapi.DeviceClaim{
-				Config: []resourceapi.DeviceClaimConfiguration{cxiOpaqueConfig()},
+				Config: cxiConfig(),
 			},
 		},
 		Status: resourceapi.ResourceClaimStatus{
@@ -152,13 +154,21 @@ func TestPrepareClaimRequiresVNIClaim(t *testing.T) {
 			},
 			ReservedFor: []resourceapi.ResourceClaimConsumerReference{
 				{Resource: "pods", UID: "pod-a"},
+				{Resource: "pods", UID: "pod-b"},
 			},
 		},
 	}
-
-	res := d.prepareClaim(claim, nil) // no VNI claims → must fail
+	// Only pod-a has a VNI allocated from the K8s pool.
+	vniByPod := map[types.UID]int{"pod-a": 42}
+	res := d.prepareClaim(claim, vniByPod)
 	if res.Err == nil {
-		t.Fatal("expected error for pod without VNI claim, got nil")
+		t.Fatal("want error (pod-b has no VNI claim), got nil")
+	}
+	if got := d.store.Get("pod-a"); got != nil {
+		t.Errorf("pod-a store entry = %+v, want nil after rollback", got)
+	}
+	if got := d.store.PodUIDsForClaim("claim-1"); len(got) != 0 {
+		t.Errorf("claim-1 pod mappings = %+v, want empty after rollback", got)
 	}
 }
 

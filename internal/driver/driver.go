@@ -25,7 +25,6 @@ type Driver struct {
 	mockDevices     []*cxi.Device
 	devices         []*cxi.Device
 	store           *AllocationStore
-	vniAllocator    VNIAllocator
 	overhead        cxi.ResourceSet // admin-configured per-device reserved overhead
 	refreshInterval time.Duration   // how often to republish ResourceSlice with fresh avail attrs
 }
@@ -40,7 +39,6 @@ func New(
 	nodeName, podUID, driverName, cdiRoot, pluginDir, registrarDir string,
 	kubeClient kubernetes.Interface,
 	mockDevices []*cxi.Device,
-	vniAllocator VNIAllocator,
 	cfg Config,
 ) *Driver {
 	return &Driver{
@@ -53,7 +51,6 @@ func New(
 		kubeClient:      kubeClient,
 		mockDevices:     mockDevices,
 		store:           NewAllocationStore(),
-		vniAllocator:    vniAllocator,
 		overhead:        cfg.Overhead,
 		refreshInterval: cfg.RefreshInterval,
 	}
