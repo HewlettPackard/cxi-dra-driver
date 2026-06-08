@@ -1,7 +1,7 @@
 apiVersion: v1
 kind: Pod
 metadata:
-  name: cxi-test
+  name: cxi-test-3
   namespace: default
 spec:
   restartPolicy: Never
@@ -9,7 +9,7 @@ spec:
   # Each pod gets its own ephemeral claim from the template.
   resourceClaims:
     - name: cxi
-      resourceClaimTemplateName: cxi-claim-template
+      resourceClaimTemplateName: cxi-quarter
 
   containers:
     - name: workload
@@ -30,7 +30,7 @@ spec:
           - name: cxi
       env:
         - name: LD_LIBRARY_PATH      
-          value: "/usr/lib64/:/extras/lib/:/hostlibs"
+          value: "/usr/lib64/:/extras/lib/:/hostlibs:/xpmem/lib64"
         - name: CXIP_DEFAULT_LINK
           value: "1"
         - name: CXIP_DEFAULT_SPEED
@@ -42,10 +42,16 @@ spec:
           mountPath: /hostlibs
         - name: build
           mountPath: /extras
+        - name: xpmem
+          mountPath: /xpmem/lib64
   volumes:
     - name: libcxi
       hostPath:
         path: /usr/lib64/
+        type: Directory
+    - name: xpmem
+      hostPath:
+        path: /opt/xpmem/lib64
         type: Directory
     - name: build
       hostPath:

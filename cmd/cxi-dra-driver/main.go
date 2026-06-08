@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -30,13 +31,30 @@ func main() {
 		registrarDir = flag.String("registrar-dir", kubeletplugin.KubeletRegistryDir, "Kubelet plugin registrar directory")
 		kubeconfig   = flag.String("kubeconfig", "", "Path to kubeconfig (omit for in-cluster config)")
 		mockDevices  = flag.Int("mock-devices", 0, "Generate N synthetic CXI devices instead of real discovery (for kind/local testing)")
+
+		// VNI pool: each pod receives a unique VNI so cxil_svc_set_vni_range
+		// does not return -EEXIST when two pods share the same device.
+		// Avoid VNI 1 (Slingshot default/untagged) and any VNIs reserved by
+		// system services visible in `cxi service show`.
+		vniMin = flag.Int("vni-min", 2, "Lowest VNI the driver may allocate (inclusive, >= 1)")
+		vniMax = flag.Int("vni-max", 4094, "Highest VNI the driver may allocate (inclusive, >= vni-min)")
+
+		refreshInterval = flag.Duration("resource-refresh-interval", 30*time.Second,
+			"How often to republish the ResourceSlice with refreshed available-capacity attributes")
+
+		// Admin overhead: resources to deduct from hardware totals when computing
+		// the usable ceiling for outright rejection. Applied uniformly to all
+		// devices on this node. Set these to cover pre-existing system services.
+		reservedTXQs    = flag.Int64("reserved-txqs", 0, "TXQs reserved by pre-existing system services (deducted from usable ceiling)")
+		reservedTGQs    = flag.Int64("reserved-tgqs", 0, "TGQs reserved by pre-existing system services")
+		reservedEQs     = flag.Int64("reserved-eqs", 0, "EQs reserved by pre-existing system services")
+		reservedCTs     = flag.Int64("reserved-cts", 0, "CTs reserved by pre-existing system services")
+		reservedPTEs    = flag.Int64("reserved-ptes", 0, "PTEs reserved by pre-existing system services")
+		reservedACs     = flag.Int64("reserved-acs", 0, "ACs reserved by pre-existing system services")
+		reservedLEPools = flag.Int64("reserved-le-pools", 0, "LE pools reserved by pre-existing system services (1 pool = 256 LEs)")
+		reservedTLEPools = flag.Int64("reserved-tle-pools", 0, "TLE pools reserved by pre-existing system services (1 pool = 512 TLEs)")
 	)
 	flag.Parse()
-
-	if *nodeName == "" {
-		fmt.Fprintln(os.Stderr, "error: --node-name or $NODE_NAME must be set")
-		os.Exit(1)
-	}
 
 	kubeClient, err := buildKubeClient(*kubeconfig)
 	if err != nil {
@@ -44,25 +62,54 @@ func main() {
 		os.Exit(1)
 	}
 
-	mock := *mockDevices > 0
-	var mockDevList []*cxi.Device
-	if mock {
-		mockDevList = cxi.MockDevices(*mockDevices)
-		for _, dev := range mockDevList {
-			if err := os.MkdirAll(dev.SysfsPath, 0o755); err != nil {
-				fmt.Fprintf(os.Stderr, "error: creating mock sysfs dir %s: %v\n", dev.SysfsPath, err)
-				os.Exit(1)
-			}
-		}
-	}
-
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	d := driver.New(*nodeName, *podUID, *driverName, *cdiRoot, *pluginDir, *registrarDir, kubeClient, mockDevList,
-		// TODO: replace StaticVNIAllocator with a real cluster-wide VNI pool
-		// allocator once the VNI ResourceSlice phase is implemented.
-		&driver.StaticVNIAllocator{VNI: 1},
+	if *nodeName == "" {
+		fmt.Fprintln(os.Stderr, "error: --node-name or $NODE_NAME must be set")
+		os.Exit(1)
+	}
+
+	mock := *mockDevices > 0
+
+	if *reservedTXQs < 0 || *reservedTGQs < 0 || *reservedEQs < 0 || *reservedCTs < 0 ||
+		*reservedPTEs < 0 || *reservedACs < 0 || *reservedLEPools < 0 || *reservedTLEPools < 0 {
+		fmt.Fprintln(os.Stderr, "error: --reserved-* values must be non-negative")
+		os.Exit(1)
+	}
+	if *vniMin < 1 {
+		fmt.Fprintln(os.Stderr, "error: --vni-min must be >= 1")
+		os.Exit(1)
+	}
+	if *vniMax < *vniMin {
+		fmt.Fprintf(os.Stderr, "error: --vni-max (%d) must be >= --vni-min (%d)\n", *vniMax, *vniMin)
+		os.Exit(1)
+	}
+
+	overhead := cxi.ResourceSet{
+		TXQs: *reservedTXQs,
+		TGQs: *reservedTGQs,
+		EQs:  *reservedEQs,
+		CTs:  *reservedCTs,
+		PTEs: *reservedPTEs,
+		ACs:  *reservedACs,
+		LEs:  *reservedLEPools * cxi.LEPoolSize,
+		TLEs: *reservedTLEPools * cxi.TLEPoolSize,
+	}
+
+	var mockDevList []*cxi.Device
+	if mock {
+		mockDevList = cxi.MockDevices(*mockDevices)
+	}
+
+	d := driver.New(
+		*nodeName, *podUID, *driverName, *cdiRoot, *pluginDir, *registrarDir,
+		kubeClient, mockDevList,
+		driver.NewPoolVNIAllocator(*vniMin, *vniMax),
+		driver.Config{
+			Overhead:        overhead,
+			RefreshInterval: *refreshInterval,
+		},
 	)
 
 	nriPlugin, err := nri.New(d.Store(), mock)
@@ -71,8 +118,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Run the NRI plugin concurrently with the DRA driver. If either exits,
-	// the signal context will eventually cancel the other.
 	nriErrCh := make(chan error, 1)
 	go func() {
 		nriErrCh <- nriPlugin.Run(ctx)

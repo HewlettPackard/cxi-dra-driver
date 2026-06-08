@@ -9,44 +9,73 @@ import (
 )
 
 // buildDriverResources constructs the DriverResources payload for
-// helper.PublishResources. The helper's ResourceSlice controller takes care of
-// creating/updating/deleting ResourceSlice objects on the API server.
+// helper.PublishResources.
+//
+// Each physical CXI device is published with AllowMultipleAllocations=true —
+// the scheduler may place multiple pods on the same device. Capacity tracking
+// is not delegated to the scheduler; instead the driver performs a live
+// fit-check in PrepareResourceClaims against the actual hardware state.
+//
+// Device attributes include both static topology info and current available
+// resource counts. The available counts are refreshed periodically so that
+// users can write CEL selectors against them (e.g. to prefer devices with
+// more headroom). They are informational — the live fit-check is the
+// authoritative gate.
 func (d *Driver) buildDriverResources() resourceslice.DriverResources {
 	return resourceslice.DriverResources{
 		Pools: map[string]resourceslice.Pool{
 			d.nodeName: {
 				Slices: []resourceslice.Slice{
-					{Devices: buildDevices(d.devices)},
+					{Devices: d.buildDevices()},
 				},
 			},
 		},
 	}
 }
 
-func buildDevices(devices []*cxi.Device) []resourceapi.Device {
-	out := make([]resourceapi.Device, 0, len(devices))
-	for _, dev := range devices {
+// buildDevices constructs the Device list for the ResourceSlice.
+func (d *Driver) buildDevices() []resourceapi.Device {
+	out := make([]resourceapi.Device, 0, len(d.devices))
+	for _, dev := range d.devices {
+		avail, err := cxi.ReadAvailableCapacity(dev.Name)
+		if err != nil {
+			// Log and use zeros — the fit-check will reject requests that
+			// can't fit rather than silently overcommitting.
+			d.logf("warning: reading available capacity for %s: %v", dev.Name, err)
+			avail = cxi.ResourceSet{}
+		}
+		// Subtract admin-configured overhead so the published avail_* attributes
+		// match the usable ceiling enforced at prepare time. Clamped to zero in
+		// case overhead exceeds what the hardware currently reports.
+		avail = avail.Sub(d.overhead).ClampToZero()
+
 		out = append(out, resourceapi.Device{
 			Name: dev.Name,
 			Attributes: map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
-				// Topology
+				// Topology — usable in CEL placement selectors.
 				"numa_node": {IntValue: ptr.To(int64(dev.NUMANode))},
 				"pcie_root": {StringValue: ptr.To(dev.PCIeRoot)},
 				"hsn_iface": {StringValue: ptr.To(dev.HSNIface)},
-				// Hardware resource capacity (Max values from the device).
-				// These allow the scheduler to make topology- and capacity-aware
-				// placement decisions. Res values reflect per-service reservations
-				// and are tracked at runtime by the ResourceTracker, not exposed
-				// here — ResourceSlice attributes are static at publish time.
-				"capacity_txqs": {IntValue: ptr.To(dev.Capacity.TXQs.Max)},
-				"capacity_tgqs": {IntValue: ptr.To(dev.Capacity.TGQs.Max)},
-				"capacity_eqs":  {IntValue: ptr.To(dev.Capacity.EQs.Max)},
-				"capacity_cts":  {IntValue: ptr.To(dev.Capacity.CTs.Max)},
-				"capacity_tles": {IntValue: ptr.To(dev.Capacity.TLEs.Max)},
-				"capacity_ptes": {IntValue: ptr.To(dev.Capacity.PTEs.Max)},
-				"capacity_les":  {IntValue: ptr.To(dev.Capacity.LEs.Max)},
-				"capacity_acs":  {IntValue: ptr.To(dev.Capacity.ACs.Max)},
+				// Hardware totals — static, from cxil_devinfo at discovery.
+				"capacity_txqs": {IntValue: ptr.To(dev.Capacity.TXQs)},
+				"capacity_tgqs": {IntValue: ptr.To(dev.Capacity.TGQs)},
+				"capacity_eqs":  {IntValue: ptr.To(dev.Capacity.EQs)},
+				"capacity_cts":  {IntValue: ptr.To(dev.Capacity.CTs)},
+				"capacity_tles": {IntValue: ptr.To(dev.Capacity.TLEs)},
+				"capacity_ptes": {IntValue: ptr.To(dev.Capacity.PTEs)},
+				"capacity_les":  {IntValue: ptr.To(dev.Capacity.LEs)},
+				"capacity_acs":  {IntValue: ptr.To(dev.Capacity.ACs)},
+				// Available — refreshed periodically; informational for CEL selectors.
+				"avail_txqs": {IntValue: ptr.To(avail.TXQs)},
+				"avail_tgqs": {IntValue: ptr.To(avail.TGQs)},
+				"avail_eqs":  {IntValue: ptr.To(avail.EQs)},
+				"avail_cts":  {IntValue: ptr.To(avail.CTs)},
+				"avail_tles": {IntValue: ptr.To(avail.TLEs)},
+				"avail_ptes": {IntValue: ptr.To(avail.PTEs)},
+				"avail_les":  {IntValue: ptr.To(avail.LEs)},
+				"avail_acs":  {IntValue: ptr.To(avail.ACs)},
 			},
+			AllowMultipleAllocations: ptr.To(true),
 		})
 	}
 	return out

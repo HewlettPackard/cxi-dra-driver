@@ -1,7 +1,27 @@
+# CXI ResourceClaimTemplates with explicit resource allocation.
+#
+# All resource fields are required — the driver has no defaults. Claims
+# without opaque config will be rejected at prepare time with a clear error.
+#
+# LEs and TLEs are expressed as pool counts:
+#   le_pools:  1 pool = 1024 LEs
+#   tle_pools: 1 pool = 512  TLEs
+#
+# The driver performs a live fit-check at service creation time against the
+# actual hardware state, so placement is always accurate even if multiple
+# pods are scheduled concurrently.
+#
+# Note: each request in a claim should target a separate device. Multiple
+# requests landing on the same physical device will fail at service creation
+# time due to TOCTOU between the fit-check and the second service create.
+---
+# Quarter-device: suitable for most jobs. Requests four LE pools (4096 LEs) and
+# one TLE pool (512 TLEs); set le_pools/tle_pools to 0 if your job does not use
+# triggered ops.
 apiVersion: resource.k8s.io/v1
 kind: ResourceClaimTemplate
 metadata:
-  name: cxi-claim-template
+  name: cxi-quarter
   namespace: default
 spec:
   spec:
@@ -10,4 +30,43 @@ spec:
         - name: cxi
           exactly:
             deviceClassName: cxi-device
-            count: 2
+      config:
+        - requests: ["cxi"]
+          opaque:
+            driver: cxi.slingshot.hpe.com
+            parameters:
+              txqs: 256
+              tgqs: 128
+              eqs: 511
+              cts: 511
+              ptes: 512
+              acs: 255
+              le_pools: 4
+              tle_pools: 1
+---
+# Half-device: for bandwidth-intensive jobs needing more queues or LE pools.
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata:
+  name: cxi-half
+  namespace: default
+spec:
+  spec:
+    devices:
+      requests:
+        - name: cxi
+          exactly:
+            deviceClassName: cxi-device
+      config:
+        - requests: ["cxi"]
+          opaque:
+            driver: cxi.slingshot.hpe.com
+            parameters:
+              txqs: 512
+              tgqs: 256
+              eqs: 1023
+              cts: 1023
+              ptes: 1024
+              acs: 511
+              le_pools: 8
+              tle_pools: 2

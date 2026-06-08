@@ -4,14 +4,17 @@ import (
 	"sync"
 
 	"k8s.io/apimachinery/pkg/types"
+
+	"github.com/slingshot/cxi-dra-driver/internal/cxi"
 )
 
 // PodAllocation records which CXI devices were allocated to a pod.
 type PodAllocation struct {
-	DeviceName string // e.g. "cxi0"
-	DevPath    string // e.g. "/dev/cxi0" — host path of the character device
-	HSNIface   string // e.g. "hsn2"
-	VNI        int    // Virtual Network Identifier for the Slingshot fabric service
+	DeviceName string          // e.g. "cxi0"
+	DevPath    string          // e.g. "/dev/cxi0" — host path of the character device
+	HSNIface   string          // e.g. "hsn2"
+	VNI        int             // Virtual Network Identifier for the Slingshot fabric service
+	Resources  cxi.ResourceSet // negotiated per-service resource limits
 }
 
 // AllocationStore is a concurrency-safe map of pod UID → allocated CXI devices.

@@ -3,7 +3,7 @@ package cxi
 import "fmt"
 type StubServiceManager struct{}
 var _ ServiceManager = StubServiceManager{}
-func (StubServiceManager) CreateService(deviceName string, netnsInode uint64, vni int) (int, error) {
+func (StubServiceManager) CreateService(deviceName string, netnsInode uint64, vni int, _ ResourceSet) (int, error) {
 	return 0, fmt.Errorf("cxi: CreateService not implemented (rebuild with -tags cxi and libcxi installed at /opt/libcxi-netns/)")
 }
 func (StubServiceManager) DeleteService(deviceName string, netnsInode uint64) error {

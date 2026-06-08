@@ -27,7 +27,7 @@ spec:
 
       containers:
         - name: driver
-          image: docker.io/pirese/cxi-dra-driver:latest
+          image: docker.io/pirese/cxi-dra-driver:dev
           imagePullPolicy: Always
           command:
             - /cxi-dra-driver
@@ -36,6 +36,16 @@ spec:
             - --cdi-root=/var/run/cdi
             - --plugin-dir=/var/lib/kubelet/plugins/cxi.slingshot.hpe.com
             - --registrar-dir=/var/lib/kubelet/plugins_registry
+            - --reserved-txqs=5
+            - --reserved-tgqs=5
+            - --reserved-eqs=10
+            - --reserved-cts=0
+            - --reserved-ptes=12
+            - --reserved-acs=4
+            - --reserved-le-pools=2
+            - --reserved-tle-pools=1
+            - --vni-min=2
+            - --vni-max=4094
           env:
             - name: NODE_NAME
               valueFrom:
