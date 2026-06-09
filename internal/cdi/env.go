@@ -255,7 +255,7 @@ func WriteAWSofiNCCLSpec(cdiRoot, driverName string, cfg CDIEnvConfig) error {
 		mounts = append(mounts, &specs.Mount{
 			HostPath:      dep.hostPath,
 			ContainerPath: "/usr/lib/" + dep.soName,
-			Options:       []string{"bind", "rw", "nosuid", "nodev", "private"},
+			Options:       []string{"bind", "ro", "nosuid", "nodev", "private"},
 		})
 	}
 
