@@ -21,11 +21,10 @@ type Device struct {
 	PCIeRoot    string // PCI slot name, e.g. "0000:81:00.0"
 	HSNIface    string // paired HSN interface, e.g. "hsn2" (set by PairDevice)
 
-	// Capacity holds the total hardware resource limits for this device.
-	// On real hardware these are read from the device via libcxi at discovery
-	// time. In mock mode DefaultResourceSet() is used.
-	//
-	// TODO: populate Max values from cxil_devinfo when CGo/libcxi is available.
+	// Capacity holds the total hardware resource limits for this device,
+	// read from cxil_devinfo via libcxi at discovery time (production builds).
+	// In non-cxi builds DeviceCapacity() is used. Discovery hard-fails if
+	// capacity cannot be read in production.
 	Capacity ResourceSet
 }
 
@@ -52,6 +51,10 @@ func Discover() ([]*Device, error) {
 		}
 
 		sysfsPath := filepath.Join(sysfsClassPath, name)
+		capacity, err := readDeviceCapacity(name)
+		if err != nil {
+			return nil, fmt.Errorf("reading capacity for device %s: %w", name, err)
+		}
 		dev := &Device{
 			Name:      name,
 			Index:     idx,
@@ -59,9 +62,7 @@ func Discover() ([]*Device, error) {
 			SysfsPath: sysfsPath,
 			NUMANode:  readIntFile(filepath.Join(sysfsPath, "device", "numa_node"), -1),
 			PCIeRoot:  readPCISlot(filepath.Join(sysfsPath, "device", "uevent")),
-			// TODO: read real capacity from cxil_devinfo once CGo/libcxi is available.
-			// For now use defaults so the ResourceSlice and ResourceTracker are populated.
-			Capacity: DeviceCapacity(),
+			Capacity:  capacity,
 		}
 
 		if err := PairDevice(dev); err != nil {
@@ -92,9 +93,9 @@ func readPCISlot(ueventPath string) string {
 	if err != nil {
 		return ""
 	}
-	for _, line := range strings.Split(string(data), "\n") {
-		if strings.HasPrefix(line, "PCI_SLOT_NAME=") {
-			return strings.TrimPrefix(line, "PCI_SLOT_NAME=")
+	for line := range strings.SplitSeq(string(data), "\n") {
+		if v, ok := strings.CutPrefix(line, "PCI_SLOT_NAME="); ok {
+			return v
 		}
 	}
 	return ""

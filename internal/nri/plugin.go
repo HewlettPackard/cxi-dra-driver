@@ -3,6 +3,7 @@ package nri
 import (
 	"context"
 	"fmt"
+	"maps"
 	"os"
 	"sync"
 	"syscall"
@@ -98,9 +99,16 @@ func (p *Plugin) RunPodSandbox(_ context.Context, pod *api.PodSandbox) error {
 	state := &podState{netnsInode: inode, svcIDs: make(map[string]int)}
 
 	for _, alloc := range allocs {
+		// Defensive bound check at the hardware boundary: an out-of-range VNI
+		// would silently truncate to uint16 in libcxi and could scope the
+		// service to the wrong fabric network.
+		if !driver.ValidVNI(alloc.VNI) {
+			return fmt.Errorf("refusing to create CXI service for %s: VNI %d out of range [%d, %d]",
+				alloc.DeviceName, alloc.VNI, driver.MinVNI, driver.MaxVNI)
+		}
 		fmt.Printf("cxi-nri: creating CXI service: pod=%s device=%s hsn=%s netns=%s inode=%d vni=%d\n",
 			podUID, alloc.DeviceName, alloc.HSNIface, netnsPath, inode, alloc.VNI)
-		svcID, err := p.svcMgr.CreateService(alloc.DeviceName, inode, alloc.VNI)
+		svcID, err := p.svcMgr.CreateService(alloc.DeviceName, inode, alloc.VNI, alloc.Resources)
 		if err != nil {
 			return fmt.Errorf("creating CXI service for %s: %w", alloc.DeviceName, err)
 		}
@@ -133,9 +141,7 @@ func (p *Plugin) CreateContainer(_ context.Context, pod *api.PodSandbox, contain
 
 	p.mu.Lock()
 	svcIDs := make(map[string]int, len(state.svcIDs))
-	for k, v := range state.svcIDs {
-		svcIDs[k] = v
-	}
+	maps.Copy(svcIDs, state.svcIDs)
 	inode := state.netnsInode
 	p.mu.Unlock()
 

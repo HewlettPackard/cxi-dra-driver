@@ -1,0 +1,99 @@
+
+# ── SEQUENCE 1: Node Boot ──────────────────────────────────────────────────────
+
+node_boot: {
+  shape: sequence_diagram
+  title: "Node Boot — Driver Startup"
+
+  os
+  main
+  driver
+  cxi_pkg
+  nri
+  kubelet
+  apiserver
+
+  os -> main: "DaemonSet pod scheduled\n(NODE_NAME, POD_UID injected as env)"
+
+  main -> cxi_pkg: "DiscoverDevices() [mock or sysfs]"
+  cxi_pkg -> cxi_pkg: "walk /sys/class/cxi_user/*\nread NUMANode, PCIeRoot per device"
+  cxi_pkg -> cxi_pkg: "DiscoverHSN(): walk sysfs,\nmatch HSN iface by PCIe root"
+  cxi_pkg -> main: "[]Device{cxi0(hsn2), cxi1(hsn0), ...}"
+
+  main -> driver: "NewDriver(devices, vniAllocator, ...)"
+  main -> nri: "NewPlugin(store, svcMgr)"
+  main -> nri: "go plugin.Run(ctx)"
+  nri -> kubelet: "NRI socket handshake\n(/var/run/nri/nri.sock)"
+  kubelet -> nri: "RegisterPlugin ACK\n(subscribes RunPodSandbox,\nCreateContainer, StopPodSandbox)"
+
+  main -> driver: "driver.Run(ctx)"
+  driver -> driver: "WriteCDISpec per device\n(/var/run/cdi/cxi-*.json)"
+  driver -> kubelet: "RegisterPlugin\n(kubelet-plugin socket)"
+  kubelet -> driver: "ACK"
+
+  driver -> apiserver: "Publish ResourceSlice (CXI)\ncxi0 [numa.node=1, pcie.root=81:00.0, hsn=hsn2]\ncxi1 [numa.node=0, pcie.root=01:00.0, hsn=hsn0]"
+
+  main -> main: "Leader election for VNI pool\n(k8s Lease API)"
+  main -> apiserver: "Publish ResourceSlice (VNI)\nvni-100 .. vni-300 [type=vni]"
+  apiserver -> main: "ResourceSlice created/updated"
+
+  driver -> driver: "Block on ctx\n(serving kubelet plugin gRPC)"
+}
+
+# ── SEQUENCE 2: User Job Submission ───────────────────────────────────────────
+
+job_submission: {
+  shape: sequence_diagram
+  title: "User Job Submission — Pod Scheduling through Container Start"
+
+  user
+  apiserver
+  scheduler
+  kubelet
+  driver
+  nri
+  containerd
+  cxi_svc
+
+  user -> apiserver: "kubectl apply:\n  Deployment\n  ResourceClaim (cxi-vni class)\n  ResourceClaimTemplate (cxi-device class)"
+
+  apiserver -> scheduler: "Pod pending\n(resourceClaims: [device-tmpl, vni-claim])"
+
+  scheduler -> apiserver: "GET ResourceSlices\n(driver=cxi.slingshot.hpe.com)"
+  apiserver -> scheduler: "ResourceSlice CXI: cxi0, cxi1\nResourceSlice VNI: vni-100..300"
+
+  scheduler -> scheduler: "Evaluate DeviceClass selectors\nCheck DeviceClaim topology constraints\nPick: node=worker-1, cxi0, vni-142"
+
+  scheduler -> apiserver: "Patch ResourceClaim status:\n  allocatedDevice=cxi0\n  allocatedVNI=vni-142\n  scheduledNode=worker-1"
+
+  kubelet -> apiserver: "Watch: claim allocated for this node"
+  kubelet -> driver: "NodePrepareResources(claims)"
+
+  driver -> driver: "Extract VNI=142 from\npool claim allocation"
+  driver -> driver: "Admit(cxi0, DefaultResourceSet)\n→ check headroom in ResourceTracker"
+  driver -> driver: "Reserve(podUID, cxi0, resources)"
+  driver -> driver: "AllocationStore.Set(podUID,\n  {Device:cxi0, HSN:hsn2, VNI:142})"
+
+  driver -> kubelet: "return CDI device ID:\n  cxi.slingshot.hpe.com/cxi0"
+
+  kubelet -> containerd: "RunPodSandbox\n(apply CDI spec for cxi0)"
+  containerd -> containerd: "bind-mount /dev/cxi0\nbind-mount /run/cxi/cxi0 (sysfs)\ncgroup BPF allowance"
+
+  containerd -> nri: "NRI hook: RunPodSandbox\n(podUID, netns path)"
+  nri -> nri: "stat netns → inode=98765"
+  nri -> nri: "AllocationStore.Get(podUID)\n→ {cxi0, hsn2, VNI=142}"
+  nri -> cxi_svc: "CreateService(cxi0, netnsInode=98765, vni=142)"
+  cxi_svc -> cxi_svc: "open /dev/cxi0\nalloc service (libcxi ioctl)\nscoped to netns + VNI"
+  cxi_svc -> nri: "serviceID=7"
+  nri -> nri: "podStates[podUID] = {cxi0: svcID=7}"
+
+  containerd -> nri: "NRI hook: CreateContainer"
+  nri -> containerd: "inject env:\n  FI_CXI_SVC_ID=7"
+
+  containerd -> containerd: "start container process"
+
+  containerd -> nri: "NRI hook: StopPodSandbox"
+  nri -> cxi_svc: "DeleteService(cxi0, netnsInode=98765)"
+  nri -> driver: "UnprepareResourceClaims(podUID)"
+  driver -> driver: "ResourceTracker.Release(podUID)\nAllocationStore.Delete(podUID)"
+}

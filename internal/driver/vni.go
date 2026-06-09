@@ -1,36 +1,28 @@
 package driver
 
-import "k8s.io/apimachinery/pkg/types"
+import "fmt"
 
-// VNIAllocator is the interface for obtaining a VNI for a pod.
-//
-// The current implementation (StaticVNIAllocator) returns a hardcoded value.
-// The next phase will replace this with a real allocator that coordinates with
-// a cluster-wide VNI pool ResourceSlice, ensuring each workload gets a unique
-// VNI scoped to the Slingshot fabric.
-//
-// To plug in a new allocator, implement this interface and pass it to
-// driver.New() in cmd/cxi-dra-driver/main.go.
-type VNIAllocator interface {
-	// Allocate returns a VNI for the given pod UID.
-	// It is called from PrepareResourceClaims, before any containers start.
-	Allocate(podUID types.UID) (int, error)
+const (
+	// MinVNI and MaxVNI bound the usable Slingshot fabric VNI space. VNI is a
+	// uint16 hardware field (see internal/cxi/service_cgo.go, which casts to
+	// uint16), and 0 is reserved — the flags treat 0 as "pool disabled".
+	MinVNI = 1
+	MaxVNI = 65535
+)
 
-	// Release is called when the pod's last container has stopped, allowing
-	// the allocator to return the VNI to the pool.
-	Release(podUID types.UID)
+// ValidVNI reports whether vni is within the usable fabric VNI range. It guards
+// the hardware boundary: an out-of-range VNI would silently truncate to uint16
+// and could scope a service to the wrong fabric network.
+func ValidVNI(vni int) bool {
+	return vni >= MinVNI && vni <= MaxVNI
 }
 
-// StaticVNIAllocator always returns the same VNI.
-// This is a placeholder until the cluster-wide VNI pool is implemented.
-type StaticVNIAllocator struct {
-	VNI int
-}
-
-func (s *StaticVNIAllocator) Allocate(_ types.UID) (int, error) {
-	return s.VNI, nil
-}
-
-func (s *StaticVNIAllocator) Release(_ types.UID) {
-	// Nothing to release — static allocation.
+// ValidateVNIRange checks that [start, end] is a usable cluster-wide VNI pool
+// range: MinVNI <= start <= end <= MaxVNI.
+func ValidateVNIRange(start, end int) error {
+	if start < MinVNI || end > MaxVNI || start > end {
+		return fmt.Errorf("invalid VNI range [%d, %d]: must satisfy %d <= start <= end <= %d",
+			start, end, MinVNI, MaxVNI)
+	}
+	return nil
 }

@@ -12,6 +12,10 @@ rules:
   - apiGroups: [""]
     resources: ["nodes"]
     verbs: ["get"]
+  # Reading the DaemonSet at startup to obtain its UID for ResourceSlice ownership.
+  - apiGroups: ["apps"]
+    resources: ["daemonsets"]
+    verbs: ["get"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -31,3 +35,35 @@ kind: ServiceAccount
 metadata:
   name: cxi-dra-driver
   namespace: kube-system
+---
+# VNI pool leader election is namespaced and scoped to the single lease the
+# driver uses, so the ServiceAccount cannot read or overwrite control-plane
+# leases (e.g. kube-scheduler / kube-controller-manager) in other namespaces.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: cxi-vni-pool-leader
+  namespace: kube-system
+rules:
+  # "create" cannot be restricted by resourceName — the object does not exist yet.
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["create"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    resourceNames: ["cxi-vni-pool-leader"]
+    verbs: ["get", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: cxi-vni-pool-leader
+  namespace: kube-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: cxi-vni-pool-leader
+subjects:
+  - kind: ServiceAccount
+    name: cxi-dra-driver
+    namespace: kube-system

@@ -39,10 +39,12 @@ kind-reload: kind-load
 deploy:
 	kubectl apply -f deploy/kubernetes/clusterrole.yaml
 	kubectl apply -f deploy/kubernetes/deviceclass.yaml
+	kubectl apply -f deploy/kubernetes/admission-policy.yaml
 	kubectl apply -f deploy/kubernetes/daemonset.yaml
 
 undeploy:
 	kubectl delete -f deploy/kubernetes/daemonset.yaml --ignore-not-found
+	kubectl delete -f deploy/kubernetes/admission-policy.yaml --ignore-not-found
 	kubectl delete -f deploy/kubernetes/deviceclass.yaml --ignore-not-found
 	kubectl delete -f deploy/kubernetes/clusterrole.yaml --ignore-not-found
 

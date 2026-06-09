@@ -2,11 +2,14 @@
   "$schema": "https://raw.githubusercontent.com/jetify-com/devbox/0.17.0/.schema/devbox.schema.json",
   "packages": [
     "kubectl@latest",
-    "k9s@latest"
+    "k9s@latest",
+    "gopls@latest",
+    "go@latest"
   ],
   "shell": {
     "init_hook": [
-      "echo 'Welcome to devbox!' > /dev/null"
+      "export GOPATH=$HOME/go",
+      "export PATH=$GOPATH/bin:$PATH"
     ],
     "scripts": {
       "test": [

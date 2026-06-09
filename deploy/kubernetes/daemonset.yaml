@@ -20,6 +20,13 @@ spec:
       hostPID: true  # required for future netns inode querying
       priorityClassName: system-node-critical
 
+      # Baseline seccomp profile. The driver container is privileged (it needs
+      # raw access to /dev/cxi* and sysfs) so it runs unconfined at runtime, but
+      # declaring the pod baseline satisfies Pod Security Standards and tooling.
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+
       # Only schedule on nodes with CXI hardware.
       # Label nodes with: kubectl label node <node> feature.node.kubernetes.io/cxi=true
       nodeSelector:
@@ -27,7 +34,7 @@ spec:
 
       containers:
         - name: driver
-          image: docker.io/pirese/cxi-dra-driver:latest
+          image: docker.io/pirese/cxi-dra-driver:dev
           imagePullPolicy: Always
           command:
             - /cxi-dra-driver
@@ -36,6 +43,17 @@ spec:
             - --cdi-root=/var/run/cdi
             - --plugin-dir=/var/lib/kubelet/plugins/cxi.slingshot.hpe.com
             - --registrar-dir=/var/lib/kubelet/plugins_registry
+            - --reserved-txqs=5
+            - --reserved-tgqs=5
+            - --reserved-eqs=10
+            - --reserved-cts=0
+            - --reserved-ptes=12
+            - --reserved-acs=4
+            - --reserved-le-pools=2
+            - --reserved-tle-pools=1
+            - --daemonset-name=cxi-dra-driver
+            - --vni-range-start=100
+            - --vni-range-end=300
           env:
             - name: NODE_NAME
               valueFrom:
@@ -45,6 +63,10 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.uid
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
           securityContext:
             privileged: true  # required to access /dev/cxi* and sysfs
             runAsUser: 0
