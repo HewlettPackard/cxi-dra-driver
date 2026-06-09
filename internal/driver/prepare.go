@@ -156,11 +156,22 @@ func (d *Driver) prepareClaim(claim *resourceapi.ResourceClaim, vniByPod map[typ
 			}
 		}
 
+		cdiIDs := []string{
+			cdi.DeviceID(d.driverName, alloc.Device),
+			cdi.EnvDeviceID(d.driverName),
+		}
+		if d.cdiEnvConfig.NCCLPrefix != "" {
+			cdiIDs = append(cdiIDs, cdi.NCCLDeviceID(d.driverName))
+		}
+		if d.cdiEnvConfig.AWSofiNCCLPrefix != "" {
+			cdiIDs = append(cdiIDs, cdi.AWSofiNCCLDeviceID(d.driverName))
+		}
+
 		kubeletDevices = append(kubeletDevices, kubeletplugin.Device{
 			Requests:     []string{alloc.Request},
 			PoolName:     alloc.Pool,
 			DeviceName:   alloc.Device,
-			CDIDeviceIDs: []string{cdi.DeviceID(d.driverName, alloc.Device)},
+			CDIDeviceIDs: cdiIDs,
 		})
 
 		pa := d.podAllocationBase(alloc.Device)
