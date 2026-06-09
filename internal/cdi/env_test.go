@@ -186,3 +186,82 @@ func TestRemoveNCCLSpec(t *testing.T) {
 	}
 }
 
+func TestWriteAWSofiNCCLSpec(t *testing.T) {
+	cdiRoot := t.TempDir()
+	const driver = "cxi.slingshot.hpe.com"
+	cfg := CDIEnvConfig{
+		AWSofiNCCLPrefix: "/spack/aws-ofi-nccl-1.18.0",
+		HwlocLib:         "/spack/hwloc/lib/libhwloc.so.15",
+		PciaccessLib:     "/spack/pciaccess/lib/libpciaccess.so.0",
+		Libxml2Lib:       "/spack/libxml2/lib/libxml2.so.2",
+		LibatomicLib:     "/spack/gcc-runtime/lib/libatomic.so.1",
+		LiblzmaLib:       "/spack/xz/lib/liblzma.so.5",
+		LibiconvLib:      "/spack/libiconv/lib/libiconv.so.2",
+	}
+
+	if err := WriteAWSofiNCCLSpec(cdiRoot, driver, cfg); err != nil {
+		t.Fatalf("WriteAWSofiNCCLSpec: %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(cdiRoot, driver+"-aws-ofi-nccl.json"))
+	if err != nil {
+		t.Fatalf("reading spec: %v", err)
+	}
+	var spec specs.Spec
+	if err := json.Unmarshal(data, &spec); err != nil {
+		t.Fatalf("unmarshalling: %v", err)
+	}
+
+	if spec.Kind != driver+"/aws-ofi-nccl" {
+		t.Errorf("kind = %q, want %q", spec.Kind, driver+"/aws-ofi-nccl")
+	}
+	if len(spec.Devices) != 1 || spec.Devices[0].Name != "aws-ofi-nccl" {
+		t.Errorf("devices = %v, want [{aws-ofi-nccl}]", spec.Devices)
+	}
+
+	wantHostPath := cfg.AWSofiNCCLPrefix + "/lib/libnccl-net.so"
+	found := false
+	for _, m := range spec.ContainerEdits.Mounts {
+		if m.HostPath == wantHostPath && m.ContainerPath == "/usr/lib/libnccl-net.so" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("libnccl-net.so mount not found; mounts = %v", spec.ContainerEdits.Mounts)
+	}
+
+	foundEnv := false
+	for _, e := range spec.ContainerEdits.Env {
+		if e == "NCCL_NET=AWS Libfabric" {
+			foundEnv = true
+			break
+		}
+	}
+	if !foundEnv {
+		t.Error("NCCL_NET env var not found in aws-ofi-nccl spec")
+	}
+
+	if len(spec.ContainerEdits.Hooks) == 0 {
+		t.Error("no hooks in aws-ofi-nccl spec, want ldcache hook")
+	}
+}
+
+func TestRemoveAWSofiNCCLSpec(t *testing.T) {
+	cdiRoot := t.TempDir()
+	const driver = "cxi.slingshot.hpe.com"
+	cfg := CDIEnvConfig{AWSofiNCCLPrefix: "/spack/aws-ofi-nccl"}
+	if err := WriteAWSofiNCCLSpec(cdiRoot, driver, cfg); err != nil {
+		t.Fatalf("WriteAWSofiNCCLSpec: %v", err)
+	}
+	if err := RemoveAWSofiNCCLSpec(cdiRoot, driver); err != nil {
+		t.Fatalf("RemoveAWSofiNCCLSpec: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(cdiRoot, driver+"-aws-ofi-nccl.json")); !os.IsNotExist(err) {
+		t.Error("aws-ofi-nccl spec file still exists after remove")
+	}
+	if err := RemoveAWSofiNCCLSpec(cdiRoot, driver); err != nil {
+		t.Errorf("RemoveAWSofiNCCLSpec on absent file: %v", err)
+	}
+}
+

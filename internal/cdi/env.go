@@ -217,3 +217,86 @@ func RemoveNCCLSpec(cdiRoot, driverName string) error {
 	return removeSpec(filepath.Join(cdiRoot, driverName+"-nccl.json"))
 }
 
+// WriteAWSofiNCCLSpec writes the AWS OFI NCCL CDI spec, mounting the plugin
+// library, GDRCopy API library, Spack dependency libs, and setting the
+// libfabric/NCCL tuning env vars used on Isambard.
+func WriteAWSofiNCCLSpec(cdiRoot, driverName string, cfg CDIEnvConfig) error {
+	if err := os.MkdirAll(cdiRoot, 0o755); err != nil {
+		return err
+	}
+
+	mounts := []*specs.Mount{
+		{
+			HostPath:      cfg.AWSofiNCCLPrefix + "/lib/libnccl-net.so",
+			ContainerPath: "/usr/lib/libnccl-net.so",
+			Options:       []string{"bind", "ro", "nosuid", "nodev", "private"},
+		},
+		{
+			HostPath:      "/usr/lib64/libgdrapi.so.2.5",
+			ContainerPath: "/usr/lib/libgdrapi.so",
+			Options:       []string{"bind", "ro", "nosuid", "nodev", "private"},
+		},
+	}
+
+	for _, dep := range []struct {
+		hostPath string
+		soName   string
+	}{
+		{cfg.HwlocLib, "libhwloc.so.15"},
+		{cfg.PciaccessLib, "libpciaccess.so.0"},
+		{cfg.Libxml2Lib, "libxml2.so.2"},
+		{cfg.LibatomicLib, "libatomic.so.1"},
+		{cfg.LiblzmaLib, "liblzma.so.5"},
+		{cfg.LibiconvLib, "libiconv.so.2"},
+	} {
+		if dep.hostPath == "" {
+			continue
+		}
+		mounts = append(mounts, &specs.Mount{
+			HostPath:      dep.hostPath,
+			ContainerPath: "/usr/lib/" + dep.soName,
+			Options:       []string{"bind", "rw", "nosuid", "nodev", "private"},
+		})
+	}
+
+	spec := &specs.Spec{
+		Version: cdiVersion,
+		Kind:    driverName + "/aws-ofi-nccl",
+		Devices: []specs.Device{{Name: "aws-ofi-nccl"}},
+		ContainerEdits: specs.ContainerEdits{
+			Env: []string{
+				"NCCL_NET=AWS Libfabric",
+				"NCCL_CROSS_NIC=1",
+				"NCCL_NET_GDR_LEVEL=PHB",
+				"NCCL_SOCKET_IFNAME=hsn",
+				"NCCL_MIN_NCHANNELS=4",
+				"NCCL_GDRCOPY_ENABLE=1",
+				"NCCL_NET_FORCE_FLUSH=0",
+				"FI_MR_CACHE_MONITOR=userfaultfd",
+				"FI_CXI_DISABLE_HOST_REGISTER=1",
+				"FI_HMEM_CUDA_USE_GDRCOPY=1",
+				"FI_CXI_DEFAULT_CQ_SIZE=131072",
+				"FI_CXI_DEFAULT_TX_SIZE=2048",
+				"FI_CXI_RDZV_PROTO=alt_read",
+				"FI_CXI_RDZV_THRESHOLD=0",
+				"FI_CXI_RDZV_GET_MIN=0",
+				"FI_CXI_RDZV_EAGER_SIZE=0",
+				"FI_CXI_DISABLE_NON_INJECT_MSG_IDC=1",
+				"FI_CXI_RX_MATCH_MODE=hybrid",
+			},
+			Mounts: mounts,
+			Hooks:  []*specs.Hook{ldcacheHook("/usr/lib", "/usr/lib64")},
+		},
+	}
+
+	data, err := json.MarshalIndent(spec, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshalling CDI aws-ofi-nccl spec: %w", err)
+	}
+	return os.WriteFile(filepath.Join(cdiRoot, driverName+"-aws-ofi-nccl.json"), data, 0o644)
+}
+
+// RemoveAWSofiNCCLSpec deletes the AWS OFI NCCL CDI spec file.
+func RemoveAWSofiNCCLSpec(cdiRoot, driverName string) error {
+	return removeSpec(filepath.Join(cdiRoot, driverName+"-aws-ofi-nccl.json"))
+}
