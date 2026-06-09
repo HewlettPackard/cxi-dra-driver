@@ -144,21 +144,18 @@ No changes — env/nccl/aws-ofi-nccl specs are node-lifetime objects, not per-al
 
 ### `deploy/kubernetes/daemonset.yaml`
 
-New commented-out flags added to the driver container args with Isambard example values:
+New flags added to the driver container args, populated with Isambard values:
 
 ```yaml
-# Base CXI environment
-# - --libfabric-lib=/opt/cray/libfabric/2.3.1/lib64/libfabric.so.1
-# NCCL (optional)
-# - --nccl-prefix=/projects/public/brics/dev/apps/linux-neoverse_v2/nccl-2.29.2-1-yjntbzz5uuuashekge53wqizfqum6swy
-# AWS OFI NCCL (optional)
-# - --aws-ofi-nccl-prefix=/projects/.../aws-ofi-nccl-1.18.0-...
-# - --hwloc-lib=/projects/.../hwloc-.../lib/libhwloc.so.15
-# - --pciaccess-lib=/projects/.../libpciaccess-.../lib/libpciaccess.so.0
-# - --libxml2-lib=/projects/.../libxml2-.../lib/libxml2.so.2
-# - --libatomic-lib=/projects/.../gcc-runtime-.../lib/libatomic.so.1
-# - --liblzma-lib=/projects/.../xz-.../lib/liblzma.so.5
-# - --libiconv-lib=/projects/.../libiconv-.../lib/libiconv.so.2
+- --libfabric-lib=/opt/cray/libfabric/2.3.1/lib64/libfabric.so.1
+- --nccl-prefix=/projects/public/brics/dev/apps/linux-neoverse_v2/nccl-2.29.2-1-yjntbzz5uuuashekge53wqizfqum6swy
+- --aws-ofi-nccl-prefix=/projects/public/brics/dev/apps/linux-neoverse_v2/aws-ofi-nccl-1.18.0-6pbztrbjhvrmtu5r6nq2silgputmmcyk
+- --hwloc-lib=/projects/public/brics/dev/apps/linux-neoverse_v2/hwloc-2.12.2-xbbx7czzg3oczc3trftvj2dat3t6qj3o/lib/libhwloc.so.15
+- --pciaccess-lib=/projects/public/brics/dev/apps/linux-neoverse_v2/libpciaccess-0.17-yisowb26ojigtiis73t5dukyrvx7r6rk/lib/libpciaccess.so.0
+- --libxml2-lib=/projects/public/brics/dev/apps/linux-neoverse_v2/libxml2-2.13.5-xr3mgbb5y3midpndczeurgot35yosxkd/lib/libxml2.so.2
+- --libatomic-lib=/projects/public/brics/dev/apps/linux-neoverse_v2/gcc-runtime-14.3.0-4aynqrbkrzeranfuqhyfg7wktmszdenq/lib/libatomic.so.1
+- --liblzma-lib=/projects/public/brics/dev/apps/linux-neoverse_v2/xz-5.6.3-iqien4jp4hkpdks2rzyflpvgw3b72zqc/lib/liblzma.so.5
+- --libiconv-lib=/projects/public/brics/dev/apps/linux-neoverse_v2/libiconv-1.18-4ok6y76vboaxcwzvxwnwhc6uaxzookdp/lib/libiconv.so.2
 ```
 
 ### `deploy/kind/daemonset-mock.yaml`
