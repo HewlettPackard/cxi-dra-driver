@@ -133,3 +133,56 @@ func TestRemoveEnvSpec(t *testing.T) {
 		t.Errorf("RemoveEnvSpec on absent file: %v", err)
 	}
 }
+
+func TestWriteNCCLSpec(t *testing.T) {
+	cdiRoot := t.TempDir()
+	const driver = "cxi.slingshot.hpe.com"
+	cfg := CDIEnvConfig{NCCLPrefix: "/spack/nccl-2.29.2"}
+
+	if err := WriteNCCLSpec(cdiRoot, driver, cfg); err != nil {
+		t.Fatalf("WriteNCCLSpec: %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(cdiRoot, driver+"-nccl.json"))
+	if err != nil {
+		t.Fatalf("reading NCCL spec: %v", err)
+	}
+	var spec specs.Spec
+	if err := json.Unmarshal(data, &spec); err != nil {
+		t.Fatalf("unmarshalling: %v", err)
+	}
+
+	if spec.Kind != driver+"/nccl" {
+		t.Errorf("kind = %q, want %q", spec.Kind, driver+"/nccl")
+	}
+	if len(spec.Devices) != 1 || spec.Devices[0].Name != "nccl" {
+		t.Errorf("devices = %v, want [{nccl}]", spec.Devices)
+	}
+	if len(spec.ContainerEdits.Mounts) != 1 ||
+		spec.ContainerEdits.Mounts[0].HostPath != cfg.NCCLPrefix ||
+		spec.ContainerEdits.Mounts[0].ContainerPath != "/host/nccl" {
+		t.Errorf("mounts = %v, want NCCL prefix → /host/nccl", spec.ContainerEdits.Mounts)
+	}
+	if len(spec.ContainerEdits.Hooks) == 0 {
+		t.Error("no hooks in NCCL spec, want ldcache hook")
+	}
+}
+
+func TestRemoveNCCLSpec(t *testing.T) {
+	cdiRoot := t.TempDir()
+	const driver = "cxi.slingshot.hpe.com"
+	cfg := CDIEnvConfig{NCCLPrefix: "/spack/nccl"}
+	if err := WriteNCCLSpec(cdiRoot, driver, cfg); err != nil {
+		t.Fatalf("WriteNCCLSpec: %v", err)
+	}
+	if err := RemoveNCCLSpec(cdiRoot, driver); err != nil {
+		t.Fatalf("RemoveNCCLSpec: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(cdiRoot, driver+"-nccl.json")); !os.IsNotExist(err) {
+		t.Error("nccl spec file still exists after RemoveNCCLSpec")
+	}
+	if err := RemoveNCCLSpec(cdiRoot, driver); err != nil {
+		t.Errorf("RemoveNCCLSpec on absent file: %v", err)
+	}
+}
+

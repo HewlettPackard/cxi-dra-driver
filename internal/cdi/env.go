@@ -181,3 +181,39 @@ func removeSpec(path string) error {
 	}
 	return nil
 }
+
+// WriteNCCLSpec writes the NCCL CDI spec, mounting the whole NCCL Spack prefix
+// into /host/nccl so the container's ldcache can find the NCCL libraries.
+func WriteNCCLSpec(cdiRoot, driverName string, cfg CDIEnvConfig) error {
+	if err := os.MkdirAll(cdiRoot, 0o755); err != nil {
+		return err
+	}
+
+	spec := &specs.Spec{
+		Version: cdiVersion,
+		Kind:    driverName + "/nccl",
+		Devices: []specs.Device{{Name: "nccl"}},
+		ContainerEdits: specs.ContainerEdits{
+			Mounts: []*specs.Mount{
+				{
+					HostPath:      cfg.NCCLPrefix,
+					ContainerPath: "/host/nccl",
+					Options:       []string{"bind", "ro", "nosuid", "nodev", "private"},
+				},
+			},
+			Hooks: []*specs.Hook{ldcacheHook("/host/nccl/lib")},
+		},
+	}
+
+	data, err := json.MarshalIndent(spec, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshalling CDI NCCL spec: %w", err)
+	}
+	return os.WriteFile(filepath.Join(cdiRoot, driverName+"-nccl.json"), data, 0o644)
+}
+
+// RemoveNCCLSpec deletes the NCCL CDI spec file.
+func RemoveNCCLSpec(cdiRoot, driverName string) error {
+	return removeSpec(filepath.Join(cdiRoot, driverName+"-nccl.json"))
+}
+
