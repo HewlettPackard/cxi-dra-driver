@@ -91,14 +91,19 @@ func main() {
 		mockDevList = cxi.MockDevices(*mockDevices)
 	}
 
-	d := driver.New(
-		*nodeName, *podUID, *driverName, *cdiRoot, *pluginDir, *registrarDir,
-		kubeClient, mockDevList,
-		driver.Config{
-			Overhead:        overhead,
-			RefreshInterval: *refreshInterval,
-		},
-	)
+	d := driver.New(driver.Config{
+		NodeName:        *nodeName,
+		PodUID:          *podUID,
+		DriverName:      *driverName,
+		CDIRoot:         *cdiRoot,
+		PluginDir:       *pluginDir,
+		RegistrarDir:    *registrarDir,
+		KubeClient:      kubeClient,
+		MockDevices:     mockDevList,
+		Overhead:        overhead,
+		RefreshInterval: *refreshInterval,
+		// CDIEnvConfig: populated via CLI flags; see --libfabric-lib and friends.
+	})
 
 	// Start the cluster-wide VNI pool publisher if a VNI range is configured
 	// (either flag set). Exactly one pod (the leader) publishes the VNI
