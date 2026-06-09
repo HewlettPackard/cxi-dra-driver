@@ -104,7 +104,7 @@ kubectl label node <node-name> feature.node.kubernetes.io/cxi=true
 make deploy
 ```
 
-This applies RBAC, the `DeviceClass`, the `MutatingAdmissionPolicy`, and the `DaemonSet` in order.
+This applies RBAC, the `DeviceClass` (for CXI devices and VNIs), the `MutatingAdmissionPolicy`, and the `DaemonSet` in order.
 
 ### 4. Verify the ResourceSlice
 
@@ -119,13 +119,22 @@ You should see one slice per node with devices `cxi0`, `cxi1`, … and attribute
 ```bash
 kubectl apply -f deploy/kubernetes/test/resourceclaim.yaml
 kubectl apply -f deploy/kubernetes/test/pod.yaml
-kubectl get pod cxi-test
-kubectl exec -it cxi-test -- fi_info -p cxi
+kubectl get pod cxi-test-3
+kubectl exec -it cxi-test-3 -- fi_info -p cxi
 ```
 
-You should see CXI providers enumerated without `privileged: true`.
+The test pod claims one CXI device (via the `cxi-quarter` template) and one VNI (via the `cxi-vni` template). You should see CXI providers enumerated without `privileged: true`.
 
 ## Requesting CXI Resources
+
+Each pod that uses a CXI device needs **two** resource claims:
+
+1. A `ResourceClaimTemplate` for the **CXI device** itself — requests fabric queues and LE/TLE pools from a physical CXI NIC.
+2. A `ResourceClaim` (or `ResourceClaimTemplate`) for a **VNI** — allocates one fabric Virtual Network Identifier from the cluster-wide VNI pool.
+
+Both claims must be listed under `spec.resourceClaims` in the Pod and referenced in `resources.claims` for each container that needs them.
+
+### CXI device claim
 
 All resource fields are **required** — the driver has no defaults. Claims without an opaque config block will be rejected at prepare time with a clear error.
 
@@ -166,6 +175,71 @@ LEs and TLEs are expressed as **pool counts** due to hardware allocation granula
 Set `le_pools: 0` and `tle_pools: 0` if your job does not use triggered operations.
 
 See [deploy/kubernetes/test/resourceclaim.yaml](deploy/kubernetes/test/resourceclaim.yaml) for `cxi-quarter` and `cxi-half` example templates.
+
+### VNI claim
+
+A VNI is a cluster-wide fabric identifier that scopes communication between pods. Each pod must hold a VNI claim so the driver can program a unique CXI service bound to that pod's network namespace.
+
+For a single pod, use a `ResourceClaimTemplate` (Kubernetes creates one `ResourceClaim` per pod from the template):
+
+```yaml
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata:
+  name: cxi-vni
+  namespace: default
+spec:
+  spec:
+    devices:
+      requests:
+        - name: vni
+          exactly:
+            deviceClassName: cxi-vni
+```
+
+For a multi-pod workload where all pods must communicate on the **same** fabric service, create a single `ResourceClaim` directly (not a template) and reference it by name from each pod:
+
+```yaml
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaim
+metadata:
+  name: my-job-vni
+  namespace: default
+spec:
+  devices:
+    requests:
+      - name: vni
+        exactly:
+          deviceClassName: cxi-vni
+```
+
+Then reference it in each pod's spec:
+
+```yaml
+spec:
+  resourceClaims:
+    - name: vni
+      resourceClaimName: my-job-vni   # shared claim, not a template
+```
+
+### Wiring claims into a pod
+
+```yaml
+spec:
+  resourceClaims:
+    - name: cxi
+      resourceClaimTemplateName: cxi-quarter   # one CXI NIC per pod
+    - name: vni
+      resourceClaimTemplateName: cxi-vni       # one VNI per pod (use resourceClaimName for shared)
+  containers:
+    - name: workload
+      resources:
+        claims:
+          - name: cxi
+          - name: vni
+```
+
+See [deploy/kubernetes/test/pod.yaml](deploy/kubernetes/test/pod.yaml) for a complete example.
 
 ### How scheduler placement works
 
@@ -216,7 +290,13 @@ The CXI service (VNI scoping + netns binding) is created in the NRI `RunPodSandb
 
 Each pod receives a CXI service scoped to its network namespace inode and a unique VNI. libfabric reads `FI_CXI_SVC_ID` (injected as an env var by the NRI plugin) and uses it instead of allocating its own service, ensuring the pod operates within its allocated fabric resources.
 
-VNIs are allocated from a configurable node-local pool (`--vni-min` / `--vni-max`). Each pod receives a distinct VNI — the kernel returns `-EEXIST` from `cxil_svc_set_vni_range` if two services attempt to claim the same VNI range. Released VNIs are returned to the pool when the pod is torn down. The allocator is in-memory; VNI assignments are lost on driver restart (see Known Limitations).
+### Cluster-wide VNI pool
+
+VNIs are managed cluster-wide via a dedicated `ResourceSlice` published by the VNI pool leader. One of the DaemonSet pods wins a Kubernetes `Lease`-based leader election and publishes a pool of VNI devices (each with a `type: vni` attribute) using the `cxi-vni` `DeviceClass`. These devices are visible to the scheduler across all nodes (`allNodes: true`).
+
+When a pod's VNI `ResourceClaim` is allocated, the scheduler reserves one VNI device from this pool. The driver reads the allocated VNI number at prepare time and programs it into the CXI service. Released VNIs (when the claim is deleted) are automatically returned to the pool for reuse.
+
+The VNI range is configured via `--vni-range-start` / `--vni-range-end` in the DaemonSet. Each VNI in the range is represented as a separate device (`vni-100`, `vni-101`, …). The kernel returns `-EEXIST` from `cxil_svc_set_vni_range` if two services attempt to claim the same VNI — the cluster-wide allocation prevents this from happening under normal operation.
 
 ## Project Layout
 
@@ -241,6 +321,8 @@ deploy/kubernetes/       DaemonSet, DeviceClass, RBAC, MutatingAdmissionPolicy, 
 | `--registrar-dir` | `/var/lib/kubelet/plugins_registry` | Plugin registrar directory |
 | `--mock-devices` | `0` | Generate N synthetic devices (no hardware needed) |
 | `--resource-refresh-interval` | `30s` | How often to republish the ResourceSlice with refreshed available-capacity attributes |
+| `--vni-range-start` | `100` | First VNI in the cluster-wide pool |
+| `--vni-range-end` | `300` | Last VNI in the cluster-wide pool (inclusive) |
 | `--reserved-txqs` | `0` | TXQs reserved by pre-existing system services |
 | `--reserved-tgqs` | `0` | TGQs reserved by pre-existing system services |
 | `--reserved-eqs` | `0` | EQs reserved by pre-existing system services |
@@ -300,29 +382,31 @@ The driver supports `--mock-devices=N` which generates N synthetic CXI devices w
 kind create cluster --name cxi-dra-dev --config deploy/kind/kind-config.yaml
 
 # Build and load image (no CGo needed in mock mode)
-docker build -f Dockerfile.ci -t cxi-dra-driver:dev .
+podman build -f Dockerfile.ci -t cxi-dra-driver:dev .
 kind load docker-image cxi-dra-driver:dev --name cxi-dra-dev
 
 # Deploy
 kubectl apply -f deploy/kubernetes/clusterrole.yaml
-kubectl apply -f deploy/kubernetes/deviceclass.yaml
+kubectl apply -f deploy/kubernetes/deviceclass.yaml      # CXI device class
+kubectl apply -f deploy/kubernetes/deviceclass-vni.yaml  # VNI device class
 kubectl apply -f deploy/kubernetes/admission-policy.yaml
-kubectl apply -f deploy/kubernetes/daemonset.yaml  # add --mock-devices=2, remove nodeSelector
+kubectl apply -f deploy/kubernetes/daemonset.yaml        # add --mock-devices=2, remove nodeSelector
 
-# Verify
+# Verify both device types appear
 kubectl get resourceslices -o wide
+
+# Run the test workload (claims one CXI device + one VNI)
 kubectl apply -f deploy/kubernetes/test/resourceclaim.yaml
 kubectl apply -f deploy/kubernetes/test/pod.yaml
-kubectl logs cxi-test
+kubectl logs cxi-test-3
 ```
 
 ## Known Limitations / Planned Work
 
-- **VNI pool** — currently hardcoded `VNI=1`; cluster-wide VNI allocator planned
 - **HSN interface injection** — libfabric warns `CXI netdev not found` because HSN interfaces (`hsn0`, `hsn1`, …) live in the host network namespace. Fix requires pre-creating the mountpoint directory on each node so the CDI spec can bind-mount over it
 - **Service reconciliation on restart** — services surviving a driver restart are not re-tracked; orphaned services persist until node reboot
 - **Hot-plug** — no fsnotify watcher on `/sys/class/cxi_user`; driver restart required if devices appear/disappear
-- **Multi-node VNI coordination** — VNI allocation is per-node; cross-node uniqueness not enforced
+- **VNI pool persistence** — VNI allocation is backed by `ResourceSlice` objects, so assignments survive individual driver pod restarts. However, if the entire DaemonSet is deleted and recreated, in-flight claims that were allocated but not yet released may reference VNIs that no longer appear in the re-published pool until the claims are deleted
 
 ## Troubleshooting
 
