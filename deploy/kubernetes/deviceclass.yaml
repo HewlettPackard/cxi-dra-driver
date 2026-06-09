@@ -5,4 +5,6 @@ metadata:
 spec:
   selectors:
     - cel:
-        expression: "device.driver == 'cxi.slingshot.hpe.com'"
+        expression: >-
+          device.driver == "cxi.slingshot.hpe.com" &&
+          device.attributes["cxi.slingshot.hpe.com"].type == "device"
