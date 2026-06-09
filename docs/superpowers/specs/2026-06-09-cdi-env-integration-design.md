@@ -127,7 +127,7 @@ Device `aws-ofi-nccl`, top-level `containerEdits`:
 
 - `Driver` struct gains `cdiEnvConfig cdi.CDIEnvConfig`
 - `Run()`: after per-device `cdi.WriteSpec` calls, call `cdi.WriteEnvSpec`; conditionally call `cdi.WriteNCCLSpec` and `cdi.WriteAWSofiNCCLSpec`
-- Cleanup path: call corresponding `Remove*Spec` functions
+- No cleanup on shutdown — specs are node-lifetime objects and the driver leaves the JSON files in place (consistent with existing per-device CDI specs).
 
 ### `internal/driver/prepare.go`
 

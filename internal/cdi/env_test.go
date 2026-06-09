@@ -102,9 +102,14 @@ func TestWriteEnvSpecNoLibfabric(t *testing.T) {
 	if err := WriteEnvSpec(cdiRoot, "cxi.slingshot.hpe.com", cfg); err != nil {
 		t.Fatalf("WriteEnvSpec without libfabric: %v", err)
 	}
-	data, _ := os.ReadFile(filepath.Join(cdiRoot, "cxi.slingshot.hpe.com-env.json"))
+	data, err := os.ReadFile(filepath.Join(cdiRoot, "cxi.slingshot.hpe.com-env.json"))
+	if err != nil {
+		t.Fatalf("reading spec: %v", err)
+	}
 	var spec specs.Spec
-	json.Unmarshal(data, &spec)
+	if err := json.Unmarshal(data, &spec); err != nil {
+		t.Fatalf("unmarshalling spec: %v", err)
+	}
 	for _, m := range spec.ContainerEdits.Mounts {
 		if m.ContainerPath == "/usr/lib64/libfabric.so.1" {
 			t.Error("libfabric mount found but LibfabricLib was empty")

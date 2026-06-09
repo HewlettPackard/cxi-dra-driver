@@ -45,7 +45,7 @@ func AWSofiNCCLDeviceID(driverName string) string {
 // WriteEnvSpec writes the shared CXI environment CDI spec containing device
 // nodes, library bind-mounts, and the ldcache hook that every CXI container
 // needs. xpmem and gdrdrv device nodes are included only when present on the
-// host; a missing libfabric path skips that mount with a warning.
+// host; the libfabric mount is included only when LibfabricLib is non-empty.
 func WriteEnvSpec(cdiRoot, driverName string, cfg CDIEnvConfig) error {
 	if err := os.MkdirAll(cdiRoot, 0o755); err != nil {
 		return err
@@ -71,7 +71,7 @@ func WriteEnvSpec(cdiRoot, driverName string, cfg CDIEnvConfig) error {
 		{
 			HostPath:      "/dev/shm",
 			ContainerPath: "/dev/shm",
-			Options:       []string{"bind", "rw", "nosuid", "private"},
+			Options:       []string{"bind", "rw", "nosuid", "nodev", "private"},
 		},
 	}
 	if cfg.LibfabricLib != "" {
@@ -141,8 +141,8 @@ func RemoveEnvSpec(cdiRoot, driverName string) error {
 	return removeSpec(filepath.Join(cdiRoot, driverName+"-env.json"))
 }
 
-// optionalDeviceNode stats hostPath and returns a DeviceNode if the path
-// exists on the host; returns nil without error if the path is absent.
+// optionalDeviceNode stats hostPath and returns a DeviceNode if the path exists.
+// It returns nil if stat fails (including when the path is absent).
 func optionalDeviceNode(hostPath string) *specs.DeviceNode {
 	var st syscall.Stat_t
 	if err := syscall.Stat(hostPath, &st); err != nil {
@@ -156,7 +156,7 @@ func optionalDeviceNode(hostPath string) *specs.DeviceNode {
 		Type:        "c",
 		Major:       major,
 		Minor:       minor,
-		Permissions: "rw",
+		Permissions: "rwm",
 	}
 }
 

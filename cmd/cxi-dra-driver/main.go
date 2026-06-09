@@ -52,7 +52,7 @@ func main() {
 		reservedLEPools  = flag.Int64("reserved-le-pools", 0, "LE pools reserved by pre-existing system services (1 pool = 1024 LEs)")
 		reservedTLEPools = flag.Int64("reserved-tle-pools", 0, "TLE pools reserved by pre-existing system services (1 pool = 512 TLEs)")
 
-		// CDI env spec paths — all optional; empty = skip mount/spec.
+		// CDI env spec configuration — all optional; empty disables the corresponding mount/spec.
 		libfabricLib     = flag.String("libfabric-lib", "", "Host path to libfabric.so.1 (versioned Spack path)")
 		ncclPrefix       = flag.String("nccl-prefix", "", "Spack NCCL install prefix; empty disables NCCL CDI spec")
 		awsOfiNCCLPrefix = flag.String("aws-ofi-nccl-prefix", "", "Spack aws-ofi-nccl install prefix; empty disables OFI CDI spec")
