@@ -53,6 +53,7 @@ func (d *Driver) buildDevices() []resourceapi.Device {
 			Name: dev.Name,
 			Attributes: map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
 				// Topology — usable in CEL placement selectors.
+				"type": {StringValue: ptr.To("device")},
 				"numa_node": {IntValue: ptr.To(int64(dev.NUMANode))},
 				"pcie_root": {StringValue: ptr.To(dev.PCIeRoot)},
 				"hsn_iface": {StringValue: ptr.To(dev.HSNIface)},
