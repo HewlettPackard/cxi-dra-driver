@@ -30,20 +30,38 @@ type podState struct {
 // by the DRA driver in PrepareResourceClaims before containers are created.
 //
 // Hooks used:
-//   - RunPodSandbox  — network namespace is available; create CXI service here
-//     so the cgroup device policy is set before any container starts.
+//   - RunPodSandbox   — network namespace is available; create CXI service here.
 //   - CreateContainer — inject FI_CXI_SVC_ID env vars into each container.
 //   - StopPodSandbox  — tear down CXI service when the pod sandbox stops.
 type Plugin struct {
-	stub      stub.Stub
-	store     *driver.AllocationStore
-	svcMgr    cxi.ServiceManager
-	mu        sync.Mutex
-	podStates map[types.UID]*podState
+	stub             stub.Stub
+	store            *driver.AllocationStore
+	svcMgr           cxi.ServiceManager
+	republish        func()          // triggers immediate ResourceSlice update
+	onServiceCreated func(types.UID) // called with claimUID after service creation
+	onServiceDeleted func()          // called after service deletion
+	mu               sync.Mutex
+	podStates        map[types.UID]*podState
+	deviceMu         sync.Map // map[string]*sync.Mutex — one mutex per device name
 }
 
 // New creates a new NRI plugin.
-func New(store *driver.AllocationStore, mock bool) (*Plugin, error) {
+//
+// republish is called after each service create/delete so the ResourceSlice
+// immediately reflects updated avail_*.
+//
+// onServiceCreated(claimUID) is called after a service is successfully created
+// so the driver can remove the pending entry for that claim.
+//
+// onServiceDeleted is called after any service is deleted so the ClaimBinder
+// can immediately re-evaluate claims waiting in Ready=False.
+func New(
+	store *driver.AllocationStore,
+	mock bool,
+	republish func(),
+	onServiceCreated func(types.UID),
+	onServiceDeleted func(),
+) (*Plugin, error) {
 	var svcMgr cxi.ServiceManager
 	if mock {
 		svcMgr = cxi.MockServiceManager{}
@@ -51,9 +69,12 @@ func New(store *driver.AllocationStore, mock bool) (*Plugin, error) {
 		svcMgr = cxi.NewServiceManager()
 	}
 	p := &Plugin{
-		store:     store,
-		svcMgr:    svcMgr,
-		podStates: make(map[types.UID]*podState),
+		store:            store,
+		svcMgr:           svcMgr,
+		republish:        republish,
+		onServiceCreated: onServiceCreated,
+		onServiceDeleted: onServiceDeleted,
+		podStates:        make(map[types.UID]*podState),
 	}
 	var err error
 	p.stub, err = stub.New(p,
@@ -74,10 +95,21 @@ func (p *Plugin) Run(ctx context.Context) error {
 	return nil
 }
 
+// getDeviceLock returns the per-device mutex, creating it if needed.
+// Serialising RunPodSandbox calls per device makes the fit-check + service
+// creation atomic with respect to other concurrent pod starts on the same device.
+func (p *Plugin) getDeviceLock(name string) *sync.Mutex {
+	v, _ := p.deviceMu.LoadOrStore(name, &sync.Mutex{})
+	return v.(*sync.Mutex)
+}
+
 // RunPodSandbox is called by containerd when the pod sandbox is created and
-// the network namespace is ready — before any containers start. This is the
-// correct hook to create the CXI service, matching the pattern used by the
-// containerd network-device-injector reference plugin.
+// the network namespace is ready — before any containers start.
+//
+// The BindingConditions gate (ClaimBinder) is the primary capacity check.
+// The per-device fit-check here is a secondary safety net for the narrow
+// window between Ready=True being granted and the service being created.
+// On failure the pod sandbox creation is retried by the kubelet.
 func (p *Plugin) RunPodSandbox(_ context.Context, pod *api.PodSandbox) error {
 	podUID := types.UID(pod.GetUid())
 	allocs := p.store.Get(podUID)
@@ -89,7 +121,6 @@ func (p *Plugin) RunPodSandbox(_ context.Context, pod *api.PodSandbox) error {
 	if pid == 0 {
 		return fmt.Errorf("pod %s has no PID in sandbox — cannot resolve netns inode", podUID)
 	}
-
 	inode, err := netnsInode(pid)
 	if err != nil {
 		return fmt.Errorf("resolving netns inode for pod %s (pid %d): %w", podUID, pid, err)
@@ -98,20 +129,51 @@ func (p *Plugin) RunPodSandbox(_ context.Context, pod *api.PodSandbox) error {
 	netnsPath := netnsFromPod(pod)
 	state := &podState{netnsInode: inode, svcIDs: make(map[string]int)}
 
+	// Track services created so far for rollback on partial failure.
+	createdDevices := make([]string, 0, len(allocs))
+	rollback := func() {
+		for _, devName := range createdDevices {
+			if err := p.svcMgr.DeleteService(devName, inode); err != nil {
+				fmt.Printf("cxi-nri: warning: rollback delete service %s: %v\n", devName, err)
+			}
+		}
+	}
+
 	for _, alloc := range allocs {
-		// Defensive bound check at the hardware boundary: an out-of-range VNI
-		// would silently truncate to uint16 in libcxi and could scope the
-		// service to the wrong fabric network.
 		if !driver.ValidVNI(alloc.VNI) {
-			return fmt.Errorf("refusing to create CXI service for %s: VNI %d out of range [%d, %d]",
+			rollback()
+			return fmt.Errorf("refusing CXI service for %s: VNI %d out of range [%d, %d]",
 				alloc.DeviceName, alloc.VNI, driver.MinVNI, driver.MaxVNI)
 		}
-		fmt.Printf("cxi-nri: creating CXI service: pod=%s device=%s hsn=%s netns=%s inode=%d vni=%d\n",
+
+		// Per-device mutex: serialise fit-check + CreateService so that
+		// concurrent pod starts on the same device don't race each other.
+		mu := p.getDeviceLock(alloc.DeviceName)
+		mu.Lock()
+
+		avail, err := cxi.ReadAvailableCapacity(alloc.DeviceName)
+		if err != nil {
+			mu.Unlock()
+			rollback()
+			return fmt.Errorf("pod %s device %s: reading capacity: %w", podUID, alloc.DeviceName, err)
+		}
+		if !alloc.Resources.Fits(avail) {
+			mu.Unlock()
+			rollback()
+			return fmt.Errorf("pod %s device %s: requested (%s) does not fit available (%s) — will retry",
+				podUID, alloc.DeviceName, alloc.Resources, avail)
+		}
+
+		fmt.Printf("cxi-nri: creating service: pod=%s device=%s hsn=%s netns=%s inode=%d vni=%d\n",
 			podUID, alloc.DeviceName, alloc.HSNIface, netnsPath, inode, alloc.VNI)
 		svcID, err := p.svcMgr.CreateService(alloc.DeviceName, inode, alloc.VNI, alloc.Resources)
+		mu.Unlock()
+
 		if err != nil {
+			rollback()
 			return fmt.Errorf("creating CXI service for %s: %w", alloc.DeviceName, err)
 		}
+		createdDevices = append(createdDevices, alloc.DeviceName)
 		state.svcIDs[alloc.DeviceName] = svcID
 	}
 
@@ -119,12 +181,18 @@ func (p *Plugin) RunPodSandbox(_ context.Context, pod *api.PodSandbox) error {
 	p.podStates[podUID] = state
 	p.mu.Unlock()
 
+	// Remove the pending entry now that the hardware service owns the resources.
+	if claimUID := p.store.ClaimForPod(podUID); claimUID != "" {
+		p.onServiceCreated(claimUID)
+	}
+
+	// Update ResourceSlice immediately so avail_* reflects the new service.
+	p.republish()
 	return nil
 }
 
-// CreateContainer is called by containerd before each container in a pod is
-// started. The CXI service was already created in RunPodSandbox; here we just
-// inject the FI_CXI_SVC_ID env vars so libfabric uses the pre-allocated service.
+// CreateContainer injects FI_CXI_SVC_ID env vars. The service was already
+// created in RunPodSandbox.
 func (p *Plugin) CreateContainer(_ context.Context, pod *api.PodSandbox, container *api.Container) (*api.ContainerAdjustment, []*api.ContainerUpdate, error) {
 	podUID := types.UID(pod.GetUid())
 	allocs := p.store.Get(podUID)
@@ -146,12 +214,8 @@ func (p *Plugin) CreateContainer(_ context.Context, pod *api.PodSandbox, contain
 	p.mu.Unlock()
 
 	adj := &api.ContainerAdjustment{}
-
-	// Inject FI_CXI_SVC_ID per device. If there is exactly one CXI device also
-	// set the bare FI_CXI_SVC_ID that libfabric reads by default.
 	for devName, svcID := range svcIDs {
-		envKey := fmt.Sprintf("FI_CXI_SVC_ID_%s", devName)
-		adj.AddEnv(envKey, fmt.Sprintf("%d", svcID))
+		adj.AddEnv(fmt.Sprintf("FI_CXI_SVC_ID_%s", devName), fmt.Sprintf("%d", svcID))
 	}
 	if len(svcIDs) == 1 {
 		for _, svcID := range svcIDs {
@@ -174,8 +238,8 @@ func (p *Plugin) CreateContainer(_ context.Context, pod *api.PodSandbox, contain
 	return adj, nil, nil
 }
 
-// StopPodSandbox is called by containerd when the pod sandbox stops.
-// We tear down the CXI service here, matching the reference plugin pattern.
+// StopPodSandbox tears down CXI services and notifies the binder that
+// capacity has been freed.
 func (p *Plugin) StopPodSandbox(_ context.Context, pod *api.PodSandbox) error {
 	podUID := types.UID(pod.GetUid())
 	allocs := p.store.Get(podUID)
@@ -194,14 +258,19 @@ func (p *Plugin) StopPodSandbox(_ context.Context, pod *api.PodSandbox) error {
 	p.mu.Unlock()
 
 	for _, alloc := range allocs {
-		fmt.Printf("cxi-nri: deleting CXI service: pod=%s device=%s inode=%d\n",
+		fmt.Printf("cxi-nri: deleting service: pod=%s device=%s inode=%d\n",
 			podUID, alloc.DeviceName, inode)
 		if err := p.svcMgr.DeleteService(alloc.DeviceName, inode); err != nil {
-			fmt.Printf("cxi-nri: warning: deleting CXI service for %s: %v\n", alloc.DeviceName, err)
+			fmt.Printf("cxi-nri: warning: deleting service for %s: %v\n", alloc.DeviceName, err)
 		}
 	}
 
 	p.store.Delete(podUID)
+
+	// Tell the binder to re-evaluate Ready=False claims — capacity just freed.
+	p.onServiceDeleted()
+	// Update ResourceSlice immediately so avail_* reflects freed capacity.
+	p.republish()
 	return nil
 }
 
@@ -215,13 +284,8 @@ func netnsFromPod(pod *api.PodSandbox) string {
 	return ""
 }
 
-// netnsInode returns the nsfs inode of the pod's network namespace.
-// We read it via /proc/<pid>/ns/net rather than stat-ing the netns bind-mount
-// path, because stat() on a bind-mount of a nsfs file from a different mount
-// namespace returns the inode of the bind-mount entry on the underlying
-// filesystem, not the kernel nsfs inode that the CXI driver uses to scope
-// services. /proc/<pid>/ns/net resolves directly into nsfs and fstat gives
-// the correct inode.
+// netnsInode returns the nsfs inode of the pod's network namespace via
+// /proc/<pid>/ns/net + fstat. stat() on a bind-mount returns the wrong inode.
 func netnsInode(pid uint32) (uint64, error) {
 	path := fmt.Sprintf("/proc/%d/ns/net", pid)
 	f, err := os.Open(path)
@@ -236,7 +300,6 @@ func netnsInode(pid uint32) (uint64, error) {
 	return uint64(st.Ino), nil
 }
 
-// isMockManager reports whether svcMgr is the mock implementation.
 func isMockManager(svcMgr cxi.ServiceManager) bool {
 	_, ok := svcMgr.(cxi.MockServiceManager)
 	return ok

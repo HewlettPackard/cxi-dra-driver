@@ -4,23 +4,22 @@ import (
 	resourceapi "k8s.io/api/resource/v1"
 	"k8s.io/dynamic-resource-allocation/resourceslice"
 	"k8s.io/utils/ptr"
-
-	"github.com/slingshot/cxi-dra-driver/internal/cxi"
 )
 
 // buildDriverResources constructs the DriverResources payload for
 // helper.PublishResources.
 //
-// Each physical CXI device is published with AllowMultipleAllocations=true —
-// the scheduler may place multiple pods on the same device. Capacity tracking
-// is not delegated to the scheduler; instead the driver performs a live
-// fit-check in PrepareResourceClaims against the actual hardware state.
+// Each physical CXI device is published with AllowMultipleAllocations=true
+// and BindingConditions=["Ready"]. The scheduler may allocate multiple claims
+// to the same device, but must wait for the ClaimBinder to set Ready=True
+// before binding each pod. This prevents pods from being bound before capacity
+// is confirmed — eliminating the race condition that caused concurrent pods to
+// collide at the libcxi layer.
 //
-// Device attributes include both static topology info and current available
-// resource counts. The available counts are refreshed periodically so that
-// users can write CEL selectors against them (e.g. to prefer devices with
-// more headroom). They are informational — the live fit-check is the
-// authoritative gate.
+// avail_* attributes reflect ReadAvailableCapacity minus any in-flight pending
+// grants (resources granted Ready=True but whose services haven't been created
+// yet). Publishing these pending-adjusted values steers the scheduler toward
+// less-loaded devices for subsequent pod allocations.
 func (d *Driver) buildDriverResources() resourceslice.DriverResources {
 	return resourceslice.DriverResources{
 		Pools: map[string]resourceslice.Pool{
@@ -37,22 +36,16 @@ func (d *Driver) buildDriverResources() resourceslice.DriverResources {
 func (d *Driver) buildDevices() []resourceapi.Device {
 	out := make([]resourceapi.Device, 0, len(d.devices))
 	for _, dev := range d.devices {
-		avail, err := cxi.ReadAvailableCapacity(dev.Name)
-		if err != nil {
-			// Log and use zeros — the fit-check will reject requests that
-			// can't fit rather than silently overcommitting.
-			d.logf("warning: reading available capacity for %s: %v", dev.Name, err)
-			avail = cxi.ResourceSet{}
-		}
-		// Do NOT subtract overhead here. ReadAvailableCapacity already reflects
-		// the actual hardware consumption of all running services, including the
-		// pre-configured system services that --reserved-*-pools accounts for.
-		// Subtracting overhead again would double-count those reservations.
+		// Pending-adjusted available capacity. ReadAvailableCapacity already
+		// reflects all running service consumption; we only subtract in-flight
+		// pending grants on top of that.
+		avail := d.effectiveAvail(dev.Name)
+
 		out = append(out, resourceapi.Device{
 			Name: dev.Name,
 			Attributes: map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
-				// Topology — usable in CEL placement selectors.
 				"type": {StringValue: ptr.To("device")},
+				// Topology — usable in CEL placement selectors.
 				"numa_node": {IntValue: ptr.To(int64(dev.NUMANode))},
 				"pcie_root": {StringValue: ptr.To(dev.PCIeRoot)},
 				"hsn_iface": {StringValue: ptr.To(dev.HSNIface)},
@@ -65,7 +58,8 @@ func (d *Driver) buildDevices() []resourceapi.Device {
 				"capacity_ptes": {IntValue: ptr.To(dev.Capacity.PTEs)},
 				"capacity_les":  {IntValue: ptr.To(dev.Capacity.LEs)},
 				"capacity_acs":  {IntValue: ptr.To(dev.Capacity.ACs)},
-				// Available — refreshed periodically; informational for CEL selectors.
+				// Effective available — pending-adjusted; updated on every
+				// service create/delete and on the periodic refresh interval.
 				"avail_txqs": {IntValue: ptr.To(avail.TXQs)},
 				"avail_tgqs": {IntValue: ptr.To(avail.TGQs)},
 				"avail_eqs":  {IntValue: ptr.To(avail.EQs)},
@@ -75,7 +69,16 @@ func (d *Driver) buildDevices() []resourceapi.Device {
 				"avail_les":  {IntValue: ptr.To(avail.LEs)},
 				"avail_acs":  {IntValue: ptr.To(avail.ACs)},
 			},
-			AllowMultipleAllocations: ptr.To(true),
+		// BindingConditions: the scheduler will not bind a pod until the
+		// ClaimBinder sets Ready=True, confirming capacity is available.
+		// BindingFailureConditions: if the ClaimBinder sets Unschedulable=True
+		// (device hardware is truly full), the scheduler deallocates the claim
+		// and retries on a different device. Pods must use a merged CXI+VNI
+		// claim template so that both allocations are deallocated atomically —
+		// see ClaimBinder type comment for why separate claims cause Score errors.
+		BindingConditions:        []string{"Ready"},
+		BindingFailureConditions: []string{"Unschedulable"},
+		AllowMultipleAllocations: ptr.To(true),
 		})
 	}
 	return out

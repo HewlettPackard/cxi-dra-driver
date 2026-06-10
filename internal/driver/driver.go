@@ -3,6 +3,7 @@ package driver
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"k8s.io/apimachinery/pkg/types"
@@ -12,6 +13,16 @@ import (
 	"github.com/slingshot/cxi-dra-driver/internal/cdi"
 	"github.com/slingshot/cxi-dra-driver/internal/cxi"
 )
+
+// pendingEntry records a grant that has been issued to the ClaimBinder
+// (Ready=True set) but for which the NRI plugin has not yet created the
+// hardware service. The resources are held in the pending map so that
+// subsequent binder evaluations on the same device see the reduced capacity
+// and do not double-grant.
+type pendingEntry struct {
+	deviceName string
+	resources  cxi.ResourceSet
+}
 
 // Config holds all configuration for a Driver instance.
 type Config struct {
@@ -43,6 +54,10 @@ type Driver struct {
 	overhead        cxi.ResourceSet // admin-configured per-device reserved overhead
 	refreshInterval time.Duration   // how often to republish ResourceSlice with fresh avail attrs
 	cdiEnvConfig    cdi.CDIEnvConfig
+	notify          chan struct{}    // signals an immediate ResourceSlice republish
+
+	pendingMu sync.Mutex
+	pending   map[types.UID]pendingEntry // claimUID → in-flight grant not yet backed by a service
 }
 
 func New(cfg Config) *Driver {
@@ -59,12 +74,93 @@ func New(cfg Config) *Driver {
 		overhead:        cfg.Overhead,
 		refreshInterval: cfg.RefreshInterval,
 		cdiEnvConfig:    cfg.CDIEnvConfig,
+		notify:          make(chan struct{}, 1),
+		pending:         make(map[types.UID]pendingEntry),
 	}
 }
 
 // Store returns the allocation store, so it can be passed to the NRI plugin.
 func (d *Driver) Store() *AllocationStore {
 	return d.store
+}
+
+// TriggerRepublish schedules an immediate ResourceSlice republish. If one is
+// already pending this is a no-op — the buffered channel holds at most one
+// signal.
+func (d *Driver) TriggerRepublish() {
+	select {
+	case d.notify <- struct{}{}:
+	default:
+	}
+}
+
+// RemovePending removes the in-flight pending grant for a claim. Called by
+// the NRI plugin after a CXI service is successfully created — at that point
+// the hardware service accounts for the resources and the pending entry would
+// otherwise double-subtract from effective capacity.
+func (d *Driver) RemovePending(claimUID types.UID) {
+	d.pendingMu.Lock()
+	defer d.pendingMu.Unlock()
+	delete(d.pending, claimUID)
+}
+
+// checkAndAddPending atomically checks whether requested fits within effective
+// available capacity for deviceName and, if so, records the grant in the
+// pending map. hwAvail must be the raw value from ReadAvailableCapacity —
+// do NOT subtract overhead before calling, as ReadAvailableCapacity already
+// reflects all running service consumption including system services.
+// Returns true if the grant was recorded, false if capacity was insufficient.
+func (d *Driver) checkAndAddPending(claimUID types.UID, deviceName string, requested, hwAvail cxi.ResourceSet) bool {
+	d.pendingMu.Lock()
+	defer d.pendingMu.Unlock()
+	var pendingSum cxi.ResourceSet
+	for _, e := range d.pending {
+		if e.deviceName == deviceName {
+			pendingSum = pendingSum.Add(e.resources)
+		}
+	}
+	effective := hwAvail.Sub(pendingSum).ClampToZero()
+	if !requested.Fits(effective) {
+		return false
+	}
+	d.pending[claimUID] = pendingEntry{deviceName: deviceName, resources: requested}
+	return true
+}
+
+// hasPending reports whether there is an active in-flight pending grant for
+// the given claim.
+func (d *Driver) hasPending(claimUID types.UID) bool {
+	d.pendingMu.Lock()
+	defer d.pendingMu.Unlock()
+	_, ok := d.pending[claimUID]
+	return ok
+}
+
+// effectiveAvail returns the current available capacity for a device adjusted
+// for in-flight pending grants:
+//
+//	ReadAvailableCapacity(deviceName) − pending grants
+//
+// Note: overhead is NOT subtracted here. ReadAvailableCapacity already
+// reflects the actual consumption of all running services (including the
+// pre-configured system services that --reserved-*-pools represents).
+// Used by buildDevices to publish accurate avail_* attributes in the
+// ResourceSlice so the scheduler can make informed placement decisions.
+func (d *Driver) effectiveAvail(deviceName string) cxi.ResourceSet {
+	avail, err := cxi.ReadAvailableCapacity(deviceName)
+	if err != nil {
+		d.logf("warning: reading available capacity for %s: %v", deviceName, err)
+		avail = cxi.ResourceSet{}
+	}
+	d.pendingMu.Lock()
+	defer d.pendingMu.Unlock()
+	var pendingSum cxi.ResourceSet
+	for _, e := range d.pending {
+		if e.deviceName == deviceName {
+			pendingSum = pendingSum.Add(e.resources)
+		}
+	}
+	return avail.Sub(pendingSum).ClampToZero()
 }
 
 // logf prints a formatted driver log line to stdout.
@@ -131,6 +227,8 @@ func (d *Driver) Run(ctx context.Context) error {
 	}
 
 	// Periodically republish with refreshed available-capacity attributes.
+	// Also responds to immediate republish signals from the ClaimBinder (after
+	// granting Ready=True) and from the NRI plugin (after service create/delete).
 	if d.refreshInterval <= 0 {
 		return fmt.Errorf("--resource-refresh-interval must be > 0 (got %s)", d.refreshInterval)
 	}
@@ -143,6 +241,10 @@ func (d *Driver) Run(ctx context.Context) error {
 		case <-ticker.C:
 			if err := publish(); err != nil {
 				d.logf("warning: refreshing resource slice: %v", err)
+			}
+		case <-d.notify:
+			if err := publish(); err != nil {
+				d.logf("warning: refreshing resource slice (event-driven): %v", err)
 			}
 		}
 	}

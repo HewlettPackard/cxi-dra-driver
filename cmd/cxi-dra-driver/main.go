@@ -152,7 +152,9 @@ func main() {
 		})
 	}
 
-	nriPlugin, err := nri.New(d.Store(), mock)
+	binder := driver.NewClaimBinder(d, kubeClient, *driverName, *nodeName)
+
+	nriPlugin, err := nri.New(d.Store(), mock, d.TriggerRepublish, d.RemovePending, binder.TriggerRetry)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: failed to create NRI plugin: %v\n", err)
 		os.Exit(1)
@@ -163,6 +165,11 @@ func main() {
 		nriErrCh <- nriPlugin.Run(ctx)
 	}()
 
+	binderErrCh := make(chan error, 1)
+	go func() {
+		binderErrCh <- binder.Run(ctx)
+	}()
+
 	if err := d.Run(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "error: driver exited: %v\n", err)
 		os.Exit(1)
@@ -170,6 +177,11 @@ func main() {
 
 	if err := <-nriErrCh; err != nil {
 		fmt.Fprintf(os.Stderr, "error: NRI plugin exited: %v\n", err)
+		os.Exit(1)
+	}
+
+	if err := <-binderErrCh; err != nil {
+		fmt.Fprintf(os.Stderr, "error: claim binder exited: %v\n", err)
 		os.Exit(1)
 	}
 }

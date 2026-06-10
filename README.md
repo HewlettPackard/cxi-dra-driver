@@ -123,36 +123,41 @@ kubectl get pod cxi-test-3
 kubectl exec -it cxi-test-3 -- fi_info -p cxi
 ```
 
-The test pod claims one CXI device (via the `cxi-quarter` template) and one VNI (via the `cxi-vni` template). You should see CXI providers enumerated without `privileged: true`.
+The test pod claims one CXI device and one fabric VNI via the merged `cxi-quarter-with-vni` template. You should see CXI providers enumerated without `privileged: true`.
 
 ## Requesting CXI Resources
 
-Each pod that uses a CXI device needs **two** resource claims:
+Each pod that uses a CXI device needs a **single** `ResourceClaimTemplate` that requests both the CXI device and a fabric VNI together. The CXI device and VNI are allocated as one atomic unit so that the scheduler's Unschedulable compaction mechanism works correctly (see [How scheduler placement works](#how-scheduler-placement-works) below).
 
-1. A `ResourceClaimTemplate` for the **CXI device** itself — requests fabric queues and LE/TLE pools from a physical CXI NIC.
-2. A `ResourceClaim` (or `ResourceClaimTemplate`) for a **VNI** — allocates one fabric Virtual Network Identifier from the cluster-wide VNI pool.
+Two templates are provided in [deploy/kubernetes/test/resourceclaim.yaml](deploy/kubernetes/test/resourceclaim.yaml):
 
-Both claims must be listed under `spec.resourceClaims` in the Pod and referenced in `resources.claims` for each container that needs them.
-
-### CXI device claim
+| Template | TXQs | TGQs | LE pools | TLE pools | Use case |
+|---|---|---|---|---|---|
+| `cxi-quarter-with-vni` | 256 | 128 | 4 (4096 LEs) | 1 (512 TLEs) | Most jobs |
+| `cxi-half-with-vni` | 512 | 256 | 8 (8192 LEs) | 2 (1024 TLEs) | Bandwidth-intensive jobs |
 
 All resource fields are **required** — the driver has no defaults. Claims without an opaque config block will be rejected at prepare time with a clear error.
 
-Create a `ResourceClaimTemplate` with explicit resource values:
+### Claim template structure
 
 ```yaml
 apiVersion: resource.k8s.io/v1
 kind: ResourceClaimTemplate
 metadata:
-  name: cxi-quarter
+  name: cxi-quarter-with-vni
   namespace: default
 spec:
   spec:
     devices:
       requests:
+        # CXI device request must be first — the MutatingAdmissionPolicy
+        # injects avail_* capacity selectors into requests[0].
         - name: cxi
           exactly:
             deviceClassName: cxi-device
+        - name: vni
+          exactly:
+            deviceClassName: cxi-vni
       config:
         - requests: ["cxi"]
           opaque:
@@ -174,76 +179,35 @@ LEs and TLEs are expressed as **pool counts** due to hardware allocation granula
 
 Set `le_pools: 0` and `tle_pools: 0` if your job does not use triggered operations.
 
-See [deploy/kubernetes/test/resourceclaim.yaml](deploy/kubernetes/test/resourceclaim.yaml) for `cxi-quarter` and `cxi-half` example templates.
-
-### VNI claim
-
-A VNI is a cluster-wide fabric identifier that scopes communication between pods. Each pod must hold a VNI claim so the driver can program a unique CXI service bound to that pod's network namespace.
-
-For a single pod, use a `ResourceClaimTemplate` (Kubernetes creates one `ResourceClaim` per pod from the template):
-
-```yaml
-apiVersion: resource.k8s.io/v1
-kind: ResourceClaimTemplate
-metadata:
-  name: cxi-vni
-  namespace: default
-spec:
-  spec:
-    devices:
-      requests:
-        - name: vni
-          exactly:
-            deviceClassName: cxi-vni
-```
-
-For a multi-pod workload where all pods must communicate on the **same** fabric service, create a single `ResourceClaim` directly (not a template) and reference it by name from each pod:
-
-```yaml
-apiVersion: resource.k8s.io/v1
-kind: ResourceClaim
-metadata:
-  name: my-job-vni
-  namespace: default
-spec:
-  devices:
-    requests:
-      - name: vni
-        exactly:
-          deviceClassName: cxi-vni
-```
-
-Then reference it in each pod's spec:
-
-```yaml
-spec:
-  resourceClaims:
-    - name: vni
-      resourceClaimName: my-job-vni   # shared claim, not a template
-```
-
-### Wiring claims into a pod
+### Wiring the claim into a pod
 
 ```yaml
 spec:
   resourceClaims:
     - name: cxi
-      resourceClaimTemplateName: cxi-quarter   # one CXI NIC per pod
-    - name: vni
-      resourceClaimTemplateName: cxi-vni       # one VNI per pod (use resourceClaimName for shared)
+      resourceClaimTemplateName: cxi-quarter-with-vni
   containers:
     - name: workload
       resources:
         claims:
           - name: cxi
-          - name: vni
 ```
 
 See [deploy/kubernetes/test/pod.yaml](deploy/kubernetes/test/pod.yaml) for a complete example.
 
+### Why CXI and VNI are in one claim
+
+The driver uses Kubernetes `BindingConditions` to gate pod binding until device capacity is confirmed. When a CXI device is over-subscribed (the scheduler placed more claims on it than it can serve), the ClaimBinder sets `Unschedulable=True` on the device. The scheduler then deallocates the claim and retries on a less-loaded device.
+
+Because the CXI device and VNI are in the **same** `ResourceClaim`, both allocations are cleared atomically on deallocation. If they were in separate claims, only the CXI claim would be deallocated while the VNI claim remained allocated, causing `"number of allocations 1 is smaller than number of claims 2"` Score errors on every subsequent retry.
+
+### Multi-pod workloads sharing a VNI
+
+The merged template gives each pod its own unique VNI, which is appropriate for independent pods that each need isolated fabric access. Support for multi-pod workloads that must communicate on a **shared** fabric service (same VNI across pods) is planned but not yet implemented via a merged template.
+
 ### How scheduler placement works
 
-When a `ResourceClaim` with opaque CXI config is created, the `MutatingAdmissionPolicy` automatically injects CEL selectors into the claim. For example, a `cxi-quarter` request becomes:
+When a `ResourceClaim` with opaque CXI config is created, the `MutatingAdmissionPolicy` automatically injects CEL selectors into the claim. For example, a `cxi-quarter-with-vni` request becomes:
 
 ```
 device.attributes["cxi.slingshot.hpe.com"]["avail_txqs"] >= 256 &&
@@ -251,7 +215,17 @@ device.attributes["cxi.slingshot.hpe.com"]["avail_tles"] >= 512 &&
 ...
 ```
 
-This causes the scheduler to only place the claim on devices that currently have sufficient available resources, enabling bin-packing across devices. The driver also performs a live fit-check at `PrepareResourceClaims` time as a final authoritative gate.
+These selectors steer subsequent scheduling rounds toward devices with available capacity. However, because the K8s DRA scheduler evaluates claims against a static snapshot of the `ResourceSlice` within a single scheduling batch, it may initially over-concentrate claims onto fewer devices than necessary (the custom `avail_*` attributes are not decremented between per-claim decisions in the same batch).
+
+The driver handles this via **Unschedulable compaction**:
+
+1. The scheduler allocates a batch of claims, possibly concentrating multiple claims on one device.
+2. The `ClaimBinder` evaluates each allocation against real hardware capacity. It grants `Ready=True` to claims that fit within current capacity minus in-flight pending grants.
+3. Claims that exceed the device's hardware capacity (device truly full) receive `Unschedulable=True`.
+4. The scheduler sees `Unschedulable=True` in the claim's `BindingFailureConditions`, deallocates the entire claim (CXI + VNI together), and retries.
+5. At retry time, the `ResourceSlice` has been republished with `avail_*` near zero for the full device, steering the retry allocation to a less-loaded device.
+
+The system converges to the correct distribution (≤3 `cxi-quarter` pods per device) within one or two compaction cycles.
 
 ## Accounting for Pre-existing System Services
 
@@ -358,7 +332,7 @@ Each device in the `ResourceSlice` exposes the following attributes, accessible 
 | `avail_les` | int | Currently available LEs |
 | `avail_acs` | int | Currently available ACs |
 
-The `avail_*` attributes are informational and used by the `MutatingAdmissionPolicy` for bin-packing. The live fit-check at prepare time is the authoritative gate.
+The `avail_*` attributes are used by the `MutatingAdmissionPolicy` to steer initial placement and by the `ClaimBinder`'s Unschedulable compaction cycle to redirect retried claims away from full devices. The `ClaimBinder`'s live fit-check against hardware capacity (via `ReadAvailableCapacity`) is the authoritative gate for granting `Ready=True`.
 
 Example — claim a device on NUMA node 1 with a custom CEL selector:
 
@@ -395,7 +369,7 @@ kubectl apply -f deploy/kubernetes/daemonset.yaml        # add --mock-devices=2,
 # Verify both device types appear
 kubectl get resourceslices -o wide
 
-# Run the test workload (claims one CXI device + one VNI)
+# Run the test workload (merged CXI+VNI claim)
 kubectl apply -f deploy/kubernetes/test/resourceclaim.yaml
 kubectl apply -f deploy/kubernetes/test/pod.yaml
 kubectl logs cxi-test-3

@@ -20,9 +20,15 @@ import (
 //  1. Resolve the requested ResourceSet from the claim's opaque config
 //     (all fields required — claims without config are rejected)
 //  2. Check the request against the usable ceiling (hardware - admin overhead)
-//     to give a clear "will never fit" rejection before touching hardware
-//  3. Poll live available capacity on the device and check the request fits
-//  4. Record the allocation in the store for the NRI plugin
+//     as a fast-fail for requests that can never succeed on this hardware
+//  3. Record the allocation in the store for the NRI plugin
+//
+// The live capacity fit-check is NOT performed here. It is owned by two
+// complementary mechanisms:
+//   - ClaimBinder (primary): sets Ready=True only when capacity is confirmed,
+//     preventing the scheduler from binding the pod until it is safe to do so.
+//   - NRI RunPodSandbox (secondary): re-checks under a per-device mutex as a
+//     safety net for the narrow window between Ready=True and service creation.
 func (d *Driver) PrepareResourceClaims(
 	_ context.Context,
 	claims []*resourceapi.ResourceClaim,
@@ -138,21 +144,6 @@ func (d *Driver) prepareClaim(claim *resourceapi.ResourceClaim, vniByPod map[typ
 			return kubeletplugin.PrepareResult{
 				Err: fmt.Errorf("claim %s/%s device %s: requested resources (%s) exceed usable ceiling (%s) — request will never fit on this hardware",
 					claim.Namespace, claim.Name, alloc.Device, requested, ceiling),
-			}
-		}
-
-		// Live fit-check: poll current available capacity on the device.
-		avail, err := cxi.ReadAvailableCapacity(alloc.Device)
-		if err != nil {
-			return kubeletplugin.PrepareResult{
-				Err: fmt.Errorf("claim %s/%s device %s: reading available capacity: %w",
-					claim.Namespace, claim.Name, alloc.Device, err),
-			}
-		}
-		if !requested.Fits(avail) {
-			return kubeletplugin.PrepareResult{
-				Err: fmt.Errorf("claim %s/%s device %s: requested resources (%s) do not fit in currently available (%s)",
-					claim.Namespace, claim.Name, alloc.Device, requested, avail),
 			}
 		}
 

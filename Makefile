@@ -10,6 +10,9 @@ CMD_PATH = ./cmd/cxi-dra-driver
 .PHONY: build image push deploy clean kind-load kind-reload
 
 build:
+	CGO_ENABLED=1 GOOS=linux go build -tags cxi -o bin/$(BINARY) $(CMD_PATH)
+
+build-mock:
 	CGO_ENABLED=0 GOOS=linux go build -o bin/$(BINARY) $(CMD_PATH)
 
 image:
@@ -39,12 +42,14 @@ kind-reload: kind-load
 deploy:
 	kubectl apply -f deploy/kubernetes/clusterrole.yaml
 	kubectl apply -f deploy/kubernetes/deviceclass.yaml
+	kubectl apply -f deploy/kubernetes/deviceclass-vni.yaml
 	kubectl apply -f deploy/kubernetes/admission-policy.yaml
 	kubectl apply -f deploy/kubernetes/daemonset.yaml
 
 undeploy:
 	kubectl delete -f deploy/kubernetes/daemonset.yaml --ignore-not-found
 	kubectl delete -f deploy/kubernetes/admission-policy.yaml --ignore-not-found
+	kubectl delete -f deploy/kubernetes/deviceclass-vni.yaml --ignore-not-found
 	kubectl delete -f deploy/kubernetes/deviceclass.yaml --ignore-not-found
 	kubectl delete -f deploy/kubernetes/clusterrole.yaml --ignore-not-found
 

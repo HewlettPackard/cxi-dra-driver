@@ -1,0 +1,99 @@
+# Phase 3 test: 24-pod ReplicaSet exhausting all device capacity on both nodes.
+#
+# With 4 CXI devices per node × 2 nodes and 3 cxi-quarter slots per device,
+# total capacity is 4 × 3 × 2 = 24 pods. This ReplicaSet exercises the full
+# BindingConditions gating path:
+#
+#  1. The DRA scheduler allocates all 24 claims (possibly concentrating on fewer
+#     devices due to alphabetical first-fit).
+#  2. The ClaimBinder evaluates each claim. For each device it grants Ready=True
+#     to the first 3 claims (3 × 512 TLEs = 1536 = ReadAvailableCapacity on a
+#     fresh device), deferring the rest to falseClaims.
+#  3. Over-concentrated claims (>3 per device) receive Unschedulable=True; the
+#     scheduler deallocates the entire merged claim (CXI+VNI together) and
+#     retries on a less-loaded device — correctly converging to 3 per device.
+#  4. As pods finish, StopPodSandbox deletes services and fires TriggerRetry(),
+#     unblocking the next wave of deferred pods.
+#
+# Expected observation:
+#   kubectl get pods -l app=cxi-phase3-test
+#   → 24 Running after at most a few Unschedulable compaction cycles.
+#
+# Check which device each pod is using:
+#
+#   kubectl get resourceclaims -o wide
+#   kubectl describe pods -l app=cxi-phase3-test | grep "FI_CXI_SVC_ID"
+#
+# Apply pre-requisites first:
+#   kubectl apply -f deploy/kubernetes/test/resourceclaim.yaml
+#
+# To clean up: kubectl delete replicaset cxi-phase3-test
+---
+apiVersion: apps/v1
+kind: ReplicaSet
+metadata:
+  name: cxi-phase3-test
+  namespace: default
+spec:
+  replicas: 24
+  selector:
+    matchLabels:
+      app: cxi-phase3-test
+  template:
+    metadata:
+      labels:
+        app: cxi-phase3-test
+    spec:
+      restartPolicy: Always
+
+      # Each pod gets its own ephemeral merged cxi-quarter-with-vni claim
+      # (CXI device + fabric VNI allocated atomically in one ResourceClaim).
+      resourceClaims:
+        - name: cxi
+          resourceClaimTemplateName: cxi-quarter-with-vni
+      containers:
+        - name: workload
+          image: ubuntu:24.04
+          command: ["sh", "-c"]
+          args:
+            - |
+              echo "=== CXI devices ==="
+              ls -la /dev/cxi* || echo "none"
+              echo "=== CXI service files (from NRI plugin) ==="
+              ls -la /run/cxi/ || echo "none"
+              cat /run/cxi/cxi0-service.yaml 2>/dev/null || echo "no service file for cxi0"
+              echo "=== libfabric providers ==="
+              /extras/bin/fi_info --provider cxi 2>&1 || echo "fi_info not found or no CXI provider"
+              sleep 3600
+          resources:
+            claims:
+              - name: cxi
+          env:
+            - name: LD_LIBRARY_PATH      
+              value: "/usr/lib64/:/extras/lib/:/hostlibs:/xpmem/lib64"
+            - name: CXIP_DEFAULT_LINK
+              value: "1"
+            - name: CXIP_DEFAULT_SPEED
+              value: "200000"
+            - name: CXIP_SKIP_AMA_CHECK
+              value: "1"
+          volumeMounts:
+            - name: libcxi
+              mountPath: /hostlibs
+            - name: build
+              mountPath: /extras
+            - name: xpmem
+              mountPath: /xpmem/lib64
+      volumes:
+        - name: libcxi
+          hostPath:
+            path: /usr/lib64/
+            type: Directory
+        - name: xpmem
+          hostPath:
+            path: /opt/xpmem/lib64
+            type: Directory
+        - name: build
+          hostPath:
+            path: /home/brics/jwatson.brics/k8s-on-compute/shs-libfabric/build-output
+            type: Directory

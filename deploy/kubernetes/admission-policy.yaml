@@ -29,12 +29,14 @@ spec:
         operations:  ["CREATE"]
         resources:   ["resourceclaims"]
   matchConditions:
-    # Only process claims with exactly one device request.
-    # The mutation patches requests[0] only; claims with multiple requests
-    # would have subsequent requests left without selectors.
+    # Only process claims with at least one device request.
+    # The mutation patches requests[0] only; the CXI request must be at index 0
+    # (as in cxi-quarter-with-vni) for selector injection to target the right
+    # request. Multi-request claims (e.g. merged CXI+VNI templates) are
+    # supported as long as the CXI request is first.
     - name: has-requests
       expression: >
-        object.spec.devices.requests.size() == 1
+        object.spec.devices.requests.size() >= 1
 
     # Only process claims whose first request has exactly set but no selectors yet.
     # We require exactly to be present because the JSONPatch target path
