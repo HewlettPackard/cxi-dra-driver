@@ -8,6 +8,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 
+	"github.com/slingshot/cxi-dra-driver/internal/cdi"
 	"github.com/slingshot/cxi-dra-driver/internal/cxi"
 )
 
@@ -189,6 +190,112 @@ func TestVNIFromDeviceName(t *testing.T) {
 			vni, ok := vniFromDeviceName(tt.in)
 			if vni != tt.wantVNI || ok != tt.wantOK {
 				t.Errorf("vniFromDeviceName(%q) = (%d, %v), want (%d, %v)", tt.in, vni, ok, tt.wantVNI, tt.wantOK)
+			}
+		})
+	}
+}
+
+// TestPrepareClaimCDIDeviceIDs verifies that the env/nccl/ofi CDI IDs are
+// appended to the per-device ID based on the CDIEnvConfig flags.
+func TestPrepareClaimCDIDeviceIDs(t *testing.T) {
+	tests := []struct {
+		name         string
+		cdiEnvConfig cdi.CDIEnvConfig
+		wantIDs      []string
+	}{
+		{
+			name:         "base only",
+			cdiEnvConfig: cdi.CDIEnvConfig{},
+			wantIDs: []string{
+				testDriver + "/cxi=cxi0",
+				testDriver + "/env=env",
+			},
+		},
+		{
+			name:         "with NCCL",
+			cdiEnvConfig: cdi.CDIEnvConfig{NCCLPrefix: "/spack/nccl"},
+			wantIDs: []string{
+				testDriver + "/cxi=cxi0",
+				testDriver + "/env=env",
+				testDriver + "/nccl=nccl",
+			},
+		},
+		{
+			name:         "with OFI",
+			cdiEnvConfig: cdi.CDIEnvConfig{AWSofiNCCLPrefix: "/spack/aws-ofi-nccl"},
+			wantIDs: []string{
+				testDriver + "/cxi=cxi0",
+				testDriver + "/env=env",
+				testDriver + "/aws-ofi-nccl=aws-ofi-nccl",
+			},
+		},
+		{
+			name: "with NCCL and OFI",
+			cdiEnvConfig: cdi.CDIEnvConfig{
+				NCCLPrefix:       "/spack/nccl",
+				AWSofiNCCLPrefix: "/spack/aws-ofi-nccl",
+			},
+			wantIDs: []string{
+				testDriver + "/cxi=cxi0",
+				testDriver + "/env=env",
+				testDriver + "/nccl=nccl",
+				testDriver + "/aws-ofi-nccl=aws-ofi-nccl",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			devices := cxi.MockDevices(1) // "cxi0"
+			d := &Driver{
+				driverName:   testDriver,
+				devices:      devices,
+				store:        NewAllocationStore(),
+				cdiEnvConfig: tt.cdiEnvConfig,
+			}
+
+			claim := &resourceapi.ResourceClaim{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-claim",
+					Namespace: "default",
+					UID:       "claim-uid-1",
+				},
+				Spec: resourceapi.ResourceClaimSpec{
+					Devices: resourceapi.DeviceClaim{
+						Config: cxiConfig(),
+					},
+				},
+				Status: resourceapi.ResourceClaimStatus{
+					Allocation: &resourceapi.AllocationResult{
+						Devices: resourceapi.DeviceAllocationResult{
+							Results: []resourceapi.DeviceRequestAllocationResult{
+								cxiResult("cxi0"),
+							},
+						},
+					},
+					ReservedFor: []resourceapi.ResourceClaimConsumerReference{
+						{Resource: "pods", UID: "pod-a"},
+					},
+				},
+			}
+
+			vniByPod := map[types.UID]int{"pod-a": 42}
+			result := d.prepareClaim(claim, vniByPod)
+			if result.Err != nil {
+				t.Fatalf("prepareClaim error: %v", result.Err)
+			}
+			if len(result.Devices) != 1 {
+				t.Fatalf("got %d devices, want 1", len(result.Devices))
+			}
+
+			got := result.Devices[0].CDIDeviceIDs
+			if len(got) != len(tt.wantIDs) {
+				t.Fatalf("CDIDeviceIDs = %v, want %v", got, tt.wantIDs)
+			}
+			for i, id := range got {
+				if id != tt.wantIDs[i] {
+					t.Errorf("CDIDeviceIDs[%d] = %q, want %q", i, id, tt.wantIDs[i])
+				}
 			}
 		})
 	}

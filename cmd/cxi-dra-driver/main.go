@@ -14,6 +14,7 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/dynamic-resource-allocation/kubeletplugin"
 
+	"github.com/slingshot/cxi-dra-driver/internal/cdi"
 	"github.com/slingshot/cxi-dra-driver/internal/cxi"
 	"github.com/slingshot/cxi-dra-driver/internal/driver"
 	"github.com/slingshot/cxi-dra-driver/internal/nri"
@@ -50,6 +51,17 @@ func main() {
 		reservedACs      = flag.Int64("reserved-acs", 0, "ACs reserved by pre-existing system services")
 		reservedLEPools  = flag.Int64("reserved-le-pools", 0, "LE pools reserved by pre-existing system services (1 pool = 1024 LEs)")
 		reservedTLEPools = flag.Int64("reserved-tle-pools", 0, "TLE pools reserved by pre-existing system services (1 pool = 512 TLEs)")
+
+		// CDI env spec configuration — all optional; empty disables the corresponding mount/spec.
+		libfabricLib     = flag.String("libfabric-lib", "", "Host path to libfabric.so.1 (versioned Spack path)")
+		ncclPrefix       = flag.String("nccl-prefix", "", "Spack NCCL install prefix; empty disables NCCL CDI spec")
+		awsOfiNCCLPrefix = flag.String("aws-ofi-nccl-prefix", "", "Spack aws-ofi-nccl install prefix; empty disables OFI CDI spec")
+		hwlocLib         = flag.String("hwloc-lib", "", "Host path to libhwloc.so.15 (for aws-ofi-nccl)")
+		pciaccessLib     = flag.String("pciaccess-lib", "", "Host path to libpciaccess.so.0 (for aws-ofi-nccl)")
+		libxml2Lib       = flag.String("libxml2-lib", "", "Host path to libxml2.so.2 (for aws-ofi-nccl)")
+		libatomicLib     = flag.String("libatomic-lib", "", "Host path to libatomic.so.1 (for aws-ofi-nccl)")
+		liblzmaLib       = flag.String("liblzma-lib", "", "Host path to liblzma.so.5 (for aws-ofi-nccl)")
+		libiconvLib      = flag.String("libiconv-lib", "", "Host path to libiconv.so.2 (for aws-ofi-nccl)")
 	)
 	flag.Parse()
 
@@ -91,14 +103,29 @@ func main() {
 		mockDevList = cxi.MockDevices(*mockDevices)
 	}
 
-	d := driver.New(
-		*nodeName, *podUID, *driverName, *cdiRoot, *pluginDir, *registrarDir,
-		kubeClient, mockDevList,
-		driver.Config{
-			Overhead:        overhead,
-			RefreshInterval: *refreshInterval,
+	d := driver.New(driver.Config{
+		NodeName:        *nodeName,
+		PodUID:          *podUID,
+		DriverName:      *driverName,
+		CDIRoot:         *cdiRoot,
+		PluginDir:       *pluginDir,
+		RegistrarDir:    *registrarDir,
+		KubeClient:      kubeClient,
+		MockDevices:     mockDevList,
+		Overhead:        overhead,
+		RefreshInterval: *refreshInterval,
+		CDIEnvConfig: cdi.CDIEnvConfig{
+			LibfabricLib:     *libfabricLib,
+			NCCLPrefix:       *ncclPrefix,
+			AWSofiNCCLPrefix: *awsOfiNCCLPrefix,
+			HwlocLib:         *hwlocLib,
+			PciaccessLib:     *pciaccessLib,
+			Libxml2Lib:       *libxml2Lib,
+			LibatomicLib:     *libatomicLib,
+			LiblzmaLib:       *liblzmaLib,
+			LibiconvLib:      *libiconvLib,
 		},
-	)
+	})
 
 	// Start the cluster-wide VNI pool publisher if a VNI range is configured
 	// (either flag set). Exactly one pod (the leader) publishes the VNI

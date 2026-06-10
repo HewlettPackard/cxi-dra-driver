@@ -13,6 +13,21 @@ import (
 	"github.com/slingshot/cxi-dra-driver/internal/cxi"
 )
 
+// Config holds all configuration for a Driver instance.
+type Config struct {
+	NodeName        string
+	PodUID          string
+	DriverName      string
+	CDIRoot         string
+	PluginDir       string
+	RegistrarDir    string
+	KubeClient      kubernetes.Interface
+	MockDevices     []*cxi.Device
+	Overhead        cxi.ResourceSet
+	RefreshInterval time.Duration
+	CDIEnvConfig    cdi.CDIEnvConfig
+}
+
 // Driver implements kubeletplugin.DRAPlugin for CXI devices.
 type Driver struct {
 	nodeName        string
@@ -27,32 +42,23 @@ type Driver struct {
 	store           *AllocationStore
 	overhead        cxi.ResourceSet // admin-configured per-device reserved overhead
 	refreshInterval time.Duration   // how often to republish ResourceSlice with fresh avail attrs
+	cdiEnvConfig    cdi.CDIEnvConfig
 }
 
-// Config holds admin-configured driver parameters passed from flags.
-type Config struct {
-	Overhead        cxi.ResourceSet
-	RefreshInterval time.Duration
-}
-
-func New(
-	nodeName, podUID, driverName, cdiRoot, pluginDir, registrarDir string,
-	kubeClient kubernetes.Interface,
-	mockDevices []*cxi.Device,
-	cfg Config,
-) *Driver {
+func New(cfg Config) *Driver {
 	return &Driver{
-		nodeName:        nodeName,
-		podUID:          podUID,
-		driverName:      driverName,
-		cdiRoot:         cdiRoot,
-		pluginDir:       pluginDir,
-		registrarDir:    registrarDir,
-		kubeClient:      kubeClient,
-		mockDevices:     mockDevices,
+		nodeName:        cfg.NodeName,
+		podUID:          cfg.PodUID,
+		driverName:      cfg.DriverName,
+		cdiRoot:         cfg.CDIRoot,
+		pluginDir:       cfg.PluginDir,
+		registrarDir:    cfg.RegistrarDir,
+		kubeClient:      cfg.KubeClient,
+		mockDevices:     cfg.MockDevices,
 		store:           NewAllocationStore(),
 		overhead:        cfg.Overhead,
 		refreshInterval: cfg.RefreshInterval,
+		cdiEnvConfig:    cfg.CDIEnvConfig,
 	}
 }
 
@@ -83,6 +89,20 @@ func (d *Driver) Run(ctx context.Context) error {
 	for _, dev := range d.devices {
 		if err := cdi.WriteSpec(d.cdiRoot, d.driverName, dev); err != nil {
 			return fmt.Errorf("writing CDI spec for %s: %w", dev.Name, err)
+		}
+	}
+
+	if err := cdi.WriteEnvSpec(d.cdiRoot, d.driverName, d.cdiEnvConfig); err != nil {
+		return fmt.Errorf("writing CDI env spec: %w", err)
+	}
+	if d.cdiEnvConfig.NCCLPrefix != "" {
+		if err := cdi.WriteNCCLSpec(d.cdiRoot, d.driverName, d.cdiEnvConfig); err != nil {
+			return fmt.Errorf("writing CDI NCCL spec: %w", err)
+		}
+	}
+	if d.cdiEnvConfig.AWSofiNCCLPrefix != "" {
+		if err := cdi.WriteAWSofiNCCLSpec(d.cdiRoot, d.driverName, d.cdiEnvConfig); err != nil {
+			return fmt.Errorf("writing CDI aws-ofi-nccl spec: %w", err)
 		}
 	}
 
