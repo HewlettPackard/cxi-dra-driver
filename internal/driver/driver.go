@@ -37,6 +37,7 @@ type Config struct {
 	Overhead        cxi.ResourceSet
 	RefreshInterval time.Duration
 	CDIEnvConfig    cdi.CDIEnvConfig
+	EnableCDIEnv    bool // if false, env/nccl/ofi CDI specs are not written and not injected into pods
 }
 
 // Driver implements kubeletplugin.DRAPlugin for CXI devices.
@@ -54,6 +55,7 @@ type Driver struct {
 	overhead        cxi.ResourceSet // admin-configured per-device reserved overhead
 	refreshInterval time.Duration   // how often to republish ResourceSlice with fresh avail attrs
 	cdiEnvConfig    cdi.CDIEnvConfig
+	enableCDIEnv    bool // if false, env/nccl/ofi CDI specs are not written and not injected into pods
 	notify          chan struct{}    // signals an immediate ResourceSlice republish
 
 	pendingMu sync.Mutex
@@ -74,6 +76,7 @@ func New(cfg Config) *Driver {
 		overhead:        cfg.Overhead,
 		refreshInterval: cfg.RefreshInterval,
 		cdiEnvConfig:    cfg.CDIEnvConfig,
+		enableCDIEnv:    cfg.EnableCDIEnv,
 		notify:          make(chan struct{}, 1),
 		pending:         make(map[types.UID]pendingEntry),
 	}
@@ -188,17 +191,19 @@ func (d *Driver) Run(ctx context.Context) error {
 		}
 	}
 
-	if err := cdi.WriteEnvSpec(d.cdiRoot, d.driverName, d.cdiEnvConfig); err != nil {
-		return fmt.Errorf("writing CDI env spec: %w", err)
-	}
-	if d.cdiEnvConfig.NCCLPrefix != "" {
-		if err := cdi.WriteNCCLSpec(d.cdiRoot, d.driverName, d.cdiEnvConfig); err != nil {
-			return fmt.Errorf("writing CDI NCCL spec: %w", err)
+	if d.enableCDIEnv {
+		if err := cdi.WriteEnvSpec(d.cdiRoot, d.driverName, d.cdiEnvConfig); err != nil {
+			return fmt.Errorf("writing CDI env spec: %w", err)
 		}
-	}
-	if d.cdiEnvConfig.AWSofiNCCLPrefix != "" {
-		if err := cdi.WriteAWSofiNCCLSpec(d.cdiRoot, d.driverName, d.cdiEnvConfig); err != nil {
-			return fmt.Errorf("writing CDI aws-ofi-nccl spec: %w", err)
+		if d.cdiEnvConfig.NCCLPrefix != "" {
+			if err := cdi.WriteNCCLSpec(d.cdiRoot, d.driverName, d.cdiEnvConfig); err != nil {
+				return fmt.Errorf("writing CDI NCCL spec: %w", err)
+			}
+		}
+		if d.cdiEnvConfig.AWSofiNCCLPrefix != "" {
+			if err := cdi.WriteAWSofiNCCLSpec(d.cdiRoot, d.driverName, d.cdiEnvConfig); err != nil {
+				return fmt.Errorf("writing CDI aws-ofi-nccl spec: %w", err)
+			}
 		}
 	}
 
