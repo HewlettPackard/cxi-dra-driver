@@ -37,7 +37,7 @@ func main() {
 		vniRangeStart = flag.Int("vni-range-start", 0, "First VNI in the cluster-wide pool (0 disables VNI pool publishing)")
 		vniRangeEnd   = flag.Int("vni-range-end", 0, "Last VNI in the cluster-wide pool (inclusive)")
 
-		refreshInterval = flag.Duration("resource-refresh-interval", 30*time.Second,
+		refreshInterval = flag.Duration("resource-refresh-interval", 10*time.Second,
 			"How often to republish the ResourceSlice with refreshed available-capacity attributes")
 
 		// Admin overhead: resources to deduct from hardware totals when computing
