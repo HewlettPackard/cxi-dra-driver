@@ -6,10 +6,12 @@ metadata:
 spec:
   restartPolicy: Never
 
-  # Each pod gets its own ephemeral claim from the template.
+  # Single CXI device claim — the fabric VNI is namespace-scoped (assigned
+  # by the namespace VNI allocator) and read at prepare time, not part of
+  # the claim.
   resourceClaims:
     - name: cxi
-      resourceClaimTemplateName: cxi-quarter-with-vni
+      resourceClaimTemplateName: cxi-quarter
 
   containers:
     - name: workload

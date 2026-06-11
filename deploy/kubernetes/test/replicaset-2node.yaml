@@ -1,15 +1,16 @@
 # Two-node test: 24-pod ReplicaSet pinned to two nodes only.
 #
 # 2 nodes × 4 CXI devices × 3 cxi-quarter slots = 24 pods capacity.
-# Useful for testing scale-down/scale-up VNI cleanup in isolation.
+# Useful for testing scale-down/scale-up in isolation.
 #
-# Each pod uses the merged cxi-quarter-with-vni template — CXI device and
-# fabric VNI in a single claim. This is required for Unschedulable compaction
-# to work correctly: when the ClaimBinder sets Unschedulable=True on an
-# over-subscribed device, the scheduler deallocates the entire merged claim
-# (CXI + VNI together), so the retry starts with a clean allocation on a
-# less-loaded device. With separate claims the VNI allocation would survive
-# the deallocation, causing Score errors on retry.
+# Each pod uses the single-CXI cxi-quarter template. The fabric VNI is
+# namespace-scoped (assigned once by the namespace VNI allocator) and read at
+# prepare time, so it is not part of the claim. This one-claim-per-pod model
+# is what lets Unschedulable compaction work cleanly: when the ClaimBinder
+# sets Unschedulable=True on an over-subscribed device, the scheduler
+# deallocates the single CXI claim and retries on a less-loaded device — no
+# second claim is left in a partial-allocation state, so the DRA Score
+# plugin cannot hit the "N allocations < N claims" mismatch.
 #
 # To switch nodes, edit the values under nodeAffinity below.
 # To clean up: kubectl delete replicaset cxi-2node-test
@@ -42,11 +43,12 @@ spec:
                       - nid001018
                       - nid001019
 
-      # Each pod gets its own ephemeral merged cxi-quarter-with-vni claim
-      # (CXI device + fabric VNI allocated atomically in one ResourceClaim).
+      # Single CXI device claim — the fabric VNI is namespace-scoped (assigned
+      # by the namespace VNI allocator) and read at prepare time, not part of
+      # the claim.
       resourceClaims:
         - name: cxi
-          resourceClaimTemplateName: cxi-quarter-with-vni
+          resourceClaimTemplateName: cxi-quarter
       
       containers:
         - name: workload

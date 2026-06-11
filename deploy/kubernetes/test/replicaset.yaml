@@ -10,8 +10,10 @@
 #     to the first 3 claims (3 × 512 TLEs = 1536 = ReadAvailableCapacity on a
 #     fresh device), deferring the rest to falseClaims.
 #  3. Over-concentrated claims (>3 per device) receive Unschedulable=True; the
-#     scheduler deallocates the entire merged claim (CXI+VNI together) and
-#     retries on a less-loaded device — correctly converging to 3 per device.
+#     scheduler deallocates the single CXI claim and retries on a less-loaded
+#     device — correctly converging to 3 per device. There is no second claim
+#     to leave partially allocated because VNI is namespace-scoped (assigned
+#     once by the namespace allocator, not part of the claim).
 #  4. As pods finish, StopPodSandbox deletes services and fires TriggerRetry(),
 #     unblocking the next wave of deferred pods.
 #
@@ -46,11 +48,12 @@ spec:
     spec:
       restartPolicy: Always
 
-      # Each pod gets its own ephemeral merged cxi-quarter-with-vni claim
-      # (CXI device + fabric VNI allocated atomically in one ResourceClaim).
+      # Single CXI device claim — the fabric VNI is namespace-scoped (assigned
+      # by the namespace VNI allocator) and read at prepare time, not part of
+      # the claim.
       resourceClaims:
         - name: cxi
-          resourceClaimTemplateName: cxi-quarter-with-vni
+          resourceClaimTemplateName: cxi-quarter
       containers:
         - name: workload
           image: ubuntu:24.04

@@ -1,40 +1,39 @@
 # CXI ResourceClaimTemplates with explicit resource allocation.
 #
+# Each pod gets one ResourceClaim that allocates a single CXI device. The
+# fabric VNI is NOT part of the claim: it is assigned per-namespace by the
+# leader-elected namespace VNI allocator and read at prepare time, so every
+# pod in a namespace shares the namespace's VNI for RDMA.
+#
+# This one-claim-per-pod model is what makes the Unschedulable compaction
+# path correct: when the ClaimBinder sets Unschedulable=True on an
+# over-subscribed device, the scheduler deallocates the single CXI claim
+# and retries on a less-loaded device — there is no second claim to leave
+# in a partially-allocated state, so the DRA Score plugin cannot hit the
+# "number of allocations N is smaller than number of claims" mismatch.
+#
 # All resource fields are required — the driver has no defaults. Claims
 # without opaque config will be rejected at prepare time with a clear error.
 #
 # LEs and TLEs are expressed as pool counts:
 #   le_pools:  1 pool = 1024 LEs
 #   tle_pools: 1 pool = 512  TLEs
-#
-# Each pod uses a single merged template that combines the CXI device request
-# and the fabric VNI allocation in one ResourceClaim. This is required for
-# Unschedulable compaction to work correctly: when the ClaimBinder sets
-# Unschedulable=True on an over-subscribed device the scheduler deallocates
-# the entire claim (CXI + VNI together) atomically, so the pod retries with
-# a clean allocation on a less-loaded device.
 ---
-# Merged quarter+VNI: allocates a CXI quarter-device and a fabric VNI in a
-# single ResourceClaim. Suitable for most jobs. Requests four LE pools
-# (4096 LEs) and one TLE pool (512 TLEs); set le_pools/tle_pools to 0 if
-# your job does not use triggered operations.
+# CXI quarter-device. Requests four LE pools (4096 LEs) and one TLE pool
+# (512 TLEs); set le_pools/tle_pools to 0 if your job does not use
+# triggered operations.
 apiVersion: resource.k8s.io/v1
 kind: ResourceClaimTemplate
 metadata:
-  name: cxi-quarter-with-vni
+  name: cxi-quarter
   namespace: default
 spec:
   spec:
     devices:
       requests:
-        # CXI device request must be first: the MutatingAdmissionPolicy
-        # injects avail_* selectors into requests[0] (the CXI request).
         - name: cxi
           exactly:
             deviceClassName: cxi-device
-        - name: vni
-          exactly:
-            deviceClassName: cxi-vni
       config:
         - requests: ["cxi"]
           opaque:
@@ -49,12 +48,11 @@ spec:
               le_pools: 4
               tle_pools: 1
 ---
-# Merged half+VNI: allocates a CXI half-device and a fabric VNI in a single
-# ResourceClaim. For bandwidth-intensive jobs needing more queues or LE pools.
+# CXI half-device. For bandwidth-intensive jobs needing more queues or LE pools.
 apiVersion: resource.k8s.io/v1
 kind: ResourceClaimTemplate
 metadata:
-  name: cxi-half-with-vni
+  name: cxi-half
   namespace: default
 spec:
   spec:
@@ -63,9 +61,6 @@ spec:
         - name: cxi
           exactly:
             deviceClassName: cxi-device
-        - name: vni
-          exactly:
-            deviceClassName: cxi-vni
       config:
         - requests: ["cxi"]
           opaque:
