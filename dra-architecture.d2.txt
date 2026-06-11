@@ -10,22 +10,16 @@ Workload: {
 
   Owning Resource: {
     shape: sql_table
-    kind: "Deployment / StatefulSet / etc"
-  }
-
-  VNI Claim: {
-    shape: sql_table
-    type: "Persistent ResourceClaim"
-    deviceClassName: "cxi-vni"
-    shared: "all pods reference by name"
+    kind: "Deployment / ReplicaSet / StatefulSet / Job"
   }
 
   Device Claim Template: {
     shape: sql_table
     type: "ResourceClaimTemplate"
-    deviceClassName: "cxi-device (+ gpu-device)"
-    constraints: "matchAttribute numa.node"
+    deviceClassName: "cxi-device"
+    shape_examples: "cxi-quarter / cxi-half"
     per_pod: "ephemeral claim per pod"
+    note: "exactly one CXI claim per pod"
   }
 
   Pods: {
@@ -33,24 +27,27 @@ Workload: {
     style.fill: "#c5cae9"
     POD: {
       shape: sql_table
-      status: "running / completed"
-      resourceClaims: "device template + VNI claim"
+      status: "pending → bound → running"
+      resourceClaims: "single CXI device template"
+      vni_source: "from namespace annotation"
     }
   }
 
   Owning Resource -> Pods.POD: "creates (many)"
-  Owning Resource -> VNI Claim: "creates once"
+  Owning Resource -> Device Claim Template: "references"
 }
 
-DRA Admission Webhook: {
+MutatingAdmissionPolicy: {
   direction: down
   style.fill: "#fff3e0"
 
-  Webhook: {
+  Policy: {
     shape: sql_table
-    role: "validates ResourceClaims"
-    validates: "claim parameters"
-    enforces: "VNI requires CXI device"
+    role: "auto-injects opaque CXI config"
+    triggers_on: "ResourceClaim CREATE"
+    enforces: "all 8 resource fields present"
+    failure_policy: "Ignore (claim passes through)"
+    impl: "deploy/kubernetes/admission-policy.yaml"
   }
 }
 
@@ -60,10 +57,10 @@ Kubernetes Scheduler: {
 
   Structured Parameters: {
     shape: sql_table
-    role: "allocates devices from ResourceSlices"
-    device_selection: "matches DeviceClass + selectors"
-    topology: "enforces matchAttribute constraints"
-    vni_allocation: "assigns VNI from pool"
+    role: "allocates CXI device from ResourceSlices"
+    selects_node: "by ResourceSlice avail_* attrs"
+    binding_gate: "waits for BindingCondition Ready=True"
+    on_unschedulable: "deallocates + retries on another device"
   }
 }
 
@@ -73,72 +70,109 @@ DRA Node Driver: {
 
   Kubelet Plugin: {
     shape: sql_table
-    role: "device discovery + preparation"
-    discovers: "CXI devices via sysfs"
-    resolves: "CXI-to-HSN pairing"
-    publishes: "ResourceSlices with topology attributes"
+    role: "device discovery + slice publishing"
+    discovers: "CXI devices via sysfs (or mock)"
+    resolves: "CXI-to-HSN pairing via PCIe topology"
+    publishes: "node-scoped ResourceSlice per device"
+    avail_attrs: "txqs/tgqs/eqs/cts/ptes/tles/les/acs"
   }
 
-  NodePrepareResources: {
+  ClaimBinder: {
     shape: sql_table
-    role: "configures devices for pod"
-    cdi_spec: "CXI device node + sysfs mounts"
-    vni_binding: "queries CRI for netns inode"
-    programs: "CXI service (VNI + netns inode)"
+    role: "live capacity fit-check via BindingConditions"
+    watches: "ResourceClaims cluster-wide"
+    sets_Ready: "True / False / Unschedulable per claim"
+    pending_map: "in-flight grants (Ready=True, no service yet)"
+    re_publish: "triggers ResourceSlice update on grant"
   }
 
-  NodeUnprepareResources: {
+  PrepareResourceClaims: {
     shape: sql_table
-    role: "tears down on pod removal"
-    removes: "CXI service entries"
+    role: "kubelet hook on pod scheduling"
+    reads_vni: "from claim.namespace annotation"
+    fast_fail: "rejects requests > usable ceiling"
+    writes_store: "podUID → []PodAllocation{Device,HSN,VNI}"
+    returns: "CDI device IDs"
+  }
+
+  UnprepareResourceClaims: {
+    shape: sql_table
+    role: "kubelet hook on pod removal"
+    clears: "AllocationStore entry"
+  }
+
+  AllocationStore: {
+    shape: sql_table
+    role: "podUID → device assignment (NRI reads)"
+    fields: "DeviceName, DevPath, HSNIface, VNI"
+  }
+
+  NRI Plugin: {
+    shape: sql_table
+    role: "container lifecycle hook"
+    RunPodSandbox: "per-device mutex; CreateService(dev, netnsInode, vni)"
+    CreateContainer: "(future) inject FI_CXI_SVC_ID env"
+    StopPodSandbox: "DestroyService; TriggerRetry"
+  }
+
+  Namespace VNI Allocator: {
+    shape: sql_table
+    role: "leader-elected; assigns VNI per namespace"
+    lease: "cxi-vni-allocator-leader"
+    skip_list: "kube-system, kube-public, kube-node-lease"
+    annotates: "cxi.slingshot.hpe.com/vni on Namespace"
+    range: "--vni-range-start..end (e.g. 100..300)"
   }
 
   ResourceSlice CXI: {
     shape: sql_table
-    devices: "cxi0, cxi1, ..."
-    attributes: "numa.node, pcie.root-complex"
-    hsn_mapping: "cxi0->hsn2, cxi1->hsn0, ..."
+    pool: "<nodeName> (node-scoped)"
+    devices: "cxi0, cxi1, cxi2, cxi3"
+    attributes: "numa.node, pcie.root, hsn"
+    capacity: "txqs, tgqs, eqs, cts, ptes, tles, les, acs"
+    avail: "live, refreshed every 10s + on events"
   }
 
-  ResourceSlice VNI: {
-    shape: sql_table
-    pool: "available VNI range"
-    deviceClassName: "cxi-vni"
-  }
-
-  Kubelet Plugin -> ResourceSlice CXI: "publishes"
-  Kubelet Plugin -> ResourceSlice VNI: "publishes"
-  Kubelet Plugin -> NodePrepareResources: "on pod scheduled"
-  NodePrepareResources -> NodeUnprepareResources: "on pod removal"
+  Kubelet Plugin -> ResourceSlice CXI: "publishes + republishes"
+  ClaimBinder -> Kubelet Plugin: "TriggerRepublish on grant"
+  Kubelet Plugin -> PrepareResourceClaims: "on pod scheduled"
+  PrepareResourceClaims -> UnprepareResourceClaims: "on pod removal"
+  PrepareResourceClaims -> AllocationStore: "write podUID → allocation"
+  AllocationStore -> NRI Plugin: "NRI reads on RunPodSandbox"
+  NRI Plugin -> ClaimBinder: "TriggerRetry on StopPodSandbox"
 }
 
-Node Hardware: {
-  direction: right
+Node Resources: {
+  direction: down
   style.fill: "#e8f5e9"
+
+  Namespace: {
+    shape: sql_table
+    annotation: "cxi.slingshot.hpe.com/vni"
+    scope: "one VNI per namespace, shared by all pods"
+  }
 
   CXI Device: {
     shape: sql_table
-    path: "/dev/cxi0"
-    type: "character device"
+    path: "/dev/cxi0..3"
     sysfs: "/sys/class/cxi_user/cxi0/..."
+    capacity: "device-level total resource pool"
   }
 
   HSN Interface: {
     shape: sql_table
-    path: "/sys/class/.../hsn2"
-    type: "network device"
-    metadata: "discovered via sysfs walk"
+    path: "/sys/class/net/hsn0..3"
+    discovery: "matched to CXI via PCIe root"
   }
 
   CXI Service: {
     shape: sql_table
-    vni: "assigned VNI"
-    netns_inode: "pod network namespace"
-    service_id: "unique per binding"
-    status: "active / deleted"
+    binding: "netns inode + VNI + ResourceSet"
+    libcxi: "alloc via libcxi ioctl (-tags cxi)"
+    mock: "service_mock.go → /tmp/cxi-services/*.yaml"
   }
 
-  CXI Device -> HSN Interface: "paired via sysfs topology"
+  CXI Device -> HSN Interface: "paired via PCIe topology"
 }
 
 Container: {
@@ -147,35 +181,37 @@ Container: {
 
   Pod Container: {
     shape: sql_table
-    devices: "/dev/cxi0 (via CDI)"
-    mounts: "sysfs subtree (via CDI)"
-    libfabric: "discovers HSN via sysfs paths"
-    vni_access: "restricted by CXI service"
+    devices: "/dev/cxiN via CDI DeviceNodes"
+    no_privileged: "CDI lets non-root pods access device"
+    libfabric: "discovers HSN via sysfs"
+    vni_scope: "restricted by CXI service to namespace VNI"
   }
 }
 
-# User flow
-User -> Workload.Owning Resource: "creates workload"
-User -> Workload.VNI Claim: "creates VNI claim"
+# ── Flows ────────────────────────────────────────────────────────────────────
 
-# Admission
-Workload.VNI Claim -> DRA Admission Webhook.Webhook: "validated at creation"
-Workload.Device Claim Template -> DRA Admission Webhook.Webhook: "validated at creation"
-DRA Admission Webhook.Webhook -> Workload.Pods.POD: "validates pod has CXI if VNI"
+# User submits workload
+User -> Workload.Owning Resource: "kubectl apply Deployment"
+
+# Admission rewrites claim
+Workload.Pods.POD -> MutatingAdmissionPolicy.Policy: "ResourceClaim created"
 
 # Scheduling
-Workload.Pods.POD -> Kubernetes Scheduler.Structured Parameters: "pending pod"
-DRA Node Driver.ResourceSlice CXI -> Kubernetes Scheduler.Structured Parameters: "available devices"
-DRA Node Driver.ResourceSlice VNI -> Kubernetes Scheduler.Structured Parameters: "available VNIs"
-Workload.Device Claim Template -> Kubernetes Scheduler.Structured Parameters: "device requirements"
-Workload.VNI Claim -> Kubernetes Scheduler.Structured Parameters: "VNI requirement"
+Workload.Pods.POD -> Kubernetes Scheduler.Structured Parameters: "pending pod with claim"
+DRA Node Driver.ResourceSlice CXI -> Kubernetes Scheduler.Structured Parameters: "available CXI capacity"
+
+# Binding gate
+Kubernetes Scheduler.Structured Parameters -> DRA Node Driver.ClaimBinder: "claim allocated to this node"
+DRA Node Driver.ClaimBinder -> Kubernetes Scheduler.Structured Parameters: "Ready=True (bind) / Unschedulable (retry)"
+
+# Namespace VNI
+DRA Node Driver.Namespace VNI Allocator -> Node Resources.Namespace: "patch annotation"
 
 # Node preparation
-Kubernetes Scheduler.Structured Parameters -> DRA Node Driver.NodePrepareResources: "pod scheduled to node"
-DRA Node Driver.NodePrepareResources -> Node Hardware.CXI Service: "programs CXI service"
-DRA Node Driver.NodePrepareResources -> Container.Pod Container: "returns CDI spec"
+Kubernetes Scheduler.Structured Parameters -> DRA Node Driver.PrepareResourceClaims: "pod scheduled to node"
+Node Resources.Namespace -> DRA Node Driver.PrepareResourceClaims: "read VNI from annotation"
 
-# Hardware relationships
-DRA Node Driver.Kubelet Plugin -> Node Hardware.CXI Device: "discovers at startup"
-Node Hardware.CXI Device -> Container.Pod Container: "mounted via CDI"
-Node Hardware.HSN Interface -> Container.Pod Container: "sysfs mounted via CDI"
+# Container lifecycle (NRI)
+DRA Node Driver.NRI Plugin -> Node Resources.CXI Service: "CreateService on RunPodSandbox"
+Node Resources.CXI Device -> Container.Pod Container: "device node via CDI"
+Node Resources.CXI Service -> Container.Pod Container: "restricts access to (netns, VNI)"
