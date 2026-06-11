@@ -60,8 +60,8 @@ type Driver struct {
 	overhead        cxi.ResourceSet // admin-configured per-device reserved overhead
 	refreshInterval time.Duration   // how often to republish ResourceSlice with fresh avail attrs
 	cdiEnvConfig    cdi.CDIEnvConfig
-	enableCDIEnv    bool // if false, env/nccl/ofi CDI specs are not written and not injected into pods
-	notify          chan struct{}    // signals an immediate ResourceSlice republish
+	enableCDIEnv    bool          // if false, env/nccl/ofi CDI specs are not written and not injected into pods
+	notify          chan struct{} // signals an immediate ResourceSlice republish
 
 	pendingMu sync.Mutex
 	pending   map[types.UID]pendingEntry // claimUID → in-flight grant not yet backed by a service
@@ -490,6 +490,15 @@ func (d *Driver) Run(ctx context.Context) error {
 	// Periodically republish with refreshed available-capacity attributes.
 	// Also responds to immediate republish signals from the ClaimBinder (after
 	// granting Ready=True) and from the NRI plugin (after service create/delete).
+	//
+	// The ticker also drives reconcileOccupancyFromHardware, which closes
+	// the gap between in-memory occupancy state and actual hardware
+	// services for drift cases the event path cannot cover (driver
+	// restart, missed watch events, force-deleted pods that bypassed
+	// NRI). The reconciler runs before publish so any state change it
+	// makes is reflected in the same ResourceSlice update — and if it
+	// triggers an extra republish via the notify channel, the next loop
+	// iteration absorbs it harmlessly.
 	if d.refreshInterval <= 0 {
 		return fmt.Errorf("--resource-refresh-interval must be > 0 (got %s)", d.refreshInterval)
 	}
@@ -500,6 +509,7 @@ func (d *Driver) Run(ctx context.Context) error {
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
+			d.reconcileOccupancyFromHardware(ctx)
 			if err := publish(); err != nil {
 				d.logf("warning: refreshing resource slice: %v", err)
 			}
