@@ -222,12 +222,13 @@ These selectors steer subsequent scheduling rounds toward devices with available
 The driver handles this via **Unschedulable compaction**:
 
 1. The scheduler allocates a batch of claims, possibly concentrating multiple claims on one device.
-2. The `ClaimBinder` evaluates each allocation against real hardware capacity. It grants `Ready=True` to claims that fit within current capacity minus in-flight pending grants.
-3. Claims that exceed the device's hardware capacity (device truly full) receive `Unschedulable=True`.
-4. The scheduler sees `Unschedulable=True` in the claim's `BindingFailureConditions`, deallocates the single CXI claim, and retries.
-5. At retry time, the `ResourceSlice` has been republished with `avail_*` near zero for the full device, steering the retry allocation to a less-loaded device.
+2. The `ClaimBinder` evaluates each allocation against real hardware capacity **and** against per-namespace device occupancy. It grants `Ready=True` to claims that fit within current capacity minus in-flight pending grants and whose `(namespace, device)` pair is not already held by another claim.
+3. Claims that exceed the device's hardware capacity receive `Unschedulable=True` with reason `DeviceAtCapacity`.
+4. Claims whose `(namespace, device)` pair is already held by another claim in the same namespace receive `Unschedulable=True` with reason `NamespaceDeviceOccupied`. SHS14 enforces VNI uniqueness per device at the kernel level (`cxil_svc_set_vni_range` returns `-EEXIST` for overlapping ranges on the same device), and every claim in a namespace shares the namespace's VNI — so two claims from the same namespace cannot co-locate on the same device.
+5. The scheduler sees `Unschedulable=True` in the claim's `BindingFailureConditions`, deallocates the single CXI claim, and retries.
+6. At retry time, the `ResourceSlice` has been republished with `avail_*` near zero for any device that became full, steering the retry allocation to a less-loaded device. For the namespace-occupancy case the `ResourceSlice` has no per-namespace state to update; the scheduler picks any device it would have picked anyway, and we re-check on the next allocation.
 
-The system converges to the correct distribution (≤3 `cxi-quarter` pods per device) within one or two compaction cycles.
+The system converges to the correct distribution (≤3 `cxi-quarter` pods per device, ≤1 claim per namespace per device on any one node) within one or two compaction cycles. The per-namespace occupancy index is decremented only by the NRI plugin's `StopPodSandbox` hook after `DestroyService` runs — see "Known Limitations" for the rare leak path.
 
 ## Accounting for Pre-existing System Services
 
@@ -385,6 +386,7 @@ kubectl logs cxi-test-3
 - **Service reconciliation on restart** — services surviving a driver restart are not re-tracked; orphaned services persist until node reboot
 - **Hot-plug** — no fsnotify watcher on `/sys/class/cxi_user`; driver restart required if devices appear/disappear
 - **VNI exhaustion handling** — if the configured `[--vni-range-start, --vni-range-end]` is exhausted, the namespace VNI allocator logs the error per reconcile attempt but does not emit an Event on the affected namespace; operators must read the DaemonSet logs to find out why new namespaces aren't getting a VNI
+- **Per-namespace occupancy leak on force-delete-before-start** — the per-`(namespace, device)` occupancy counter is incremented when `ClaimBinder` grants `Ready=True` and decremented only when the NRI plugin's `StopPodSandbox` hook fires after `DestroyService`. If a pod is force-deleted before `RunPodSandbox` runs (e.g. `kubectl delete pod --force --grace-period=0` on a not-yet-started pod, or a hard node reboot during pod admission), `StopPodSandbox` never fires and the increment leaks. The slot stays "occupied" against new claims in the same namespace on that device until the driver process restarts (which clears the in-memory map). This is rare in practice; mitigation is a driver pod restart on the affected node.
 
 ## Troubleshooting
 

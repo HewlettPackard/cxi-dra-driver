@@ -107,18 +107,23 @@ pod_lifecycle: {
   apiserver -> binder: "watch event: claim allocated to worker-1/cxi0"
   binder -> binder: "resolve requested ResourceSet from claim config"
   binder -> binder: "hwAvail = ReadAvailableCapacity(cxi0)"
-  binder -> binder: "checkAndAddPending: requested ≤ hwAvail − pending?"
+  binder -> binder: "checkAndAddPending(claimUID, ns, cxi0, requested, hwAvail)\n  → (granted, occupied) 3-way:\n    - occupancy[(ns,cxi0)] > 0?  → occupied=true (SHS14 -EEXIST guard)\n    - requested ≤ hwAvail − pending? → granted=true\n    - else → both false (hardware full)"
 
-  # — Happy path: capacity fits
-  binder -> binder: "YES → record in pending map"
+  # — Happy path: capacity fits AND ns not yet on this device
+  binder -> binder: "granted=true → record in pending map\n+ increment occupancy[(ns,cxi0)]"
   binder -> apiserver: "patch claim: BindingCondition Ready=True"
   binder -> binder: "TriggerRepublish (notify chan)"
   binder -> apiserver: "ResourceSlice republish (avail_* reduced)"
 
-  # — Alternate: hardware truly full
-  binder -> binder: "(if hwAvail itself can't fit) Unschedulable=True"
-  binder -> apiserver: "patch claim: Unschedulable=True"
+  # — Alternate A: hardware truly full
+  binder -> binder: "(hardware full) Unschedulable=True\nreason=DeviceAtCapacity"
+  binder -> apiserver: "patch claim: Unschedulable=True (DeviceAtCapacity)"
   binder -> scheduler: "scheduler deallocates + retries"
+
+  # — Alternate B: namespace already on this device (SHS14 guard)
+  binder -> binder: "(occupied) Unschedulable=True\nreason=NamespaceDeviceOccupied"
+  binder -> apiserver: "patch claim: Unschedulable=True (NamespaceDeviceOccupied)"
+  binder -> scheduler: "scheduler deallocates + retries on different device"
 
   # Pod binds, kubelet calls prepare
   scheduler -> apiserver: "bind pod to worker-1"
@@ -149,6 +154,7 @@ pod_lifecycle: {
   # Teardown
   containerd -> nri: "NRI hook: StopPodSandbox"
   nri -> cxi_svc: "DestroyService(cxi0, svcID=7)"
+  nri -> binder: "(via driver) RemoveOccupancy(ns, cxi0)\n  → unblocks future claims from same ns on cxi0"
   nri -> binder: "TriggerRetry (unblock Ready=False waiters)"
 
   kubelet -> prepare: "NodeUnprepareResources(claims)"

@@ -37,9 +37,10 @@ type Plugin struct {
 	stub             stub.Stub
 	store            *driver.AllocationStore
 	svcMgr           cxi.ServiceManager
-	republish        func()          // triggers immediate ResourceSlice update
-	onServiceCreated func(types.UID) // called with claimUID after service creation
-	onServiceDeleted func()          // called after service deletion
+	republish        func()                            // triggers immediate ResourceSlice update
+	onServiceCreated func(types.UID)                   // called with claimUID after service creation
+	onServiceDeleted func()                            // called after any service is deleted, triggers binder retry
+	onOccupancyFreed func(namespace, deviceName string) // called per-(ns,dev) after DestroyService to release per-namespace occupancy
 	mu               sync.Mutex
 	podStates        map[types.UID]*podState
 	deviceMu         sync.Map // map[string]*sync.Mutex — one mutex per device name
@@ -55,12 +56,20 @@ type Plugin struct {
 //
 // onServiceDeleted is called after any service is deleted so the ClaimBinder
 // can immediately re-evaluate claims waiting in Ready=False.
+//
+// onOccupancyFreed(namespace, deviceName) is called for each (ns, device)
+// pair after a successful DestroyService so the driver decrements its
+// per-namespace device-occupancy counter. The ClaimBinder uses this counter
+// to enforce SHS14's per-device VNI uniqueness constraint: two claims from
+// the same namespace cannot co-locate on the same device. See the
+// nsDeviceOccupancy field on Driver for details.
 func New(
 	store *driver.AllocationStore,
 	mock bool,
 	republish func(),
 	onServiceCreated func(types.UID),
 	onServiceDeleted func(),
+	onOccupancyFreed func(namespace, deviceName string),
 ) (*Plugin, error) {
 	var svcMgr cxi.ServiceManager
 	if mock {
@@ -74,6 +83,7 @@ func New(
 		republish:        republish,
 		onServiceCreated: onServiceCreated,
 		onServiceDeleted: onServiceDeleted,
+		onOccupancyFreed: onOccupancyFreed,
 		podStates:        make(map[types.UID]*podState),
 	}
 	var err error
@@ -263,6 +273,13 @@ func (p *Plugin) StopPodSandbox(_ context.Context, pod *api.PodSandbox) error {
 		if err := p.svcMgr.DeleteService(alloc.DeviceName, inode); err != nil {
 			fmt.Printf("cxi-nri: warning: deleting service for %s: %v\n", alloc.DeviceName, err)
 		}
+		// Release the per-namespace occupancy slot for this device. We do
+		// this even if DeleteService returned an error: an undeletable
+		// service may indicate the kernel state diverged from our records,
+		// but holding the occupancy slot forever would permanently bar the
+		// namespace from this device on this driver process. NRI is the
+		// sole decrement point — see Driver.RemoveOccupancy.
+		p.onOccupancyFreed(pod.GetNamespace(), alloc.DeviceName)
 	}
 
 	p.store.Delete(podUID)

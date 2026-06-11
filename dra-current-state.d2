@@ -100,12 +100,14 @@ DRA Node Driver: {
     shape: sql_table
     label: "■ ClaimBinder (BindingConditions)"
     impl: "internal/driver/claimbinder.go"
-    role: "live fit-check; gates pod binding"
+    role: "live fit-check + per-ns device occupancy; gates pod binding"
     watches: "ResourceClaims cluster-wide"
-    Ready_True: "request fits effective avail; pending recorded"
+    Ready_True: "fits effective avail AND (ns,dev) not occupied; pending + occupancy recorded"
     Ready_False: "fits hardware but pending blocks; periodic retry"
-    Unschedulable: "hardware truly full; scheduler retries elsewhere"
+    Unschedulable_DeviceAtCapacity: "hardware truly full on this device"
+    Unschedulable_NamespaceDeviceOccupied: "another claim in same ns already on this device (SHS14 -EEXIST guard)"
     pending_map: "in-flight grants (Ready=True, no service yet)"
+    occupancy_map: "(ns,dev) → live claim count (cleared by NRI on DestroyService)"
   }
 
   PrepareResourceClaims: {
@@ -142,7 +144,7 @@ DRA Node Driver: {
     impl: "internal/nri/plugin.go"
     RunPodSandbox: "per-device mutex; secondary fit-check; CreateService(dev, netnsInode, VNI, ResourceSet)"
     CreateContainer: "(future) inject FI_CXI_SVC_ID"
-    StopPodSandbox: "DestroyService; RemovePending; TriggerRetry"
+    StopPodSandbox: "DestroyService; RemovePending; RemoveOccupancy per (ns,dev); TriggerRetry"
   }
 
   Namespace VNI Allocator: {
@@ -159,11 +161,12 @@ DRA Node Driver: {
 
   Pending Map: {
     shape: sql_table
-    label: "■ pending map (in-driver)"
+    label: "■ pending map + occupancy index (in-driver)"
     impl: "internal/driver/driver.go"
-    role: "bridges Ready=True grant → service creation"
-    add: "checkAndAddPending under mutex"
-    remove: "RemovePending after NRI CreateService succeeds"
+    role: "bridges Ready=True grant → service creation; tracks per-ns device occupancy"
+    add: "checkAndAddPending under mutex (3-way: granted / occupied / hwFull)"
+    remove_pending: "RemovePending after NRI CreateService succeeds"
+    remove_occupancy: "RemoveOccupancy after NRI DestroyService (called per device, idempotent)"
     used_by: "effectiveAvail() to subtract from published avail_*"
   }
 
@@ -181,12 +184,13 @@ DRA Node Driver: {
 
   Kubelet Plugin -> ResourceSlice CXI: "publishes + refreshes"
   ClaimBinder -> Kubelet Plugin: "TriggerRepublish on grant"
-  ClaimBinder -> Pending Map: "checkAndAddPending"
+  ClaimBinder -> Pending Map: "checkAndAddPending (also increments occupancy)"
   Kubelet Plugin -> PrepareResourceClaims: "kubelet calls on pod scheduled"
   PrepareResourceClaims -> UnprepareResourceClaims: "kubelet calls on pod removal"
   PrepareResourceClaims -> AllocationStore: "write podUID → allocation"
   AllocationStore -> NRI Plugin: "NRI reads on RunPodSandbox"
   NRI Plugin -> Pending Map: "RemovePending after service create"
+  NRI Plugin -> Pending Map: "RemoveOccupancy per device after DestroyService"
   NRI Plugin -> ClaimBinder: "TriggerRetry on StopPodSandbox"
 }
 
@@ -293,7 +297,7 @@ DRA Node Driver.ResourceSlice CXI -> Kubernetes Scheduler.Structured Parameters:
 
 # Binding gate
 Kubernetes Scheduler.Structured Parameters -> DRA Node Driver.ClaimBinder: "claim allocated to this node"
-DRA Node Driver.ClaimBinder -> Kubernetes Scheduler.Structured Parameters: "Ready=True (bind) / Unschedulable (retry)"
+DRA Node Driver.ClaimBinder -> Kubernetes Scheduler.Structured Parameters: "Ready=True (bind) / Unschedulable: DeviceAtCapacity | NamespaceDeviceOccupied (retry)"
 
 # Namespace VNI
 DRA Node Driver.Namespace VNI Allocator -> Node Resources.Namespace: "patch annotation"

@@ -18,8 +18,11 @@ import (
 // (Ready=True set) but for which the NRI plugin has not yet created the
 // hardware service. The resources are held in the pending map so that
 // subsequent binder evaluations on the same device see the reduced capacity
-// and do not double-grant.
+// and do not double-grant. The namespace is recorded so that two claims from
+// the same namespace are prevented from being granted on the same device —
+// see nsDeviceOccupancy on Driver.
 type pendingEntry struct {
+	namespace  string
 	deviceName string
 	resources  cxi.ResourceSet
 }
@@ -60,25 +63,43 @@ type Driver struct {
 
 	pendingMu sync.Mutex
 	pending   map[types.UID]pendingEntry // claimUID → in-flight grant not yet backed by a service
+	// nsDeviceOccupancy counts how many active (pending or service-live) claims
+	// from a namespace currently occupy a particular device. Used by the
+	// ClaimBinder to enforce the SHS14 per-device VNI uniqueness constraint:
+	// every claim in a namespace shares the namespace's VNI, and the kernel
+	// rejects two services with the same VNI on the same device with -EEXIST
+	// from cxil_svc_set_vni_range. The map is keyed namespace → device → count.
+	//
+	// Lifecycle:
+	//   - incremented in checkAndAddPending when Ready=True is granted.
+	//   - decremented in RemoveOccupancy when the NRI plugin completes
+	//     DestroyService on StopPodSandbox.
+	//
+	// Decrement happens only after the service is destroyed (NOT on
+	// RemovePending) because the service holds the VNI on the device until
+	// then. Decrementing earlier risks another claim being granted on the
+	// same (namespace, device) pair, which would then collide at CreateService.
+	nsDeviceOccupancy map[string]map[string]int
 }
 
 func New(cfg Config) *Driver {
 	return &Driver{
-		nodeName:        cfg.NodeName,
-		podUID:          cfg.PodUID,
-		driverName:      cfg.DriverName,
-		cdiRoot:         cfg.CDIRoot,
-		pluginDir:       cfg.PluginDir,
-		registrarDir:    cfg.RegistrarDir,
-		kubeClient:      cfg.KubeClient,
-		mockDevices:     cfg.MockDevices,
-		store:           NewAllocationStore(),
-		overhead:        cfg.Overhead,
-		refreshInterval: cfg.RefreshInterval,
-		cdiEnvConfig:    cfg.CDIEnvConfig,
-		enableCDIEnv:    cfg.EnableCDIEnv,
-		notify:          make(chan struct{}, 1),
-		pending:         make(map[types.UID]pendingEntry),
+		nodeName:          cfg.NodeName,
+		podUID:            cfg.PodUID,
+		driverName:        cfg.DriverName,
+		cdiRoot:           cfg.CDIRoot,
+		pluginDir:         cfg.PluginDir,
+		registrarDir:      cfg.RegistrarDir,
+		kubeClient:        cfg.KubeClient,
+		mockDevices:       cfg.MockDevices,
+		store:             NewAllocationStore(),
+		overhead:          cfg.Overhead,
+		refreshInterval:   cfg.RefreshInterval,
+		cdiEnvConfig:      cfg.CDIEnvConfig,
+		enableCDIEnv:      cfg.EnableCDIEnv,
+		notify:            make(chan struct{}, 1),
+		pending:           make(map[types.UID]pendingEntry),
+		nsDeviceOccupancy: make(map[string]map[string]int),
 	}
 }
 
@@ -101,21 +122,94 @@ func (d *Driver) TriggerRepublish() {
 // the NRI plugin after a CXI service is successfully created — at that point
 // the hardware service accounts for the resources and the pending entry would
 // otherwise double-subtract from effective capacity.
+//
+// Does NOT touch nsDeviceOccupancy. The service is alive on the device until
+// DestroyService runs, so the namespace continues to occupy this device for
+// the purpose of SHS14 per-device VNI uniqueness. RemoveOccupancy is the
+// only safe decrement point — see its docs and the nsDeviceOccupancy field
+// comment.
 func (d *Driver) RemovePending(claimUID types.UID) {
 	d.pendingMu.Lock()
 	defer d.pendingMu.Unlock()
 	delete(d.pending, claimUID)
 }
 
-// checkAndAddPending atomically checks whether requested fits within effective
-// available capacity for deviceName and, if so, records the grant in the
-// pending map. hwAvail must be the raw value from ReadAvailableCapacity —
-// do NOT subtract overhead before calling, as ReadAvailableCapacity already
-// reflects all running service consumption including system services.
-// Returns true if the grant was recorded, false if capacity was insufficient.
-func (d *Driver) checkAndAddPending(claimUID types.UID, deviceName string, requested, hwAvail cxi.ResourceSet) bool {
+// RemoveOccupancy decrements the (namespace, deviceName) occupancy count.
+// Called by the NRI plugin in StopPodSandbox after a successful DestroyService:
+// at that point the kernel no longer holds the VNI on the device and another
+// claim in the same namespace can be placed here without triggering -EEXIST
+// from cxil_svc_set_vni_range.
+//
+// Multiple calls do not underflow: when the count reaches zero, the entry is
+// dropped from the index. Calls for an unknown (namespace, deviceName) pair
+// are no-ops, which makes the path idempotent if NRI fires StopPodSandbox
+// twice for the same sandbox (e.g. retry on transient runtime error).
+//
+// Limitation: if a pod is force-deleted before RunPodSandbox runs (so NRI
+// never fires StopPodSandbox), the occupancy increment from Ready=True
+// leaks until the driver process restarts. This is rare in practice; the
+// only known triggers are `kubectl delete pod --force --grace-period=0` on
+// a not-yet-started pod or a hard node reboot during pod admission.
+func (d *Driver) RemoveOccupancy(namespace, deviceName string) {
 	d.pendingMu.Lock()
 	defer d.pendingMu.Unlock()
+	devs := d.nsDeviceOccupancy[namespace]
+	if devs == nil {
+		return
+	}
+	if devs[deviceName] <= 1 {
+		delete(devs, deviceName)
+		if len(devs) == 0 {
+			delete(d.nsDeviceOccupancy, namespace)
+		}
+		return
+	}
+	devs[deviceName]--
+}
+
+// checkAndAddPending atomically validates a grant request against two
+// constraints:
+//
+//  1. (namespace, deviceName) must not already be occupied by another claim
+//     from the same namespace. This enforces the SHS14 per-device VNI
+//     uniqueness constraint (see the nsDeviceOccupancy field docs).
+//  2. requested must fit within (hwAvail − sum of pending grants on this
+//     device).
+//
+// hwAvail must be the raw value from ReadAvailableCapacity — do NOT subtract
+// overhead before calling, as ReadAvailableCapacity already reflects all
+// running service consumption including system services.
+//
+// On a successful grant, the entry is recorded in the pending map and the
+// occupancy count for (namespace, deviceName) is incremented.
+//
+// Return values:
+//
+//	(true, false)  — granted; occupancy and pending updated.
+//	(false, true)  — refused because the namespace already occupies this
+//	                 device via another claim. The ClaimBinder turns this
+//	                 into Unschedulable=True so the scheduler retries on a
+//	                 different device.
+//	(false, false) — refused because effective capacity is insufficient.
+//	                 The ClaimBinder distinguishes "raw hardware fits but
+//	                 pending grants are blocking" (Ready=False, retry) from
+//	                 "raw hardware itself cannot fit" (Unschedulable) by
+//	                 a second check against hwAvail alone.
+func (d *Driver) checkAndAddPending(
+	claimUID types.UID,
+	namespace, deviceName string,
+	requested, hwAvail cxi.ResourceSet,
+) (granted, occupied bool) {
+	d.pendingMu.Lock()
+	defer d.pendingMu.Unlock()
+
+	// SHS14 enforces VNI uniqueness per device kernel-side. Every claim in
+	// the same namespace shares the namespace VNI, so two claims from the
+	// same namespace cannot co-locate on the same device.
+	if d.nsDeviceOccupancy[namespace][deviceName] > 0 {
+		return false, true
+	}
+
 	var pendingSum cxi.ResourceSet
 	for _, e := range d.pending {
 		if e.deviceName == deviceName {
@@ -124,10 +218,19 @@ func (d *Driver) checkAndAddPending(claimUID types.UID, deviceName string, reque
 	}
 	effective := hwAvail.Sub(pendingSum).ClampToZero()
 	if !requested.Fits(effective) {
-		return false
+		return false, false
 	}
-	d.pending[claimUID] = pendingEntry{deviceName: deviceName, resources: requested}
-	return true
+
+	d.pending[claimUID] = pendingEntry{
+		namespace:  namespace,
+		deviceName: deviceName,
+		resources:  requested,
+	}
+	if d.nsDeviceOccupancy[namespace] == nil {
+		d.nsDeviceOccupancy[namespace] = make(map[string]int)
+	}
+	d.nsDeviceOccupancy[namespace][deviceName]++
+	return true, false
 }
 
 // hasPending reports whether there is an active in-flight pending grant for
