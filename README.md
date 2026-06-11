@@ -14,8 +14,13 @@ Scheduler ──allocates──► ResourceSlice (cxi0, cxi1, …)
                          ├── pairs CXI↔HSN via sysfs PCIe topology
                          ├── writes CDI specs → /var/run/cdi/
                          │     └── DeviceNodes: /dev/cxiN  (cgroup BPF allowance)
+                         ├── ClaimBinder
+                         │     └── gates pod binding via DRA BindingConditions
+                         │         (Ready=True only when capacity is confirmed)
+                         ├── Namespace VNI allocator (leader-elected)
+                         │     └── assigns one VNI per namespace via annotation
                          ├── NRI plugin (RunPodSandbox)
-                         │     └── creates CXI service: VNI + pod netns inode
+                         │     └── creates CXI service: namespace VNI + pod netns inode
                          ├── NRI plugin (CreateContainer)
                          │     └── injects FI_CXI_SVC_ID env vars
                          └── NRI plugin (StopPodSandbox)
@@ -104,7 +109,7 @@ kubectl label node <node-name> feature.node.kubernetes.io/cxi=true
 make deploy
 ```
 
-This applies RBAC, the `DeviceClass` (for CXI devices and VNIs), the `MutatingAdmissionPolicy`, and the `DaemonSet` in order.
+This applies RBAC, the `DeviceClass` for CXI devices, the `MutatingAdmissionPolicy`, and the `DaemonSet` in order.
 
 ### 4. Verify the ResourceSlice
 
@@ -123,22 +128,22 @@ kubectl get pod cxi-test-3
 kubectl exec -it cxi-test-3 -- fi_info -p cxi
 ```
 
-The test pod claims one CXI device (via the `cxi-quarter` template) and one VNI (via the `cxi-vni` template). You should see CXI providers enumerated without `privileged: true`.
+The test pod claims one CXI device via the `cxi-quarter` template. Its fabric VNI is the one assigned to the `default` namespace by the namespace VNI allocator (visible as the `cxi.slingshot.hpe.com/vni` annotation on the namespace). You should see CXI providers enumerated without `privileged: true`.
 
 ## Requesting CXI Resources
 
-Each pod that uses a CXI device needs **two** resource claims:
+Each pod that uses a CXI device needs a `ResourceClaimTemplate` that requests one CXI device. Pods do **not** request a VNI — VNIs are assigned per namespace by the leader-elected namespace VNI allocator and shared across every pod in the namespace, so each tenant gets exactly one cluster allocation that all of its pods communicate over.
 
-1. A `ResourceClaimTemplate` for the **CXI device** itself — requests fabric queues and LE/TLE pools from a physical CXI NIC.
-2. A `ResourceClaim` (or `ResourceClaimTemplate`) for a **VNI** — allocates one fabric Virtual Network Identifier from the cluster-wide VNI pool.
+Two templates are provided in [deploy/kubernetes/test/resourceclaim.yaml](deploy/kubernetes/test/resourceclaim.yaml):
 
-Both claims must be listed under `spec.resourceClaims` in the Pod and referenced in `resources.claims` for each container that needs them.
-
-### CXI device claim
+| Template | TXQs | TGQs | LE pools | TLE pools | Use case |
+|---|---|---|---|---|---|
+| `cxi-quarter` | 256 | 128 | 4 (4096 LEs) | 1 (512 TLEs) | Most jobs |
+| `cxi-half`    | 512 | 256 | 8 (8192 LEs) | 2 (1024 TLEs) | Bandwidth-intensive jobs |
 
 All resource fields are **required** — the driver has no defaults. Claims without an opaque config block will be rejected at prepare time with a clear error.
 
-Create a `ResourceClaimTemplate` with explicit resource values:
+### Claim template structure
 
 ```yaml
 apiVersion: resource.k8s.io/v1
@@ -150,6 +155,8 @@ spec:
   spec:
     devices:
       requests:
+        # CXI device request. The MutatingAdmissionPolicy injects avail_*
+        # capacity selectors into requests[0].
         - name: cxi
           exactly:
             deviceClassName: cxi-device
@@ -174,84 +181,62 @@ LEs and TLEs are expressed as **pool counts** due to hardware allocation granula
 
 Set `le_pools: 0` and `tle_pools: 0` if your job does not use triggered operations.
 
-See [deploy/kubernetes/test/resourceclaim.yaml](deploy/kubernetes/test/resourceclaim.yaml) for `cxi-quarter` and `cxi-half` example templates.
-
-### VNI claim
-
-A VNI is a cluster-wide fabric identifier that scopes communication between pods. Each pod must hold a VNI claim so the driver can program a unique CXI service bound to that pod's network namespace.
-
-For a single pod, use a `ResourceClaimTemplate` (Kubernetes creates one `ResourceClaim` per pod from the template):
-
-```yaml
-apiVersion: resource.k8s.io/v1
-kind: ResourceClaimTemplate
-metadata:
-  name: cxi-vni
-  namespace: default
-spec:
-  spec:
-    devices:
-      requests:
-        - name: vni
-          exactly:
-            deviceClassName: cxi-vni
-```
-
-For a multi-pod workload where all pods must communicate on the **same** fabric service, create a single `ResourceClaim` directly (not a template) and reference it by name from each pod:
-
-```yaml
-apiVersion: resource.k8s.io/v1
-kind: ResourceClaim
-metadata:
-  name: my-job-vni
-  namespace: default
-spec:
-  devices:
-    requests:
-      - name: vni
-        exactly:
-          deviceClassName: cxi-vni
-```
-
-Then reference it in each pod's spec:
-
-```yaml
-spec:
-  resourceClaims:
-    - name: vni
-      resourceClaimName: my-job-vni   # shared claim, not a template
-```
-
-### Wiring claims into a pod
+### Wiring the claim into a pod
 
 ```yaml
 spec:
   resourceClaims:
     - name: cxi
-      resourceClaimTemplateName: cxi-quarter   # one CXI NIC per pod
-    - name: vni
-      resourceClaimTemplateName: cxi-vni       # one VNI per pod (use resourceClaimName for shared)
+      resourceClaimTemplateName: cxi-quarter
   containers:
     - name: workload
       resources:
         claims:
           - name: cxi
-          - name: vni
 ```
 
 See [deploy/kubernetes/test/pod.yaml](deploy/kubernetes/test/pod.yaml) for a complete example.
 
+### Why pods carry exactly one ResourceClaim
+
+The driver uses Kubernetes `BindingConditions` to gate pod binding until device capacity is confirmed. When a CXI device is over-subscribed (the scheduler placed more claims on it than it can serve), the ClaimBinder sets `Unschedulable=True` on the device. The scheduler then deallocates the claim and retries on a less-loaded device.
+
+Because each pod carries a single CXI claim — VNI is namespace-scoped, not part of the claim — there is nothing else to leave in a partial-allocation state when the scheduler deallocates and retries. This structurally avoids the `"number of allocations N is smaller than number of claims"` Score error that would arise if VNI were a separate claim that survived the CXI deallocation.
+
+### Multi-pod workloads sharing a VNI
+
+Every pod in a namespace receives the same VNI, so any number of pods in the same namespace can form RDMA connections to each other on the Slingshot fabric without further coordination. This makes a namespace the unit of fabric tenancy: distinct namespaces are isolated; multiple jobs inside one namespace deliberately share the namespace's VNI.
+
 ### How scheduler placement works
 
-When a `ResourceClaim` with opaque CXI config is created, the `MutatingAdmissionPolicy` automatically injects CEL selectors into the claim. For example, a `cxi-quarter` request becomes:
+When a `ResourceClaim` with opaque CXI config is created, the `MutatingAdmissionPolicy` automatically injects two CEL selectors into the claim. For a `cxi-quarter` request from namespace `ellis` these are:
 
 ```
+# Selector 1: per-resource capacity check (one expression with all 8 fields)
 device.attributes["cxi.slingshot.hpe.com"]["avail_txqs"] >= 256 &&
 device.attributes["cxi.slingshot.hpe.com"]["avail_tles"] >= 512 &&
 ...
+
+# Selector 2: per-namespace exclusion (literal namespace interpolated at admission time)
+!device.attributes["cxi.slingshot.hpe.com"]["active_namespaces"].contains(",ellis,")
 ```
 
-This causes the scheduler to only place the claim on devices that currently have sufficient available resources, enabling bin-packing across devices. The driver also performs a live fit-check at `PrepareResourceClaims` time as a final authoritative gate.
+The scheduler ANDs both selectors. Selector 1 steers placement to devices with capacity for the request. Selector 2 prevents the scheduler from picking a device that already hosts another claim from the same namespace — necessary because SHS14 enforces VNI uniqueness per device at the kernel level (`cxil_svc_set_vni_range` returns `-EEXIST` for overlapping ranges) and every claim in a namespace shares the namespace's VNI.
+
+The `active_namespaces` attribute is a comma-padded sorted string (e.g. `,alpha,ellis,zeta,`) published per device on every `ResourceSlice` update. The leading and trailing commas let the CEL `.contains(",<NS>,")` perform exact, non-prefix matching — `,foo,` does not match `,foobar,`. An unoccupied device publishes the empty string.
+
+The driver re-publishes the `ResourceSlice` immediately on every occupancy 0↔1 transition (a claim grant flips 0→1; the NRI plugin's `DestroyService` callback flips 1→0). Other claims in the same namespace see the updated `active_namespaces` within milliseconds and are steered away from the now-occupied device — no waiting for the next 10-second periodic refresh.
+
+Because the K8s DRA scheduler evaluates claims against a static snapshot of the `ResourceSlice` within a single scheduling batch, it may still over-concentrate claims onto fewer devices than necessary in one batch (the custom `avail_*` attributes are not decremented between per-claim decisions in the same batch). The driver handles this via **Unschedulable compaction**, which is also the runtime safety net for the rare case where the admission-injected selector raced a stale `ResourceSlice`:
+
+1. The scheduler allocates a batch of claims, possibly concentrating multiple claims on one device.
+2. The `ClaimBinder` evaluates each allocation against real hardware capacity **and** against per-namespace device occupancy. It grants `Ready=True` to claims that fit within current capacity minus in-flight pending grants and whose `(namespace, device)` pair is not already held by another claim.
+3. Claims that exceed the device's hardware capacity receive `Unschedulable=True` with reason `DeviceAtCapacity`.
+4. Claims whose `(namespace, device)` pair is already held by another claim in the same namespace receive `Unschedulable=True` with reason `NamespaceDeviceOccupied`. This should be rare with the admission-injected CEL selector in place; it is kept as a defense against admission-policy bypass or stale `ResourceSlice` race conditions.
+5. The scheduler sees `Unschedulable=True` in the claim's `BindingFailureConditions`, deallocates the single CXI claim, and retries.
+6. At retry time, the `ResourceSlice` has been republished — `avail_*` near zero for any device that became full, `active_namespaces` updated for the same-namespace case — steering the retry allocation to an actually eligible device.
+
+The system converges to the correct distribution (≤3 `cxi-quarter` pods per device, ≤1 claim per namespace per device on any one node) within one or two compaction cycles in the worst case, and typically zero (CEL pre-filter catches it at scheduling time). The per-namespace occupancy index is decremented only by the NRI plugin's `StopPodSandbox` hook after `DestroyService` runs — see "Known Limitations" for the rare leak path.
 
 ## Accounting for Pre-existing System Services
 
@@ -290,13 +275,15 @@ The CXI service (VNI scoping + netns binding) is created in the NRI `RunPodSandb
 
 Each pod receives a CXI service scoped to its network namespace inode and a unique VNI. libfabric reads `FI_CXI_SVC_ID` (injected as an env var by the NRI plugin) and uses it instead of allocating its own service, ensuring the pod operates within its allocated fabric resources.
 
-### Cluster-wide VNI pool
+### Namespace-scoped VNI allocation
 
-VNIs are managed cluster-wide via a dedicated `ResourceSlice` published by the VNI pool leader. One of the DaemonSet pods wins a Kubernetes `Lease`-based leader election and publishes a pool of VNI devices (each with a `type: vni` attribute) using the `cxi-vni` `DeviceClass`. These devices are visible to the scheduler across all nodes (`allNodes: true`).
+VNIs are assigned per **namespace** by a leader-elected controller that runs inside the DaemonSet. One DaemonSet pod wins a `Lease`-based election (`cxi-vni-allocator-leader` in `kube-system`) and runs a namespace watcher that scans for the `cxi.slingshot.hpe.com/vni` annotation. Any namespace that lacks one is patched with the lowest free VNI in the configured cluster-wide range.
 
-When a pod's VNI `ResourceClaim` is allocated, the scheduler reserves one VNI device from this pool. The driver reads the allocated VNI number at prepare time and programs it into the CXI service. Released VNIs (when the claim is deleted) are automatically returned to the pool for reuse.
+When a pod is scheduled and the kubelet calls `PrepareResourceClaims`, the driver reads the VNI from the pod's namespace annotation and programs it into the CXI service it creates. Every pod in the same namespace therefore shares the same VNI and can form RDMA connections to every other pod in that namespace. Namespaces are isolated from each other on the fabric.
 
-The VNI range is configured via `--vni-range-start` / `--vni-range-end` in the DaemonSet. Each VNI in the range is represented as a separate device (`vni-100`, `vni-101`, …). The kernel returns `-EEXIST` from `cxil_svc_set_vni_range` if two services attempt to claim the same VNI — the cluster-wide allocation prevents this from happening under normal operation.
+The VNI range is configured via `--vni-range-start` / `--vni-range-end` in the DaemonSet (default `0` disables the allocator, in which case the driver assumes namespaces are annotated by some other authority). The skip list (`kube-system`, `kube-public`, `kube-node-lease`) is hardcoded — system namespaces never receive a VNI.
+
+Pre-existing annotations are respected: if a namespace already has a valid `cxi.slingshot.hpe.com/vni` annotation, the allocator leaves it untouched. This lets operators pre-assign VNIs to particular tenants.
 
 ## Project Layout
 
@@ -304,7 +291,8 @@ The VNI range is configured via `--vni-range-start` / `--vni-range-end` in the D
 cmd/cxi-dra-driver/      Binary entrypoint and CLI flags
 internal/cxi/            Sysfs device discovery, CXI↔HSN pairing, libcxi CGo wrapper
 internal/cdi/            CDI spec generation (DeviceNodes)
-internal/driver/         DRA kubelet plugin (ResourceSlice, Prepare/Unprepare, store)
+internal/driver/         DRA kubelet plugin (ResourceSlice, Prepare/Unprepare,
+                         ClaimBinder, namespace VNI allocator, store)
 internal/nri/            NRI plugin (RunPodSandbox, CreateContainer, StopPodSandbox)
 deploy/kubernetes/       DaemonSet, DeviceClass, RBAC, MutatingAdmissionPolicy, test manifests
 ```
@@ -321,8 +309,8 @@ deploy/kubernetes/       DaemonSet, DeviceClass, RBAC, MutatingAdmissionPolicy, 
 | `--registrar-dir` | `/var/lib/kubelet/plugins_registry` | Plugin registrar directory |
 | `--mock-devices` | `0` | Generate N synthetic devices (no hardware needed) |
 | `--resource-refresh-interval` | `30s` | How often to republish the ResourceSlice with refreshed available-capacity attributes |
-| `--vni-range-start` | `100` | First VNI in the cluster-wide pool |
-| `--vni-range-end` | `300` | Last VNI in the cluster-wide pool (inclusive) |
+| `--vni-range-start` | `0` | First VNI in the namespace-VNI allocator's pool (0 disables the allocator) |
+| `--vni-range-end` | `0` | Last VNI in the pool (inclusive) |
 | `--reserved-txqs` | `0` | TXQs reserved by pre-existing system services |
 | `--reserved-tgqs` | `0` | TGQs reserved by pre-existing system services |
 | `--reserved-eqs` | `0` | EQs reserved by pre-existing system services |
@@ -358,7 +346,7 @@ Each device in the `ResourceSlice` exposes the following attributes, accessible 
 | `avail_les` | int | Currently available LEs |
 | `avail_acs` | int | Currently available ACs |
 
-The `avail_*` attributes are informational and used by the `MutatingAdmissionPolicy` for bin-packing. The live fit-check at prepare time is the authoritative gate.
+The `avail_*` attributes are used by the `MutatingAdmissionPolicy` to steer initial placement and by the `ClaimBinder`'s Unschedulable compaction cycle to redirect retried claims away from full devices. The `ClaimBinder`'s live fit-check against hardware capacity (via `ReadAvailableCapacity`) is the authoritative gate for granting `Ready=True`.
 
 Example — claim a device on NUMA node 1 with a custom CEL selector:
 
@@ -388,14 +376,13 @@ kind load docker-image cxi-dra-driver:dev --name cxi-dra-dev
 # Deploy
 kubectl apply -f deploy/kubernetes/clusterrole.yaml
 kubectl apply -f deploy/kubernetes/deviceclass.yaml      # CXI device class
-kubectl apply -f deploy/kubernetes/deviceclass-vni.yaml  # VNI device class
 kubectl apply -f deploy/kubernetes/admission-policy.yaml
 kubectl apply -f deploy/kubernetes/daemonset.yaml        # add --mock-devices=2, remove nodeSelector
 
-# Verify both device types appear
+# Verify the CXI ResourceSlice
 kubectl get resourceslices -o wide
 
-# Run the test workload (claims one CXI device + one VNI)
+# Run the test workload (single CXI-only claim — VNI comes from the namespace)
 kubectl apply -f deploy/kubernetes/test/resourceclaim.yaml
 kubectl apply -f deploy/kubernetes/test/pod.yaml
 kubectl logs cxi-test-3
@@ -406,7 +393,8 @@ kubectl logs cxi-test-3
 - **HSN interface injection** — libfabric warns `CXI netdev not found` because HSN interfaces (`hsn0`, `hsn1`, …) live in the host network namespace. Fix requires pre-creating the mountpoint directory on each node so the CDI spec can bind-mount over it
 - **Service reconciliation on restart** — services surviving a driver restart are not re-tracked; orphaned services persist until node reboot
 - **Hot-plug** — no fsnotify watcher on `/sys/class/cxi_user`; driver restart required if devices appear/disappear
-- **VNI pool persistence** — VNI allocation is backed by `ResourceSlice` objects, so assignments survive individual driver pod restarts. However, if the entire DaemonSet is deleted and recreated, in-flight claims that were allocated but not yet released may reference VNIs that no longer appear in the re-published pool until the claims are deleted
+- **VNI exhaustion handling** — if the configured `[--vni-range-start, --vni-range-end]` is exhausted, the namespace VNI allocator logs the error per reconcile attempt but does not emit an Event on the affected namespace; operators must read the DaemonSet logs to find out why new namespaces aren't getting a VNI
+- **Per-namespace occupancy leak on force-delete-before-start** — the per-`(namespace, device)` occupancy counter is incremented when `ClaimBinder` grants `Ready=True` and decremented only when the NRI plugin's `StopPodSandbox` hook fires after `DestroyService`. If a pod is force-deleted before `RunPodSandbox` runs (e.g. `kubectl delete pod --force --grace-period=0` on a not-yet-started pod, or a hard node reboot during pod admission), `StopPodSandbox` never fires and the increment leaks. The slot stays "occupied" against new claims in the same namespace on that device until the driver process restarts (which clears the in-memory map). This is rare in practice; mitigation is a driver pod restart on the affected node.
 
 ## Troubleshooting
 

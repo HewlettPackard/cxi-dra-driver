@@ -9,13 +9,30 @@ rules:
   - apiGroups: ["resource.k8s.io"]
     resources: ["resourceclaims"]
     verbs: ["get", "list", "watch"]
+  - apiGroups: ["resource.k8s.io"]
+    # Authorises the UpdateStatus HTTP call itself.
+    resources: ["resourceclaims/status"]
+    verbs: ["update", "patch"]
+  - apiGroups: ["resource.k8s.io"]
+    # "resourceclaims/driver" is a logical RBAC resource (no HTTP endpoint).
+    # The DRA admission plugin does two SubjectAccessReviews when status.devices
+    # is modified via UpdateStatus:
+    #   1. verb=associated-node:update  (granted to kubelets by the NodeAuthorizer)
+    #   2. verb=arbitrary-node:update   (granted to controllers/service-accounts here)
+    # Standard "update"/"patch" verbs on this subresource do NOT satisfy either
+    # check — the literal colon-verb strings must be granted explicitly.
+    resources: ["resourceclaims/driver"]
+    verbs: ["update", "patch", "associated-node:update", "arbitrary-node:update"]
   - apiGroups: [""]
     resources: ["nodes"]
     verbs: ["get"]
-  # Reading the DaemonSet at startup to obtain its UID for ResourceSlice ownership.
-  - apiGroups: ["apps"]
-    resources: ["daemonsets"]
-    verbs: ["get"]
+  # The namespace VNI allocator (leader-elected) watches every namespace, scans
+  # for the cxi.slingshot.hpe.com/vni annotation, and patches an assignment onto
+  # any namespace that lacks one. The kubelet plugin (prepare.go) Gets each pod's
+  # namespace to resolve its VNI before recording it on the pod allocation.
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "list", "watch", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -36,13 +53,14 @@ metadata:
   name: cxi-dra-driver
   namespace: kube-system
 ---
-# VNI pool leader election is namespaced and scoped to the single lease the
-# driver uses, so the ServiceAccount cannot read or overwrite control-plane
-# leases (e.g. kube-scheduler / kube-controller-manager) in other namespaces.
+# Leader-election scaffolding for the namespace VNI allocator. Only one driver
+# pod at a time assigns VNIs to namespaces; the rest wait. Scoped to a single
+# Lease in kube-system so the ServiceAccount cannot read or overwrite
+# control-plane leases (e.g. kube-scheduler / kube-controller-manager).
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
-  name: cxi-vni-pool-leader
+  name: cxi-vni-allocator-leader
   namespace: kube-system
 rules:
   # "create" cannot be restricted by resourceName — the object does not exist yet.
@@ -51,18 +69,18 @@ rules:
     verbs: ["create"]
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
-    resourceNames: ["cxi-vni-pool-leader"]
+    resourceNames: ["cxi-vni-allocator-leader"]
     verbs: ["get", "update"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: cxi-vni-pool-leader
+  name: cxi-vni-allocator-leader
   namespace: kube-system
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
-  name: cxi-vni-pool-leader
+  name: cxi-vni-allocator-leader
 subjects:
   - kind: ServiceAccount
     name: cxi-dra-driver

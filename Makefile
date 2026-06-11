@@ -10,6 +10,9 @@ CMD_PATH = ./cmd/cxi-dra-driver
 .PHONY: build image push deploy clean kind-load kind-reload
 
 build:
+	CGO_ENABLED=1 GOOS=linux go build -tags cxi -o bin/$(BINARY) $(CMD_PATH)
+
+build-mock:
 	CGO_ENABLED=0 GOOS=linux go build -o bin/$(BINARY) $(CMD_PATH)
 
 image:

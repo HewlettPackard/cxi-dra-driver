@@ -7,93 +7,156 @@ node_boot: {
 
   os
   main
-  driver
   cxi_pkg
+  driver
   nri
+  binder
+  vni_allocator
   kubelet
   apiserver
 
-  os -> main: "DaemonSet pod scheduled\n(NODE_NAME, POD_UID injected as env)"
+  os -> main: "DaemonSet pod scheduled\n(NODE_NAME, POD_UID, POD_NAMESPACE injected as env)"
 
-  main -> cxi_pkg: "DiscoverDevices() [mock or sysfs]"
+  main -> cxi_pkg: "Discover() [mock or sysfs]"
   cxi_pkg -> cxi_pkg: "walk /sys/class/cxi_user/*\nread NUMANode, PCIeRoot per device"
-  cxi_pkg -> cxi_pkg: "DiscoverHSN(): walk sysfs,\nmatch HSN iface by PCIe root"
+  cxi_pkg -> cxi_pkg: "DiscoverHSN(): match HSN iface by PCIe root"
+  cxi_pkg -> cxi_pkg: "ReadAvailableCapacity (-tags cxi: libcxi ioctls)"
   cxi_pkg -> main: "[]Device{cxi0(hsn2), cxi1(hsn0), ...}"
 
-  main -> driver: "NewDriver(devices, vniAllocator, ...)"
-  main -> nri: "NewPlugin(store, svcMgr)"
+  main -> driver: "driver.New(Config{devices, kubeClient, overhead, ...})"
+  main -> driver: "driver.Run(ctx) → discovers + writes CDI"
+  driver -> driver: "cdi.WriteSpec per device\n(/var/run/cdi/cxi-cxiN.json)"
+
+  main -> nri: "nri.NewPlugin(store, svcMgr, driver)"
   main -> nri: "go plugin.Run(ctx)"
-  nri -> kubelet: "NRI socket handshake\n(/var/run/nri/nri.sock)"
-  kubelet -> nri: "RegisterPlugin ACK\n(subscribes RunPodSandbox,\nCreateContainer, StopPodSandbox)"
+  nri -> kubelet: "NRI socket handshake (/var/run/nri/nri.sock)"
+  kubelet -> nri: "RegisterPlugin ACK\n(subscribes RunPodSandbox, StopPodSandbox)"
 
-  main -> driver: "driver.Run(ctx)"
-  driver -> driver: "WriteCDISpec per device\n(/var/run/cdi/cxi-*.json)"
-  driver -> kubelet: "RegisterPlugin\n(kubelet-plugin socket)"
+  driver -> kubelet: "kubeletplugin.Start (DRA gRPC)\n(plugin socket + registrar)"
   kubelet -> driver: "ACK"
+  driver -> apiserver: "PublishResources (ResourceSlice CXI)\ncxi0..3 with capacity + initial avail_*"
 
-  driver -> apiserver: "Publish ResourceSlice (CXI)\ncxi0 [numa.node=1, pcie.root=81:00.0, hsn=hsn2]\ncxi1 [numa.node=0, pcie.root=01:00.0, hsn=hsn0]"
+  main -> binder: "NewClaimBinder(driver, kubeClient)"
+  main -> binder: "go binder.Run(ctx) → watch ResourceClaims"
 
-  main -> main: "Leader election for VNI pool\n(k8s Lease API)"
-  main -> apiserver: "Publish ResourceSlice (VNI)\nvni-100 .. vni-300 [type=vni]"
-  apiserver -> main: "ResourceSlice created/updated"
+  main -> vni_allocator: "StartNamespaceVNIAllocator(KubeClient, Namespace, Identity, VNIStart, VNIEnd)"
+  vni_allocator -> apiserver: "leader-election Lease (cxi-vni-allocator-leader)"
+  apiserver -> vni_allocator: "lease acquired / waiting"
+  vni_allocator -> apiserver: "(leader) informer watches Namespaces\nqueue.Add for each, patch with VNI"
 
-  driver -> driver: "Block on ctx\n(serving kubelet plugin gRPC)"
+  driver -> driver: "loop: 10s ticker + d.notify\n→ PublishResources (refresh avail_*)"
 }
 
-# ── SEQUENCE 2: User Job Submission ───────────────────────────────────────────
+# ── SEQUENCE 2: Namespace Creation → VNI Assignment ──────────────────────────
 
-job_submission: {
+namespace_vni: {
   shape: sequence_diagram
-  title: "User Job Submission — Pod Scheduling through Container Start"
+  title: "Namespace Creation — VNI Allocator Assigns Annotation"
 
   user
   apiserver
+  informer
+  leader_allocator
+  follower_allocator
+
+  user -> apiserver: "kubectl create namespace alice"
+  apiserver -> informer: "Namespace ADDED event"
+  informer -> leader_allocator: "queue.Add(\"alice\")"
+
+  leader_allocator -> leader_allocator: "reconcile(\"alice\")\n- skip if in skip-list? NO\n- get namespace\n- annotation already set? NO"
+  leader_allocator -> apiserver: "List namespaces → assignedVNIs"
+  apiserver -> leader_allocator: "{1: true, 2: true, 5: true, ...}"
+  leader_allocator -> leader_allocator: "nextFreeVNI([1..N]) → 3"
+  leader_allocator -> apiserver: "MergePatch namespace/alice\n  metadata.annotations[cxi.slingshot.hpe.com/vni] = \"3\""
+  apiserver -> leader_allocator: "Patch OK"
+  leader_allocator -> leader_allocator: "queue.Forget(\"alice\")"
+
+  apiserver -> follower_allocator: "(no-op: not the leader)"
+}
+
+# ── SEQUENCE 3: Pod Scheduling through Container Start ───────────────────────
+
+pod_lifecycle: {
+  shape: sequence_diagram
+  title: "Pod Lifecycle — Scheduling, Binding, Service Creation, Container Start"
+
+  user
+  apiserver
+  admission
   scheduler
+  binder
+  prepare
+  store
   kubelet
-  driver
-  nri
   containerd
+  nri
   cxi_svc
 
-  user -> apiserver: "kubectl apply:\n  Deployment\n  ResourceClaim (cxi-vni class)\n  ResourceClaimTemplate (cxi-device class)"
+  user -> apiserver: "kubectl apply -f pod.yaml\n(refs ResourceClaimTemplate cxi-quarter)"
 
-  apiserver -> scheduler: "Pod pending\n(resourceClaims: [device-tmpl, vni-claim])"
+  apiserver -> admission: "ResourceClaim CREATE intercepted"
+  admission -> admission: "CEL: inject opaque CXI config\n(all 8 fields present? injected if not)"
+  admission -> apiserver: "patched ResourceClaim persisted"
 
-  scheduler -> apiserver: "GET ResourceSlices\n(driver=cxi.slingshot.hpe.com)"
-  apiserver -> scheduler: "ResourceSlice CXI: cxi0, cxi1\nResourceSlice VNI: vni-100..300"
+  apiserver -> scheduler: "Pod pending\n(resourceClaims: [cxi-template])"
+  scheduler -> apiserver: "GET ResourceSlices(driver=cxi.slingshot.hpe.com)"
+  apiserver -> scheduler: "ResourceSlice CXI: cxi0..3 per node\n(avail_txqs, avail_les, ...)"
+  scheduler -> scheduler: "score nodes/devices\n→ pick node=worker-1, device=cxi0"
+  scheduler -> apiserver: "patch claim.status.allocation\n+ allocation.bindingConditions=[Ready]"
 
-  scheduler -> scheduler: "Evaluate DeviceClass selectors\nCheck DeviceClaim topology constraints\nPick: node=worker-1, cxi0, vni-142"
+  apiserver -> binder: "watch event: claim allocated to worker-1/cxi0"
+  binder -> binder: "resolve requested ResourceSet from claim config"
+  binder -> binder: "hwAvail = ReadAvailableCapacity(cxi0)"
+  binder -> binder: "checkAndAddPending(claimUID, ns, cxi0, requested, hwAvail)\n  → (granted, occupied) 3-way:\n    - occupancy[(ns,cxi0)] > 0?  → occupied=true (SHS14 -EEXIST guard)\n    - requested ≤ hwAvail − pending? → granted=true\n    - else → both false (hardware full)"
 
-  scheduler -> apiserver: "Patch ResourceClaim status:\n  allocatedDevice=cxi0\n  allocatedVNI=vni-142\n  scheduledNode=worker-1"
+  # — Happy path: capacity fits AND ns not yet on this device
+  binder -> binder: "granted=true → record in pending map\n+ increment occupancy[(ns,cxi0)]"
+  binder -> apiserver: "patch claim: BindingCondition Ready=True"
+  binder -> binder: "TriggerRepublish (notify chan)"
+  binder -> apiserver: "ResourceSlice republish (avail_* reduced)"
 
-  kubelet -> apiserver: "Watch: claim allocated for this node"
-  kubelet -> driver: "NodePrepareResources(claims)"
+  # — Alternate A: hardware truly full
+  binder -> binder: "(hardware full) Unschedulable=True\nreason=DeviceAtCapacity"
+  binder -> apiserver: "patch claim: Unschedulable=True (DeviceAtCapacity)"
+  binder -> scheduler: "scheduler deallocates + retries"
 
-  driver -> driver: "Extract VNI=142 from\npool claim allocation"
-  driver -> driver: "Admit(cxi0, DefaultResourceSet)\n→ check headroom in ResourceTracker"
-  driver -> driver: "Reserve(podUID, cxi0, resources)"
-  driver -> driver: "AllocationStore.Set(podUID,\n  {Device:cxi0, HSN:hsn2, VNI:142})"
+  # — Alternate B: namespace already on this device (SHS14 guard)
+  binder -> binder: "(occupied) Unschedulable=True\nreason=NamespaceDeviceOccupied"
+  binder -> apiserver: "patch claim: Unschedulable=True (NamespaceDeviceOccupied)"
+  binder -> scheduler: "scheduler deallocates + retries on different device"
 
-  driver -> kubelet: "return CDI device ID:\n  cxi.slingshot.hpe.com/cxi0"
+  # Pod binds, kubelet calls prepare
+  scheduler -> apiserver: "bind pod to worker-1"
+  apiserver -> kubelet: "pod assigned"
+  kubelet -> prepare: "NodePrepareResources(claims)"
 
-  kubelet -> containerd: "RunPodSandbox\n(apply CDI spec for cxi0)"
-  containerd -> containerd: "bind-mount /dev/cxi0\nbind-mount /run/cxi/cxi0 (sysfs)\ncgroup BPF allowance"
+  prepare -> prepare: "for each device allocated to this driver:\n  resolve ResourceSet from opaque config\n  fast-fail if request > usableCeiling"
+  prepare -> apiserver: "Get namespace/<podNs>\nread annotation cxi.slingshot.hpe.com/vni"
+  apiserver -> prepare: "vni = 3"
+  prepare -> store: "Set(podUID, [{Device:cxi0, HSN:hsn2, VNI:3, Resources}])"
+  prepare -> kubelet: "return CDI device IDs:\n  cxi.slingshot.hpe.com/cxi0"
 
-  containerd -> nri: "NRI hook: RunPodSandbox\n(podUID, netns path)"
-  nri -> nri: "stat netns → inode=98765"
-  nri -> nri: "AllocationStore.Get(podUID)\n→ {cxi0, hsn2, VNI=142}"
-  nri -> cxi_svc: "CreateService(cxi0, netnsInode=98765, vni=142)"
-  cxi_svc -> cxi_svc: "open /dev/cxi0\nalloc service (libcxi ioctl)\nscoped to netns + VNI"
+  kubelet -> containerd: "RunPodSandbox (apply CDI for cxi0)"
+  containerd -> containerd: "bind /dev/cxi0 (CDI DeviceNodes)\nno privileged required"
+
+  containerd -> nri: "NRI hook: RunPodSandbox(podUID, netns)"
+  nri -> nri: "per-device mutex on cxi0\nstat netns → inode=98765"
+  nri -> store: "Get(podUID) → {cxi0, hsn2, VNI=3, ResourceSet}"
+  nri -> nri: "secondary fit-check (defensive)"
+  nri -> cxi_svc: "CreateService(cxi0, netnsInode=98765, vni=3, ResourceSet)"
+  cxi_svc -> cxi_svc: "open /dev/cxi0\nlibcxi ioctl: alloc service\nscoped to (netns inode, VNI)"
   cxi_svc -> nri: "serviceID=7"
   nri -> nri: "podStates[podUID] = {cxi0: svcID=7}"
+  nri -> binder: "(via driver) RemovePending(claimUID)"
 
-  containerd -> nri: "NRI hook: CreateContainer"
-  nri -> containerd: "inject env:\n  FI_CXI_SVC_ID=7"
+  containerd -> containerd: "start container process\n(libfabric sees /dev/cxi0, opens it,\n  uses service for fabric ops)"
 
-  containerd -> containerd: "start container process"
-
+  # Teardown
   containerd -> nri: "NRI hook: StopPodSandbox"
-  nri -> cxi_svc: "DeleteService(cxi0, netnsInode=98765)"
-  nri -> driver: "UnprepareResourceClaims(podUID)"
-  driver -> driver: "ResourceTracker.Release(podUID)\nAllocationStore.Delete(podUID)"
+  nri -> cxi_svc: "DestroyService(cxi0, svcID=7)"
+  nri -> binder: "(via driver) RemoveOccupancy(ns, cxi0)\n  → unblocks future claims from same ns on cxi0"
+  nri -> binder: "TriggerRetry (unblock Ready=False waiters)"
+
+  kubelet -> prepare: "NodeUnprepareResources(claims)"
+  prepare -> store: "Delete(podUID)"
 }

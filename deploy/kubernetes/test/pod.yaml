@@ -6,12 +6,12 @@ metadata:
 spec:
   restartPolicy: Never
 
-  # Each pod gets its own ephemeral claim from the template.
+  # Single CXI device claim — the fabric VNI is namespace-scoped (assigned
+  # by the namespace VNI allocator) and read at prepare time, not part of
+  # the claim.
   resourceClaims:
     - name: cxi
       resourceClaimTemplateName: cxi-quarter
-    - name: vni
-      resourceClaimTemplateName: cxi-vni
 
   containers:
     - name: workload
@@ -25,12 +25,11 @@ spec:
           ls -la /run/cxi/ || echo "none"
           cat /run/cxi/cxi0-service.yaml 2>/dev/null || echo "no service file for cxi0"
           echo "=== libfabric providers ==="
-          fi_info --provider cxi 2>&1 || echo "fi_info not found or no CXI provider"
+          /extras/bin/fi_info --provider cxi 2>&1 || echo "fi_info not found or no CXI provider"
           sleep 3600
       resources:
         claims:
           - name: cxi
-          - name: vni
       env:
         - name: LD_LIBRARY_PATH      
           value: "/usr/lib64/:/extras/lib/:/hostlibs:/xpmem/lib64"
@@ -60,3 +59,4 @@ spec:
       hostPath:
         path: /home/brics/jwatson.brics/k8s-on-compute/shs-libfabric/build-output
         type: Directory
+

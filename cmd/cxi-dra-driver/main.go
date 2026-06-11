@@ -33,11 +33,10 @@ func main() {
 		registrarDir  = flag.String("registrar-dir", kubeletplugin.KubeletRegistryDir, "Kubelet plugin registrar directory")
 		kubeconfig    = flag.String("kubeconfig", "", "Path to kubeconfig (omit for in-cluster config)")
 		mockDevices   = flag.Int("mock-devices", 0, "Generate N synthetic CXI devices instead of real discovery (for kind/local testing)")
-		daemonSetName = flag.String("daemonset-name", "cxi-dra-driver", "Name of this DaemonSet, used as owner of VNI ResourceSlices")
-		vniRangeStart = flag.Int("vni-range-start", 0, "First VNI in the cluster-wide pool (0 disables VNI pool publishing)")
+		vniRangeStart = flag.Int("vni-range-start", 0, "First VNI in the cluster-wide pool used by the namespace VNI allocator (0 disables the allocator)")
 		vniRangeEnd   = flag.Int("vni-range-end", 0, "Last VNI in the cluster-wide pool (inclusive)")
 
-		refreshInterval = flag.Duration("resource-refresh-interval", 30*time.Second,
+		refreshInterval = flag.Duration("resource-refresh-interval", 10*time.Second,
 			"How often to republish the ResourceSlice with refreshed available-capacity attributes")
 
 		// Admin overhead: resources to deduct from hardware totals when computing
@@ -53,6 +52,8 @@ func main() {
 		reservedTLEPools = flag.Int64("reserved-tle-pools", 0, "TLE pools reserved by pre-existing system services (1 pool = 512 TLEs)")
 
 		// CDI env spec configuration — all optional; empty disables the corresponding mount/spec.
+		// Set --enable-cdi-env to activate env/nccl/ofi CDI spec writing and pod injection.
+		enableCDIEnv     = flag.Bool("enable-cdi-env", false, "Write env/nccl/ofi CDI specs and inject their device IDs into pods")
 		libfabricLib     = flag.String("libfabric-lib", "", "Host path to libfabric.so.1 (versioned Spack path)")
 		ncclPrefix       = flag.String("nccl-prefix", "", "Spack NCCL install prefix; empty disables NCCL CDI spec")
 		awsOfiNCCLPrefix = flag.String("aws-ofi-nccl-prefix", "", "Spack aws-ofi-nccl install prefix; empty disables OFI CDI spec")
@@ -114,6 +115,7 @@ func main() {
 		MockDevices:     mockDevList,
 		Overhead:        overhead,
 		RefreshInterval: *refreshInterval,
+		EnableCDIEnv:    *enableCDIEnv,
 		CDIEnvConfig: cdi.CDIEnvConfig{
 			LibfabricLib:     *libfabricLib,
 			NCCLPrefix:       *ncclPrefix,
@@ -127,32 +129,30 @@ func main() {
 		},
 	})
 
-	// Start the cluster-wide VNI pool publisher if a VNI range is configured
-	// (either flag set). Exactly one pod (the leader) publishes the VNI
-	// ResourceSlices; the rest participate in leader election and take over if
-	// the leader dies. Misconfiguration fails fast rather than publishing a
-	// bad pool or creating the lease in the wrong namespace.
+	// Start the cluster-wide namespace→VNI allocator if a VNI range is
+	// configured. Exactly one pod (the leader) assigns VNIs to namespaces; the
+	// rest participate in leader election and take over if the leader dies.
 	if *vniRangeStart != 0 || *vniRangeEnd != 0 {
 		if err := driver.ValidateVNIRange(*vniRangeStart, *vniRangeEnd); err != nil {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			os.Exit(1)
 		}
 		if *podNamespace == "" {
-			fmt.Fprintln(os.Stderr, "error: --pod-namespace or $POD_NAMESPACE must be set when the VNI pool is enabled")
+			fmt.Fprintln(os.Stderr, "error: --pod-namespace or $POD_NAMESPACE must be set when the namespace VNI allocator is enabled")
 			os.Exit(1)
 		}
-		driver.StartVNIPool(ctx, driver.VNIPoolConfig{
-			DriverName:    *driverName,
-			KubeClient:    kubeClient,
-			Namespace:     *podNamespace,
-			Identity:      fmt.Sprintf("%s/%s", *nodeName, *podUID),
-			DaemonSetName: *daemonSetName,
-			VNIStart:      *vniRangeStart,
-			VNIEnd:        *vniRangeEnd,
+		driver.StartNamespaceVNIAllocator(ctx, driver.NamespaceVNIConfig{
+			KubeClient: kubeClient,
+			Namespace:  *podNamespace,
+			Identity:   fmt.Sprintf("%s/%s", *nodeName, *podUID),
+			VNIStart:   *vniRangeStart,
+			VNIEnd:     *vniRangeEnd,
 		})
 	}
 
-	nriPlugin, err := nri.New(d.Store(), mock)
+	binder := driver.NewClaimBinder(d, kubeClient, *driverName, *nodeName)
+
+	nriPlugin, err := nri.New(d.Store(), mock, d.TriggerRepublish, d.RemovePending, binder.TriggerRetry, d.RemoveOccupancy)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: failed to create NRI plugin: %v\n", err)
 		os.Exit(1)
@@ -163,6 +163,11 @@ func main() {
 		nriErrCh <- nriPlugin.Run(ctx)
 	}()
 
+	binderErrCh := make(chan error, 1)
+	go func() {
+		binderErrCh <- binder.Run(ctx)
+	}()
+
 	if err := d.Run(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "error: driver exited: %v\n", err)
 		os.Exit(1)
@@ -170,6 +175,11 @@ func main() {
 
 	if err := <-nriErrCh; err != nil {
 		fmt.Fprintf(os.Stderr, "error: NRI plugin exited: %v\n", err)
+		os.Exit(1)
+	}
+
+	if err := <-binderErrCh; err != nil {
+		fmt.Fprintf(os.Stderr, "error: claim binder exited: %v\n", err)
 		os.Exit(1)
 	}
 }

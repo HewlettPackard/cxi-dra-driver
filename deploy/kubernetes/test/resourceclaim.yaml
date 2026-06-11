@@ -1,23 +1,27 @@
 # CXI ResourceClaimTemplates with explicit resource allocation.
 #
+# Each pod gets one ResourceClaim that allocates a single CXI device. The
+# fabric VNI is NOT part of the claim: it is assigned per-namespace by the
+# leader-elected namespace VNI allocator and read at prepare time, so every
+# pod in a namespace shares the namespace's VNI for RDMA.
+#
+# This one-claim-per-pod model is what makes the Unschedulable compaction
+# path correct: when the ClaimBinder sets Unschedulable=True on an
+# over-subscribed device, the scheduler deallocates the single CXI claim
+# and retries on a less-loaded device — there is no second claim to leave
+# in a partially-allocated state, so the DRA Score plugin cannot hit the
+# "number of allocations N is smaller than number of claims" mismatch.
+#
 # All resource fields are required — the driver has no defaults. Claims
 # without opaque config will be rejected at prepare time with a clear error.
 #
 # LEs and TLEs are expressed as pool counts:
 #   le_pools:  1 pool = 1024 LEs
 #   tle_pools: 1 pool = 512  TLEs
-#
-# The driver performs a live fit-check at service creation time against the
-# actual hardware state, so placement is always accurate even if multiple
-# pods are scheduled concurrently.
-#
-# Note: each request in a claim should target a separate device. Multiple
-# requests landing on the same physical device will fail at service creation
-# time due to TOCTOU between the fit-check and the second service create.
 ---
-# Quarter-device: suitable for most jobs. Requests four LE pools (4096 LEs) and
-# one TLE pool (512 TLEs); set le_pools/tle_pools to 0 if your job does not use
-# triggered ops.
+# CXI quarter-device. Requests four LE pools (4096 LEs) and one TLE pool
+# (512 TLEs); set le_pools/tle_pools to 0 if your job does not use
+# triggered operations.
 apiVersion: resource.k8s.io/v1
 kind: ResourceClaimTemplate
 metadata:
@@ -44,7 +48,7 @@ spec:
               le_pools: 4
               tle_pools: 1
 ---
-# Half-device: for bandwidth-intensive jobs needing more queues or LE pools.
+# CXI half-device. For bandwidth-intensive jobs needing more queues or LE pools.
 apiVersion: resource.k8s.io/v1
 kind: ResourceClaimTemplate
 metadata:
@@ -70,20 +74,3 @@ spec:
               acs: 511
               le_pools: 8
               tle_pools: 2
----
-# VNI claim: allocates one fabric VNI from the cluster-wide pool managed by the
-# leader-elected VNI pool publisher. Use one persistent ResourceClaim per
-# workload (shared by all its pods) rather than this template when multiple pods
-# must communicate on the same fabric service.
-apiVersion: resource.k8s.io/v1
-kind: ResourceClaimTemplate
-metadata:
-  name: cxi-vni
-  namespace: default
-spec:
-  spec:
-    devices:
-      requests:
-        - name: vni
-          exactly:
-            deviceClassName: cxi-vni

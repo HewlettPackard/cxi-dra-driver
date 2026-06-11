@@ -24,12 +24,14 @@ type AllocationStore struct {
 	mu          sync.Mutex
 	byPodUID    map[types.UID][]PodAllocation
 	claimToPods map[types.UID][]types.UID // claim UID → pod UIDs that reserved it
+	podToClaim  map[types.UID]types.UID   // pod UID → CXI claim UID (reverse map)
 }
 
 func NewAllocationStore() *AllocationStore {
 	return &AllocationStore{
 		byPodUID:    make(map[types.UID][]PodAllocation),
 		claimToPods: make(map[types.UID][]types.UID),
+		podToClaim:  make(map[types.UID]types.UID),
 	}
 }
 
@@ -45,11 +47,13 @@ func (s *AllocationStore) Set(podUID types.UID, allocs []PodAllocation) {
 }
 
 // SetClaimPods records that claimUID was reserved by podUID. Multiple calls
-// accumulate pod UIDs for the same claim.
+// accumulate pod UIDs for the same claim. Also populates the reverse map so
+// the NRI plugin can look up the claim UID from a pod UID after service creation.
 func (s *AllocationStore) SetClaimPod(claimUID, podUID types.UID) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.claimToPods[claimUID] = append(s.claimToPods[claimUID], podUID)
+	s.podToClaim[podUID] = claimUID
 }
 
 // PodUIDsForClaim returns all pod UIDs that reserved the given claim.
@@ -71,6 +75,15 @@ func (s *AllocationStore) Delete(podUID types.UID) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.byPodUID, podUID)
+	delete(s.podToClaim, podUID)
+}
+
+// ClaimForPod returns the CXI claim UID for a pod, or "" if none is recorded.
+// Used by the NRI plugin to call RemovePending after a service is created.
+func (s *AllocationStore) ClaimForPod(podUID types.UID) types.UID {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.podToClaim[podUID]
 }
 
 // DeleteClaim removes the claim → pod mapping (called on teardown).
