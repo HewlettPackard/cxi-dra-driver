@@ -278,7 +278,11 @@ func (p *Plugin) StopPodSandbox(_ context.Context, pod *api.PodSandbox) error {
 		// service may indicate the kernel state diverged from our records,
 		// but holding the occupancy slot forever would permanently bar the
 		// namespace from this device on this driver process. NRI is the
-		// sole decrement point — see Driver.RemoveOccupancy.
+		// hot path; the ClaimBinder watch (on Allocation=nil or claim
+		// delete) and the driver's polling reconciler cover the
+		// scheduler-side and hardware-drift cases respectively — see
+		// Driver.RemoveOccupancy, RemoveOccupancyForClaim, and
+		// reconcileOccupancyFromHardware.
 		p.onOccupancyFreed(pod.GetNamespace(), alloc.DeviceName)
 	}
 

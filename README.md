@@ -16,7 +16,13 @@ Scheduler ──allocates──► ResourceSlice (cxi0, cxi1, …)
                          │     └── DeviceNodes: /dev/cxiN  (cgroup BPF allowance)
                          ├── ClaimBinder
                          │     └── gates pod binding via DRA BindingConditions
-                         │         (Ready=True only when capacity is confirmed)
+                         │         (Ready=True only when capacity is confirmed
+                         │          and (namespace, device) slot is free)
+                         ├── Polling reconciler
+                         │     └── reconciles in-memory occupancy with live
+                         │         CXI services every refresh tick — recovers
+                         │         from driver restart, missed events, and
+                         │         force-deleted pods
                          ├── Namespace VNI allocator (leader-elected)
                          │     └── assigns one VNI per namespace via annotation
                          ├── NRI plugin (RunPodSandbox)
@@ -236,7 +242,15 @@ Because the K8s DRA scheduler evaluates claims against a static snapshot of the 
 5. The scheduler sees `Unschedulable=True` in the claim's `BindingFailureConditions`, deallocates the single CXI claim, and retries.
 6. At retry time, the `ResourceSlice` has been republished — `avail_*` near zero for any device that became full, `active_namespaces` updated for the same-namespace case — steering the retry allocation to an actually eligible device.
 
-The system converges to the correct distribution (≤3 `cxi-quarter` pods per device, ≤1 claim per namespace per device on any one node) within one or two compaction cycles in the worst case, and typically zero (CEL pre-filter catches it at scheduling time). The per-namespace occupancy index is decremented only by the NRI plugin's `StopPodSandbox` hook after `DestroyService` runs — see "Known Limitations" for the rare leak path.
+The system converges to the correct distribution (≤3 `cxi-quarter` pods per device, ≤1 claim per namespace per device on any one node) within one or two compaction cycles in the worst case, and typically zero (CEL pre-filter catches it at scheduling time).
+
+The per-namespace occupancy index is released by three independent, idempotent paths that all converge on a single `removeOccupancyLocked` helper:
+
+1. **NRI `StopPodSandbox`** (normal pod termination) — calls `RemoveOccupancy(ns, dev)` after `cxil_destroy_svc` succeeds. This is the hot path.
+2. **`ClaimBinder` watch** — calls `RemoveOccupancyForClaim(uid)` when the scheduler clears `Status.Allocation` (PostFilter after a PreBind failure, Unschedulable signal, manual edit) or when a `ResourceClaim` is deleted. Resolves the UID through a reverse index so the binder doesn't need to know the device. This catches scheduler-side de-allocation that would never reach NRI.
+3. **Polling reconciler** — runs once per `--resource-refresh-interval` tick before the periodic ResourceSlice republish. Enumerates live CXI services on every device via `cxil_get_svc_list` + `cxil_svc_get_vni_range`, reverse-maps each VNI to its namespace via the annotation cache, and reconciles the in-memory occupancy against hardware truth. Releases any slot not backed by either a pending grant or a live service; adopts any live service not yet tracked with a synthetic `hw:<dev>/<ns>` UID. This recovers from driver restart, missed watch events, force-deleted pods that bypassed NRI, and containerd `StopPodSandbox` short-circuits.
+
+The reconciler is the hardware-aware authority and keeps the in-memory model converged on actual kernel state without race conditions: if a slot's hardware service still exists, the slot is kept; if it doesn't and no pending grant covers it, the slot is released. The other two paths give sub-second latency in the common cases; the reconciler bounds worst-case latency to one tick.
 
 ## Accounting for Pre-existing System Services
 
@@ -391,10 +405,9 @@ kubectl logs cxi-test-3
 ## Known Limitations / Planned Work
 
 - **HSN interface injection** — libfabric warns `CXI netdev not found` because HSN interfaces (`hsn0`, `hsn1`, …) live in the host network namespace. Fix requires pre-creating the mountpoint directory on each node so the CDI spec can bind-mount over it
-- **Service reconciliation on restart** — services surviving a driver restart are not re-tracked; orphaned services persist until node reboot
 - **Hot-plug** — no fsnotify watcher on `/sys/class/cxi_user`; driver restart required if devices appear/disappear
 - **VNI exhaustion handling** — if the configured `[--vni-range-start, --vni-range-end]` is exhausted, the namespace VNI allocator logs the error per reconcile attempt but does not emit an Event on the affected namespace; operators must read the DaemonSet logs to find out why new namespaces aren't getting a VNI
-- **Per-namespace occupancy leak on force-delete-before-start** — the per-`(namespace, device)` occupancy counter is incremented when `ClaimBinder` grants `Ready=True` and decremented only when the NRI plugin's `StopPodSandbox` hook fires after `DestroyService`. If a pod is force-deleted before `RunPodSandbox` runs (e.g. `kubectl delete pod --force --grace-period=0` on a not-yet-started pod, or a hard node reboot during pod admission), `StopPodSandbox` never fires and the increment leaks. The slot stays "occupied" against new claims in the same namespace on that device until the driver process restarts (which clears the in-memory map). This is rare in practice; mitigation is a driver pod restart on the affected node.
+- **Reconciler API-server load** — the polling reconciler calls `Namespaces().List()` once per `--resource-refresh-interval` tick to build the VNI → namespace map. This is cheap at expected scale (tens of namespaces, 10 s tick) but should be migrated to an informer-backed `NamespaceLister` if the cluster grows large
 
 ## Troubleshooting
 
