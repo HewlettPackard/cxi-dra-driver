@@ -81,7 +81,6 @@ fi
 echo "==> Applying RBAC and DeviceClasses"
 kubectl apply -f "${REPO_ROOT}/deploy/kubernetes/clusterrole.yaml"
 kubectl apply -f "${REPO_ROOT}/deploy/kubernetes/deviceclass.yaml"
-kubectl apply -f "${REPO_ROOT}/deploy/kubernetes/deviceclass-vni.yaml"
 
 echo "==> Patching DaemonSet for mock mode (${MOCK_DEVICES} devices, no nodeSelector)"
 sed \
@@ -115,7 +114,7 @@ echo ""
 echo "Run the CXI device test workload:"
 echo "  kubectl apply -f ${REPO_ROOT}/deploy/kubernetes/test/"
 echo ""
-echo "Run the VNI pool tests:"
+echo "Run the namespace-VNI allocator tests:"
 echo "  ${SCRIPT_DIR}/test-vni.sh"
 echo ""
 echo "Tear down:"

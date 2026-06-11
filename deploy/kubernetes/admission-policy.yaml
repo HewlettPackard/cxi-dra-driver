@@ -31,9 +31,10 @@ spec:
   matchConditions:
     # Only process claims with at least one device request.
     # The mutation patches requests[0] only; the CXI request must be at index 0
-    # (as in cxi-quarter-with-vni) for selector injection to target the right
-    # request. Multi-request claims (e.g. merged CXI+VNI templates) are
-    # supported as long as the CXI request is first.
+    # for selector injection to target the right request. With the namespace-
+    # scoped VNI model, claims now carry a single CXI-only request — this
+    # condition still tolerates >1 requests for forward compatibility, but the
+    # supported templates (cxi-quarter, cxi-half) are single-request.
     - name: has-requests
       expression: >
         object.spec.devices.requests.size() >= 1

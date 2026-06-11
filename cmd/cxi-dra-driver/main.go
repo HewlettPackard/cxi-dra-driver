@@ -33,8 +33,7 @@ func main() {
 		registrarDir  = flag.String("registrar-dir", kubeletplugin.KubeletRegistryDir, "Kubelet plugin registrar directory")
 		kubeconfig    = flag.String("kubeconfig", "", "Path to kubeconfig (omit for in-cluster config)")
 		mockDevices   = flag.Int("mock-devices", 0, "Generate N synthetic CXI devices instead of real discovery (for kind/local testing)")
-		daemonSetName = flag.String("daemonset-name", "cxi-dra-driver", "Name of this DaemonSet, used as owner of VNI ResourceSlices")
-		vniRangeStart = flag.Int("vni-range-start", 0, "First VNI in the cluster-wide pool (0 disables VNI pool publishing)")
+		vniRangeStart = flag.Int("vni-range-start", 0, "First VNI in the cluster-wide pool used by the namespace VNI allocator (0 disables the allocator)")
 		vniRangeEnd   = flag.Int("vni-range-end", 0, "Last VNI in the cluster-wide pool (inclusive)")
 
 		refreshInterval = flag.Duration("resource-refresh-interval", 10*time.Second,
@@ -66,7 +65,6 @@ func main() {
 		libiconvLib      = flag.String("libiconv-lib", "", "Host path to libiconv.so.2 (for aws-ofi-nccl)")
 	)
 	flag.Parse()
-	_ = daemonSetName // retained for later tasks that will re-use this flag
 
 	kubeClient, err := buildKubeClient(*kubeconfig)
 	if err != nil {
@@ -140,7 +138,7 @@ func main() {
 			os.Exit(1)
 		}
 		if *podNamespace == "" {
-			fmt.Fprintln(os.Stderr, "error: --pod-namespace or $POD_NAMESPACE must be set when the VNI pool is enabled")
+			fmt.Fprintln(os.Stderr, "error: --pod-namespace or $POD_NAMESPACE must be set when the namespace VNI allocator is enabled")
 			os.Exit(1)
 		}
 		driver.StartNamespaceVNIAllocator(ctx, driver.NamespaceVNIConfig{
