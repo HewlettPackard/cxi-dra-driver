@@ -162,11 +162,12 @@ The controller is single-writer (only the leader runs it), so a single workqueue
 
 - [ ] **Step 1: Write the failing test** (append to `vniallocator_test.go`)
 
+The file already has `import "testing"` from Task 1 — merge these imports into a single import block (don't add a second one):
+
 ```go
 import (
 	"context"
 	"testing"
-	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -217,7 +218,6 @@ func TestReconcileNamespaceAssignsVNI(t *testing.T) {
 	if got := b.Annotations[vniAnnotationKey]; got != "10" {
 		t.Fatalf("team-b VNI changed to %q, want 10", got)
 	}
-	_ = time.Second
 }
 ```
 
@@ -234,48 +234,32 @@ Expected: FAIL — `undefined: namespaceVNIController` / `defaultVNISkip`
 // reconciles so the assigned-set scan and the patch cannot race each other.
 type namespaceVNIController struct {
 	client kubernetes.Interface
-	lister listerNamespaces // informer-backed in production; nil-safe in tests via reconcile's client fallback
 	start  int
 	end    int
 	skip   map[string]bool
 }
 
-// listerNamespaces is the subset of corev1listers.NamespaceLister we use.
-type listerNamespaces interface {
-	List(selector labelsSelector) ([]*corev1.Namespace, error)
-}
-
 func defaultVNISkip() map[string]bool {
 	return map[string]bool{
-		"kube-system":    true,
-		"kube-public":    true,
+		"kube-system":     true,
+		"kube-public":     true,
 		"kube-node-lease": true,
 	}
 }
 
-// assignedVNIs returns the set of VNIs currently annotated across all namespaces.
-// It prefers the informer cache (lister) and falls back to a live LIST (tests).
+// assignedVNIs returns the set of VNIs currently annotated across all
+// namespaces. The controller is single-writer (leader only) and namespaces are
+// low-cardinality with rare events, so a live LIST per reconcile is fine and
+// keeps the assigned-set scan trivially consistent with the patch that follows.
 func (c *namespaceVNIController) assignedVNIs(ctx context.Context) (map[int]bool, error) {
-	assigned := make(map[int]bool)
-	var namespaces []*corev1.Namespace
-	if c.lister != nil {
-		nss, err := c.lister.List(everything())
-		if err != nil {
-			return nil, fmt.Errorf("listing namespaces from cache: %w", err)
-		}
-		namespaces = nss
-	} else {
-		list, err := c.client.CoreV1().Namespaces().List(ctx, metav1.ListOptions{})
-		if err != nil {
-			return nil, fmt.Errorf("listing namespaces: %w", err)
-		}
-		for i := range list.Items {
-			namespaces = append(namespaces, &list.Items[i])
-		}
+	list, err := c.client.CoreV1().Namespaces().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("listing namespaces: %w", err)
 	}
-	for _, ns := range namespaces {
-		if v, ok := ns.Annotations[vniAnnotationKey]; ok {
-			if n, err := strconv.Atoi(v); err == nil {
+	assigned := make(map[int]bool)
+	for i := range list.Items {
+		if v, ok := list.Items[i].Annotations[vniAnnotationKey]; ok {
+			if n, perr := strconv.Atoi(v); perr == nil {
 				assigned[n] = true
 			}
 		}
@@ -323,15 +307,22 @@ func (c *namespaceVNIController) reconcile(ctx context.Context, name string) err
 }
 ```
 
-Add these small adapters at the bottom of `vniallocator.go` so the test's `labelsSelector`/`everything()` compile without importing the full labels package into the interface signature:
+Imports needed by Task 2 code (add only these — Task 3 adds the informer/workqueue/leaderelection imports later; do not add them now or the build fails on unused imports):
 
 ```go
-import "k8s.io/apimachinery/pkg/labels"
+import (
+	"context"
+	"fmt"
+	"strconv"
 
-type labelsSelector = labels.Selector
-
-func everything() labels.Selector { return labels.Everything() }
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes"
+)
 ```
+
+(`reconcile` calls `ValidVNI` from `vni.go` — same package, no import.)
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -364,7 +355,6 @@ func runNamespaceVNIAllocator(ctx context.Context, cfg NamespaceVNIConfig) {
 
 	c := &namespaceVNIController{
 		client: cfg.KubeClient,
-		lister: nsListerAdapter{nsInformer.Lister()},
 		start:  cfg.VNIStart,
 		end:    cfg.VNIEnd,
 		skip:   defaultVNISkip(),
@@ -409,18 +399,9 @@ func runNamespaceVNIAllocator(ctx context.Context, cfg NamespaceVNIConfig) {
 		queue.Done(key)
 	}
 }
-
-// nsListerAdapter adapts the generated NamespaceLister to listerNamespaces.
-type nsListerAdapter struct {
-	inner interface {
-		List(selector labels.Selector) ([]*corev1.Namespace, error)
-	}
-}
-
-func (a nsListerAdapter) List(selector labels.Selector) ([]*corev1.Namespace, error) {
-	return a.inner.List(selector)
-}
 ```
+
+The informer is used only to deliver namespace Add/Update events into the queue; `assignedVNIs` reads namespaces via a live `client.List`, so no lister/adapter is needed. Imports this run loop adds to `vniallocator.go` (on top of Task 2's): `"os"`, `"time"`, `corev1 "k8s.io/api/core/v1"`, `"k8s.io/client-go/informers"`, `"k8s.io/client-go/tools/cache"`, `"k8s.io/client-go/util/workqueue"`. (`context`, `fmt` already present from Task 2.)
 
 - [ ] **Step 2: Replace the publisher wiring in `vnipool.go`**
 
