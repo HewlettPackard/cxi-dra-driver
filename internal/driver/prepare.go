@@ -5,9 +5,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
-	"strings"
+	"time"
 
 	resourceapi "k8s.io/api/resource/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/dynamic-resource-allocation/kubeletplugin"
 
@@ -30,84 +31,17 @@ import (
 //   - NRI RunPodSandbox (secondary): re-checks under a per-device mutex as a
 //     safety net for the narrow window between Ready=True and service creation.
 func (d *Driver) PrepareResourceClaims(
-	_ context.Context,
+	ctx context.Context,
 	claims []*resourceapi.ResourceClaim,
 ) (map[types.UID]kubeletplugin.PrepareResult, error) {
-	// First pass: extract VNIs from VNI pool claims so CXI claims can use them.
-	vniByPod := vniFromClaims(claims, d.driverName)
-
 	result := make(map[types.UID]kubeletplugin.PrepareResult, len(claims))
 	for _, claim := range claims {
-		if isVNIClaim(claim, d.driverName) {
-			// VNI devices are logical — no CDI device to inject into the container.
-			result[claim.UID] = kubeletplugin.PrepareResult{}
-			continue
-		}
-		result[claim.UID] = d.prepareClaim(claim, vniByPod)
+		result[claim.UID] = d.prepareClaim(ctx, claim)
 	}
 	return result, nil
 }
 
-// vniFromClaims scans all claims for VNI pool devices and returns a map of
-// pod UID → VNI for pods that have a VNI allocated from the cluster-wide pool.
-func vniFromClaims(claims []*resourceapi.ResourceClaim, driverName string) map[types.UID]int {
-	vniByPod := make(map[types.UID]int)
-	for _, claim := range claims {
-		if claim.Status.Allocation == nil {
-			continue
-		}
-		for _, alloc := range claim.Status.Allocation.Devices.Results {
-			if alloc.Driver != driverName || alloc.Pool != vniPoolName {
-				continue
-			}
-			vni, ok := vniFromDeviceName(alloc.Device)
-			if !ok {
-				continue
-			}
-			for _, ref := range claim.Status.ReservedFor {
-				if ref.Resource == "pods" {
-					vniByPod[types.UID(ref.UID)] = vni
-				}
-			}
-		}
-	}
-	return vniByPod
-}
-
-// isVNIClaim reports whether the claim contains only VNI pool devices (for this
-// driver). A claim that also carries a real CXI device is not VNI-only and must
-// go through prepareClaim so the CXI device is injected.
-func isVNIClaim(claim *resourceapi.ResourceClaim, driverName string) bool {
-	if claim.Status.Allocation == nil {
-		return false
-	}
-	sawVNI := false
-	for _, alloc := range claim.Status.Allocation.Devices.Results {
-		if alloc.Driver != driverName {
-			continue
-		}
-		if alloc.Pool != vniPoolName {
-			return false // a real CXI device → not a VNI-only claim
-		}
-		sawVNI = true
-	}
-	return sawVNI
-}
-
-// vniFromDeviceName parses the VNI integer from a device name of the form "vni-<n>".
-func vniFromDeviceName(name string) (int, bool) {
-	s, ok := strings.CutPrefix(name, "vni-")
-	if !ok {
-		return 0, false
-	}
-	n, err := strconv.Atoi(s)
-	if err != nil {
-		return 0, false
-	}
-	return n, true
-}
-
-func (d *Driver) prepareClaim(claim *resourceapi.ResourceClaim, vniByPod map[types.UID]int) kubeletplugin.PrepareResult {
+func (d *Driver) prepareClaim(ctx context.Context, claim *resourceapi.ResourceClaim) kubeletplugin.PrepareResult {
 	if claim.Status.Allocation == nil {
 		return kubeletplugin.PrepareResult{
 			Err: fmt.Errorf("ResourceClaim %s/%s has no allocation", claim.Namespace, claim.Name),
@@ -121,14 +55,7 @@ func (d *Driver) prepareClaim(claim *resourceapi.ResourceClaim, vniByPod map[typ
 		if alloc.Driver != d.driverName {
 			continue
 		}
-		if alloc.Pool == vniPoolName {
-			// VNI devices are logical — no CDI device and no hardware reservation.
-			// The VNI itself is extracted by vniFromClaims.
-			continue
-		}
 
-		// Resolve the requested resources from the claim's opaque config.
-		// Claims without config are rejected — all fields are required.
 		requested, err := d.resolveResources(claim, alloc)
 		if err != nil {
 			return kubeletplugin.PrepareResult{
@@ -137,8 +64,6 @@ func (d *Driver) prepareClaim(claim *resourceapi.ResourceClaim, vniByPod map[typ
 			}
 		}
 
-		// Usable ceiling = hardware total - admin overhead. If the request
-		// exceeds this it can never succeed on any device of this type.
 		ceiling := d.usableCeiling(alloc.Device)
 		if !requested.Fits(ceiling) {
 			return kubeletplugin.PrepareResult{
@@ -147,9 +72,7 @@ func (d *Driver) prepareClaim(claim *resourceapi.ResourceClaim, vniByPod map[typ
 			}
 		}
 
-		cdiIDs := []string{
-			cdi.DeviceID(d.driverName, alloc.Device),
-		}
+		cdiIDs := []string{cdi.DeviceID(d.driverName, alloc.Device)}
 		if d.enableCDIEnv {
 			cdiIDs = append(cdiIDs, cdi.EnvDeviceID(d.driverName))
 			if d.cdiEnvConfig.NCCLPrefix != "" {
@@ -172,39 +95,62 @@ func (d *Driver) prepareClaim(claim *resourceapi.ResourceClaim, vniByPod map[typ
 		podAllocs = append(podAllocs, pa)
 	}
 
-	var preparedPods []types.UID
-	rollback := func() {
-		for _, podUID := range preparedPods {
-			d.store.Delete(podUID)
-		}
-		d.store.DeleteClaim(claim.UID)
+	// The VNI is namespace-scoped: a namespace is one cluster allocation, so
+	// every pod in it shares the VNI and can form RDMA connections. The claim
+	// and the pods that reserved it share claim.Namespace.
+	vni, err := d.namespaceVNI(ctx, claim.Namespace)
+	if err != nil {
+		return kubeletplugin.PrepareResult{Err: err}
 	}
+	for i := range podAllocs {
+		podAllocs[i].VNI = vni
+	}
+
 	for _, ref := range claim.Status.ReservedFor {
 		if ref.Resource != "pods" {
 			continue
 		}
 		podUID := types.UID(ref.UID)
-
-		// VNI must come from the pod's allocated VNI ResourceClaim.
-		// Pods without a cxi-vni claim are rejected — all workloads must
-		// request a VNI from the cluster-wide pool.
-		vni, ok := vniByPod[podUID]
-		if !ok {
-			rollback()
-			return kubeletplugin.PrepareResult{
-				Err: fmt.Errorf("pod %s has no VNI allocated — add a cxi-vni ResourceClaim to the workload",
-					podUID),
-			}
-		}
-		for i := range podAllocs {
-			podAllocs[i].VNI = vni
-		}
 		d.store.Set(podUID, podAllocs)
 		d.store.SetClaimPod(claim.UID, podUID)
-		preparedPods = append(preparedPods, podUID)
 	}
 
 	return kubeletplugin.PrepareResult{Devices: kubeletDevices}
+}
+
+// namespaceVNI returns the VNI assigned to the namespace by the allocator,
+// read from the vniAnnotationKey annotation. It retries briefly to tolerate
+// the race where a pod is prepared before the allocator has annotated a
+// freshly created namespace.
+func (d *Driver) namespaceVNI(ctx context.Context, namespace string) (int, error) {
+	const (
+		attempts = 10
+		delay    = time.Second
+	)
+	var lastErr error
+	for i := 0; i < attempts; i++ {
+		ns, err := d.kubeClient.CoreV1().Namespaces().Get(ctx, namespace, metav1.GetOptions{})
+		if err != nil {
+			lastErr = fmt.Errorf("getting namespace %s: %w", namespace, err)
+		} else if v, ok := ns.Annotations[vniAnnotationKey]; ok {
+			vni, perr := strconv.Atoi(v)
+			if perr != nil {
+				return 0, fmt.Errorf("namespace %s has invalid VNI annotation %q: %w", namespace, v, perr)
+			}
+			if !ValidVNI(vni) {
+				return 0, fmt.Errorf("namespace %s VNI %d out of range [%d,%d]", namespace, vni, MinVNI, MaxVNI)
+			}
+			return vni, nil
+		} else {
+			lastErr = fmt.Errorf("namespace %s has no %s annotation yet", namespace, vniAnnotationKey)
+		}
+		select {
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		case <-time.After(delay):
+		}
+	}
+	return 0, fmt.Errorf("VNI not available for namespace %s after %d attempts: %w", namespace, attempts, lastErr)
 }
 
 // resolveResources returns the ResourceSet to use for a single device
