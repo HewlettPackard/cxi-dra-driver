@@ -66,6 +66,7 @@ func main() {
 		libiconvLib      = flag.String("libiconv-lib", "", "Host path to libiconv.so.2 (for aws-ofi-nccl)")
 	)
 	flag.Parse()
+	_ = daemonSetName // retained for later tasks that will re-use this flag
 
 	kubeClient, err := buildKubeClient(*kubeconfig)
 	if err != nil {
@@ -130,11 +131,9 @@ func main() {
 		},
 	})
 
-	// Start the cluster-wide VNI pool publisher if a VNI range is configured
-	// (either flag set). Exactly one pod (the leader) publishes the VNI
-	// ResourceSlices; the rest participate in leader election and take over if
-	// the leader dies. Misconfiguration fails fast rather than publishing a
-	// bad pool or creating the lease in the wrong namespace.
+	// Start the cluster-wide namespace→VNI allocator if a VNI range is
+	// configured. Exactly one pod (the leader) assigns VNIs to namespaces; the
+	// rest participate in leader election and take over if the leader dies.
 	if *vniRangeStart != 0 || *vniRangeEnd != 0 {
 		if err := driver.ValidateVNIRange(*vniRangeStart, *vniRangeEnd); err != nil {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
@@ -144,14 +143,12 @@ func main() {
 			fmt.Fprintln(os.Stderr, "error: --pod-namespace or $POD_NAMESPACE must be set when the VNI pool is enabled")
 			os.Exit(1)
 		}
-		driver.StartVNIPool(ctx, driver.VNIPoolConfig{
-			DriverName:    *driverName,
-			KubeClient:    kubeClient,
-			Namespace:     *podNamespace,
-			Identity:      fmt.Sprintf("%s/%s", *nodeName, *podUID),
-			DaemonSetName: *daemonSetName,
-			VNIStart:      *vniRangeStart,
-			VNIEnd:        *vniRangeEnd,
+		driver.StartNamespaceVNIAllocator(ctx, driver.NamespaceVNIConfig{
+			KubeClient: kubeClient,
+			Namespace:  *podNamespace,
+			Identity:   fmt.Sprintf("%s/%s", *nodeName, *podUID),
+			VNIStart:   *vniRangeStart,
+			VNIEnd:     *vniRangeEnd,
 		})
 	}
 

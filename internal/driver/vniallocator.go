@@ -3,12 +3,18 @@ package driver
 import (
 	"context"
 	"fmt"
+	"os"
 	"strconv"
+	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/util/workqueue"
 )
 
 const vniAnnotationKey = "cxi.slingshot.hpe.com/vni"
@@ -99,4 +105,66 @@ func (c *namespaceVNIController) reconcile(ctx context.Context, name string) err
 		return fmt.Errorf("patching namespace %s with VNI %d: %w", name, vni, err)
 	}
 	return nil
+}
+
+// runNamespaceVNIAllocator runs the controller until ctx is cancelled. It is
+// invoked from OnStartedLeading so only the leader assigns VNIs. The informer
+// only delivers namespace Add/Update events into the queue; assignedVNIs reads
+// namespaces via a live List, so no lister is needed.
+func runNamespaceVNIAllocator(ctx context.Context, cfg NamespaceVNIConfig) {
+	factory := informers.NewSharedInformerFactory(cfg.KubeClient, 10*time.Minute)
+	nsInformer := factory.Core().V1().Namespaces()
+
+	c := &namespaceVNIController{
+		client: cfg.KubeClient,
+		start:  cfg.VNIStart,
+		end:    cfg.VNIEnd,
+		skip:   defaultVNISkip(),
+	}
+
+	queue := workqueue.NewTypedRateLimitingQueue(
+		workqueue.DefaultTypedControllerRateLimiter[string]())
+	defer queue.ShutDown()
+
+	_, _ = nsInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			if ns, ok := obj.(*corev1.Namespace); ok {
+				queue.Add(ns.Name)
+			}
+		},
+		UpdateFunc: func(_, obj interface{}) {
+			if ns, ok := obj.(*corev1.Namespace); ok {
+				queue.Add(ns.Name)
+			}
+		},
+		// No DeleteFunc: a deleted namespace frees its VNI implicitly the next
+		// time assignedVNIs scans the (now smaller) namespace set.
+	})
+
+	factory.Start(ctx.Done())
+	if !cache.WaitForCacheSync(ctx.Done(), nsInformer.Informer().HasSynced) {
+		fmt.Fprintln(os.Stderr, "cxi-vni-allocator: namespace cache failed to sync")
+		return
+	}
+
+	// Shut the queue down when leadership is lost (ctx cancelled) so the worker
+	// loop's blocking Get() returns and this goroutine exits instead of leaking.
+	go func() {
+		<-ctx.Done()
+		queue.ShutDown()
+	}()
+
+	for {
+		key, shutdown := queue.Get()
+		if shutdown {
+			return
+		}
+		if err := c.reconcile(ctx, key); err != nil {
+			fmt.Fprintf(os.Stderr, "cxi-vni-allocator: %v\n", err)
+			queue.AddRateLimited(key)
+		} else {
+			queue.Forget(key)
+		}
+		queue.Done(key)
+	}
 }
