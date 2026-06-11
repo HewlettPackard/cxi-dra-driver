@@ -44,16 +44,13 @@ import (
 //     on a different device; the updated ResourceSlice (avail_* near zero for
 //     the full device) steers it to a device with real capacity.
 //
-// IMPORTANT: pods using this driver must use a merged ResourceClaimTemplate
-// that combines both the CXI device request and the VNI pool request in a
-// single ResourceClaim (e.g. cxi-quarter-with-vni). This is required for
-// Unschedulable to work correctly: when Unschedulable=True is set on the CXI
-// device, the scheduler deallocates the entire claim — including the VNI
-// allocation — atomically. If the CXI and VNI allocations were in separate
-// ResourceClaim objects, Unschedulable would deallocate only the CXI claim
-// while the VNI claim remained allocated, causing the DRA Score plugin to
-// report "number of allocations 1 is smaller than number of claims 2" on
-// every subsequent scheduling retry.
+// Pods carry exactly one ResourceClaim: the CXI device. The VNI is assigned
+// per namespace (see NamespaceVNIConfig) and read at prepare time, so it is
+// not part of any ResourceClaim. When Unschedulable=True is set on a full CXI
+// device the scheduler deallocates that single claim and retries on another
+// device — there is no second (VNI) claim to leave dangling, so the DRA Score
+// plugin cannot hit the "number of allocations N is smaller than number of
+// claims" mismatch that splitting CXI and VNI across two claims would cause.
 type ClaimBinder struct {
 	driver     *Driver
 	client     kubernetes.Interface
@@ -229,13 +226,9 @@ func (b *ClaimBinder) evaluateClaim(ctx context.Context, claim *resourceapi.Reso
 	} else {
 		// Case 3: hardware is truly at capacity — the request cannot fit even
 		// without counting any pending grants. Signal Unschedulable so the DRA
-		// scheduler deallocates this claim and retries on a different device.
-		//
-		// Pods using this driver must use a merged CXI+VNI ResourceClaimTemplate
-		// (e.g. cxi-quarter-with-vni). Unschedulable on a merged claim causes
-		// the scheduler to deallocate the whole claim — both the CXI and VNI
-		// allocations — atomically, so there is no partial-allocation state and
-		// no Score error on retry. See the ClaimBinder type comment for details.
+		// scheduler deallocates this (single, CXI-only) claim and retries on a
+		// different device. The VNI is namespace-scoped and not part of the
+		// claim, so there is no partial-allocation state on retry.
 		b.logf("Unschedulable: claim=%s/%s device=%s requested=(%s)",
 			claim.Namespace, claim.Name, result.Device, requested)
 		b.setCondition(ctx, claim, result, "Unschedulable", metav1.ConditionTrue,
@@ -295,7 +288,7 @@ func (b *ClaimBinder) findOurDevice(claim *resourceapi.ResourceClaim) (*resource
 		if alloc.Driver != b.driverName {
 			continue
 		}
-		if alloc.Pool == vniPoolName || alloc.Pool != b.nodeName {
+		if alloc.Pool != b.nodeName {
 			continue
 		}
 		requested, err := b.driver.resolveResources(claim, alloc)

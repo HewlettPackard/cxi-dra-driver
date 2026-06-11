@@ -72,10 +72,9 @@ func (d *Driver) buildDevices() []resourceapi.Device {
 		// BindingConditions: the scheduler will not bind a pod until the
 		// ClaimBinder sets Ready=True, confirming capacity is available.
 		// BindingFailureConditions: if the ClaimBinder sets Unschedulable=True
-		// (device hardware is truly full), the scheduler deallocates the claim
-		// and retries on a different device. Pods must use a merged CXI+VNI
-		// claim template so that both allocations are deallocated atomically —
-		// see ClaimBinder type comment for why separate claims cause Score errors.
+		// (device hardware is truly full), the scheduler deallocates this single
+		// CXI claim and retries on a different device. VNIs are namespace-scoped
+		// and not part of the claim, so there is nothing else to deallocate.
 		BindingConditions:        []string{"Ready"},
 		BindingFailureConditions: []string{"Unschedulable"},
 		AllowMultipleAllocations: ptr.To(true),

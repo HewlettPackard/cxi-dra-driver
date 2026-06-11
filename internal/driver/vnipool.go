@@ -12,13 +12,7 @@ import (
 	"k8s.io/client-go/tools/leaderelection/resourcelock"
 )
 
-const (
-	// vniPoolName is retained only until prepare.go and claimbinder.go stop
-	// referencing it (later tasks); the VNI ResourceSlice pool is no longer
-	// published.
-	vniPoolName           = "vni-pool"
-	vniAllocatorLeaseName = "cxi-vni-allocator-leader"
-)
+const vniAllocatorLeaseName = "cxi-vni-allocator-leader"
 
 // NamespaceVNIConfig configures the cluster-wide namespace→VNI allocator.
 type NamespaceVNIConfig struct {
