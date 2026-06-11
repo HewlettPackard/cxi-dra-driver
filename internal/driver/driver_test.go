@@ -18,7 +18,8 @@ import (
 func newDriverForTest() *Driver {
 	return &Driver{
 		pending:           make(map[types.UID]pendingEntry),
-		nsDeviceOccupancy: make(map[string]map[string]int),
+		nsDeviceOccupancy: make(map[string]map[string]types.UID),
+		claimToOccupancy:  make(map[types.UID]occupancyKey),
 	}
 }
 
@@ -67,11 +68,17 @@ func TestCheckAndAddPending_GrantsWhenFreeAndFits(t *testing.T) {
 	if !granted || occupied {
 		t.Fatalf("checkAndAddPending = (granted=%v, occupied=%v), want (true,false)", granted, occupied)
 	}
-	if got := d.nsDeviceOccupancy["ns1"]["cxi0"]; got != 1 {
-		t.Errorf("nsDeviceOccupancy[ns1][cxi0] = %d, want 1", got)
+	if got := d.nsDeviceOccupancy["ns1"]["cxi0"]; got != "c1" {
+		t.Errorf("nsDeviceOccupancy[ns1][cxi0] = %q, want %q", got, "c1")
 	}
 	if _, ok := d.pending["c1"]; !ok {
 		t.Errorf("pending[c1] not recorded after grant")
+	}
+	// claimToOccupancy must be kept in lockstep with nsDeviceOccupancy so
+	// RemoveOccupancyForClaim can find this entry when the binder later
+	// observes Allocation=nil or a claim deletion.
+	if got := d.claimToOccupancy["c1"]; got.namespace != "ns1" || got.deviceName != "cxi0" {
+		t.Errorf("claimToOccupancy[c1] = %+v, want {ns1, cxi0}", got)
 	}
 }
 
@@ -80,18 +87,23 @@ func TestCheckAndAddPending_GrantsWhenFreeAndFits(t *testing.T) {
 // signal Unschedulable=True and the scheduler retries on another device.
 func TestCheckAndAddPending_SameNamespaceSameDeviceRejects(t *testing.T) {
 	d := newDriverForTest()
-	if _, _ = d.checkAndAddPending("c1", "ns1", "cxi0", fits, hwAvailPlenty); d.nsDeviceOccupancy["ns1"]["cxi0"] != 1 {
-		t.Fatalf("setup: first grant did not increment occupancy")
+	if _, _ = d.checkAndAddPending("c1", "ns1", "cxi0", fits, hwAvailPlenty); d.nsDeviceOccupancy["ns1"]["cxi0"] != "c1" {
+		t.Fatalf("setup: first grant did not record c1 as the holder")
 	}
 	granted, occupied := d.checkAndAddPending("c2", "ns1", "cxi0", fits, hwAvailPlenty)
 	if granted || !occupied {
 		t.Fatalf("second claim in same ns+dev: got (granted=%v,occupied=%v), want (false,true)", granted, occupied)
 	}
-	if got := d.nsDeviceOccupancy["ns1"]["cxi0"]; got != 1 {
-		t.Errorf("occupancy must not be re-incremented on refusal; got %d, want 1", got)
+	// Slot must still be held by c1 — a refusal must not displace the
+	// existing holder, otherwise the next grant would silently overwrite.
+	if got := d.nsDeviceOccupancy["ns1"]["cxi0"]; got != "c1" {
+		t.Errorf("slot holder after refused second grant = %q, want %q", got, "c1")
 	}
 	if _, ok := d.pending["c2"]; ok {
 		t.Errorf("pending[c2] must not be recorded on occupancy refusal")
+	}
+	if _, ok := d.claimToOccupancy["c2"]; ok {
+		t.Errorf("claimToOccupancy[c2] must not be recorded on occupancy refusal")
 	}
 }
 
@@ -104,8 +116,8 @@ func TestCheckAndAddPending_DifferentNamespaceSameDeviceGrants(t *testing.T) {
 	if !granted || occupied {
 		t.Fatalf("different ns same device: got (granted=%v,occupied=%v), want (true,false)", granted, occupied)
 	}
-	if got := d.nsDeviceOccupancy["ns2"]["cxi0"]; got != 1 {
-		t.Errorf("ns2 occupancy = %d, want 1", got)
+	if got := d.nsDeviceOccupancy["ns2"]["cxi0"]; got != "c2" {
+		t.Errorf("nsDeviceOccupancy[ns2][cxi0] = %q, want %q", got, "c2")
 	}
 }
 
@@ -119,8 +131,8 @@ func TestCheckAndAddPending_SameNamespaceDifferentDeviceGrants(t *testing.T) {
 	if !granted || occupied {
 		t.Fatalf("same ns different device: got (granted=%v,occupied=%v), want (true,false)", granted, occupied)
 	}
-	if got := d.nsDeviceOccupancy["ns1"]["cxi1"]; got != 1 {
-		t.Errorf("ns1/cxi1 occupancy = %d, want 1", got)
+	if got := d.nsDeviceOccupancy["ns1"]["cxi1"]; got != "c2" {
+		t.Errorf("nsDeviceOccupancy[ns1][cxi1] = %q, want %q", got, "c2")
 	}
 }
 
@@ -137,8 +149,11 @@ func TestCheckAndAddPending_OverHardwareDoesNotIncrement(t *testing.T) {
 	if _, ok := d.pending["c1"]; ok {
 		t.Errorf("pending[c1] must not be recorded on capacity refusal")
 	}
-	if got := d.nsDeviceOccupancy["ns1"]["cxi0"]; got != 0 {
-		t.Errorf("occupancy must not be incremented on capacity refusal; got %d", got)
+	if _, ok := d.nsDeviceOccupancy["ns1"]["cxi0"]; ok {
+		t.Errorf("occupancy slot must not be set on capacity refusal")
+	}
+	if _, ok := d.claimToOccupancy["c1"]; ok {
+		t.Errorf("claimToOccupancy[c1] must not be set on capacity refusal")
 	}
 }
 
@@ -155,20 +170,28 @@ func TestCheckAndAddPending_OccupancyTakesPrecedenceOverCapacity(t *testing.T) {
 	}
 }
 
-// RemoveOccupancy decrements the count and drops the entry on zero. Calls for
-// unknown (ns, dev) are no-ops so NRI can retry without state corruption.
+// RemoveOccupancy releases the (ns, dev) slot and prunes empty namespace
+// buckets. Calls for unknown (ns, dev) are no-ops so NRI can retry without
+// state corruption.
 func TestRemoveOccupancy(t *testing.T) {
 	d := newDriverForTest()
 	d.checkAndAddPending("c1", "ns1", "cxi0", fits, hwAvailPlenty)
 	d.checkAndAddPending("c2", "ns1", "cxi1", fits, hwAvailPlenty)
 
-	// First decrement on cxi0 should drop the entry and leave cxi1.
+	// First release on cxi0 should drop the slot and leave cxi1.
 	d.RemoveOccupancy("ns1", "cxi0")
 	if _, ok := d.nsDeviceOccupancy["ns1"]["cxi0"]; ok {
 		t.Errorf("nsDeviceOccupancy[ns1][cxi0] still present after RemoveOccupancy")
 	}
-	if got := d.nsDeviceOccupancy["ns1"]["cxi1"]; got != 1 {
-		t.Errorf("ns1/cxi1 occupancy = %d, want 1 (RemoveOccupancy must not affect unrelated entries)", got)
+	if got := d.nsDeviceOccupancy["ns1"]["cxi1"]; got != "c2" {
+		t.Errorf("ns1/cxi1 slot = %q, want %q (RemoveOccupancy must not affect unrelated entries)", got, "c2")
+	}
+	// Reverse index must also drop c1 but keep c2.
+	if _, ok := d.claimToOccupancy["c1"]; ok {
+		t.Errorf("claimToOccupancy[c1] still present after RemoveOccupancy(ns1, cxi0)")
+	}
+	if got := d.claimToOccupancy["c2"]; got.namespace != "ns1" || got.deviceName != "cxi1" {
+		t.Errorf("claimToOccupancy[c2] = %+v, want {ns1, cxi1}", got)
 	}
 
 	// Idempotent: a second call for the same (ns, dev) is a no-op.
@@ -181,6 +204,9 @@ func TestRemoveOccupancy(t *testing.T) {
 	d.RemoveOccupancy("ns1", "cxi1")
 	if _, ok := d.nsDeviceOccupancy["ns1"]; ok {
 		t.Errorf("namespace bucket should be pruned when empty; ns1 still present")
+	}
+	if len(d.claimToOccupancy) != 0 {
+		t.Errorf("claimToOccupancy should be empty after all slots released; got %d entries", len(d.claimToOccupancy))
 	}
 
 	// Unknown ns/dev is harmless.
@@ -207,14 +233,17 @@ func TestCheckAndAddPending_GrantableAfterRemoveOccupancy(t *testing.T) {
 }
 
 // RemovePending must not touch nsDeviceOccupancy — the service is alive on
-// the device until DestroyService runs. Premature decrement would let another
+// the device until DestroyService runs. Premature release would let another
 // claim be granted on the same (ns, device) and then collide at CreateService.
 func TestRemovePending_DoesNotDecrementOccupancy(t *testing.T) {
 	d := newDriverForTest()
 	d.checkAndAddPending("c1", "ns1", "cxi0", fits, hwAvailPlenty)
 	d.RemovePending("c1")
-	if got := d.nsDeviceOccupancy["ns1"]["cxi0"]; got != 1 {
-		t.Errorf("occupancy after RemovePending = %d, want 1 (RemovePending must NOT touch occupancy)", got)
+	if got := d.nsDeviceOccupancy["ns1"]["cxi0"]; got != "c1" {
+		t.Errorf("slot after RemovePending = %q, want %q (RemovePending must NOT release the occupancy slot)", got, "c1")
+	}
+	if got := d.claimToOccupancy["c1"]; got.namespace != "ns1" || got.deviceName != "cxi0" {
+		t.Errorf("claimToOccupancy[c1] after RemovePending = %+v, want {ns1, cxi0}", got)
 	}
 }
 
@@ -349,29 +378,6 @@ func TestRemoveOccupancy_1To0TriggersRepublish(t *testing.T) {
 	}
 }
 
-// A N→N-1 (N>=2) RemoveOccupancy must NOT trigger a republish: the namespace
-// is still present in active_namespaces (count is positive), so the attribute
-// string is unchanged and publishing it would be no-op churn. This case
-// arises if NRI ever increments the count >1 (currently it cannot — checkAndAddPending
-// rejects same-ns same-dev so count is always at most 1 — but the property
-// is still required for the 1→0 trigger to be a meaningful signal rather
-// than a noisy "any decrement").
-func TestRemoveOccupancy_NToNMinusOneDoesNotTriggerRepublish(t *testing.T) {
-	d := newDriverForTestWithNotify()
-	// Bypass checkAndAddPending and set the count directly to model the
-	// hypothetical N>=2 case.
-	d.nsDeviceOccupancy["ns1"] = map[string]int{"cxi0": 3}
-	drainNotify(d)
-
-	d.RemoveOccupancy("ns1", "cxi0")
-	if got := d.nsDeviceOccupancy["ns1"]["cxi0"]; got != 2 {
-		t.Fatalf("setup: count after decrement = %d, want 2", got)
-	}
-	if notifyFired(d) {
-		t.Errorf("RemoveOccupancy 3→2 triggered a republish; only 1→0 transitions change the active_namespaces string")
-	}
-}
-
 // RemoveOccupancy on an unknown (ns, dev) must NOT trigger a republish: no
 // state changed, so there is nothing to republish.
 func TestRemoveOccupancy_UnknownDoesNotTriggerRepublish(t *testing.T) {
@@ -394,7 +400,8 @@ func TestBuildDevices_AlwaysPublishesActiveNamespaces(t *testing.T) {
 		nodeName:          "test-node",
 		devices:           cxi.MockDevices(3), // cxi0..cxi2
 		pending:           make(map[types.UID]pendingEntry),
-		nsDeviceOccupancy: make(map[string]map[string]int),
+		nsDeviceOccupancy: make(map[string]map[string]types.UID),
+		claimToOccupancy:  make(map[types.UID]occupancyKey),
 	}
 
 	devices := d.buildDevices()
@@ -425,14 +432,17 @@ func TestBuildDevices_PublishesPerDeviceOccupancy(t *testing.T) {
 		nodeName:          "test-node",
 		devices:           cxi.MockDevices(3), // cxi0..cxi2
 		pending:           make(map[types.UID]pendingEntry),
-		nsDeviceOccupancy: make(map[string]map[string]int),
+		nsDeviceOccupancy: make(map[string]map[string]types.UID),
+		claimToOccupancy:  make(map[types.UID]occupancyKey),
 	}
 	// cxi0: occupied by zeta and alpha (sorted output expected)
 	// cxi1: occupied by mu only
 	// cxi2: unoccupied
-	d.nsDeviceOccupancy["zeta"] = map[string]int{"cxi0": 1}
-	d.nsDeviceOccupancy["alpha"] = map[string]int{"cxi0": 1}
-	d.nsDeviceOccupancy["mu"] = map[string]int{"cxi1": 1}
+	// Bypasses checkAndAddPending so the test pins specific UID values;
+	// any non-empty UID would work, the value is opaque to buildDevices.
+	d.nsDeviceOccupancy["zeta"] = map[string]types.UID{"cxi0": "uid-zeta"}
+	d.nsDeviceOccupancy["alpha"] = map[string]types.UID{"cxi0": "uid-alpha"}
+	d.nsDeviceOccupancy["mu"] = map[string]types.UID{"cxi1": "uid-mu"}
 
 	devices := d.buildDevices()
 	want := map[string]string{
@@ -445,5 +455,157 @@ func TestBuildDevices_PublishesPerDeviceOccupancy(t *testing.T) {
 		if w, ok := want[dev.Name]; ok && got != w {
 			t.Errorf("device %s active_namespaces = %q, want %q", dev.Name, got, w)
 		}
+	}
+}
+
+// RemoveOccupancyForClaim releases the (ns, dev) slot identified by claim UID
+// and clears both the forward and reverse maps. This is the path used by the
+// ClaimBinder when the scheduler clears Status.Allocation — at that point
+// the binder doesn't know which device the claim was on, only its UID.
+func TestRemoveOccupancyForClaim(t *testing.T) {
+	d := newDriverForTest()
+	d.checkAndAddPending("c1", "ns1", "cxi0", fits, hwAvailPlenty)
+	d.checkAndAddPending("c2", "ns2", "cxi1", fits, hwAvailPlenty)
+
+	d.RemoveOccupancyForClaim("c1")
+
+	if _, ok := d.nsDeviceOccupancy["ns1"]["cxi0"]; ok {
+		t.Errorf("ns1/cxi0 slot still present after RemoveOccupancyForClaim(c1)")
+	}
+	if _, ok := d.nsDeviceOccupancy["ns1"]; ok {
+		t.Errorf("ns1 namespace bucket should be pruned when its last slot is freed")
+	}
+	if _, ok := d.claimToOccupancy["c1"]; ok {
+		t.Errorf("claimToOccupancy[c1] should be cleared after RemoveOccupancyForClaim")
+	}
+
+	// Unrelated entries (c2 on ns2/cxi1) must be untouched.
+	if got := d.nsDeviceOccupancy["ns2"]["cxi1"]; got != "c2" {
+		t.Errorf("ns2/cxi1 slot = %q after RemoveOccupancyForClaim(c1), want %q", got, "c2")
+	}
+	if got := d.claimToOccupancy["c2"]; got.namespace != "ns2" || got.deviceName != "cxi1" {
+		t.Errorf("claimToOccupancy[c2] = %+v after RemoveOccupancyForClaim(c1), want {ns2, cxi1}", got)
+	}
+}
+
+// RemoveOccupancyForClaim on an unknown claim UID is a no-op and must not
+// trigger a republish. Covers the case where the binder fires
+// RemoveOccupancyForClaim defensively for claims that never had a slot
+// (e.g. claims allocated on a different node).
+func TestRemoveOccupancyForClaim_Unknown(t *testing.T) {
+	d := newDriverForTestWithNotify()
+	d.checkAndAddPending("c1", "ns1", "cxi0", fits, hwAvailPlenty)
+	drainNotify(d)
+
+	d.RemoveOccupancyForClaim("does-not-exist")
+	if notifyFired(d) {
+		t.Errorf("RemoveOccupancyForClaim on unknown claim triggered a republish; should have been a no-op")
+	}
+	// Existing entry must survive.
+	if got := d.nsDeviceOccupancy["ns1"]["cxi0"]; got != "c1" {
+		t.Errorf("ns1/cxi0 slot = %q after no-op call, want %q", got, "c1")
+	}
+}
+
+// RemoveOccupancyForClaim must trigger a republish on real state change so
+// the freed slot becomes visible to other claims in the namespace immediately
+// — not at the next 10s periodic refresh.
+func TestRemoveOccupancyForClaim_TriggersRepublish(t *testing.T) {
+	d := newDriverForTestWithNotify()
+	d.checkAndAddPending("c1", "ns1", "cxi0", fits, hwAvailPlenty)
+	drainNotify(d)
+
+	d.RemoveOccupancyForClaim("c1")
+	if !notifyFired(d) {
+		t.Errorf("RemoveOccupancyForClaim did not TriggerRepublish; scheduler will not see the freed slot until the periodic refresh")
+	}
+}
+
+// After RemoveOccupancyForClaim frees the slot, another claim in the same
+// namespace must be grantable on that same device. This is the unblocking
+// path that prevents permanent stuck-Unschedulable loops when the scheduler
+// clears Allocation but NRI's StopPodSandbox cannot fire.
+func TestRemoveOccupancyForClaim_UnblocksSameNamespace(t *testing.T) {
+	d := newDriverForTest()
+	d.checkAndAddPending("c1", "ns1", "cxi0", fits, hwAvailPlenty)
+	d.RemoveOccupancyForClaim("c1")
+
+	granted, occupied := d.checkAndAddPending("c2", "ns1", "cxi0", fits, hwAvailPlenty)
+	if !granted || occupied {
+		t.Fatalf("after RemoveOccupancyForClaim: got (granted=%v,occupied=%v), want (true,false)", granted, occupied)
+	}
+}
+
+// Atomic reallocation: the scheduler can move a claim from cxi0 to cxi1
+// without the binder observing Status.Allocation=nil in between (one watch
+// event carries both writes). The defensive prior-release in
+// checkAndAddPending must release the old slot, otherwise the namespace
+// would be pinned to BOTH devices in active_namespaces and the CEL selector
+// would exclude both for any other claim in the namespace.
+func TestCheckAndAddPending_AtomicReallocationReleasesPriorSlot(t *testing.T) {
+	d := newDriverForTest()
+
+	// First grant: c1 on cxi0.
+	d.checkAndAddPending("c1", "ns1", "cxi0", fits, hwAvailPlenty)
+	if got := d.nsDeviceOccupancy["ns1"]["cxi0"]; got != "c1" {
+		t.Fatalf("setup: ns1/cxi0 = %q, want %q", got, "c1")
+	}
+
+	// Same claim reallocated to cxi1 — the prior slot on cxi0 must be
+	// released as part of the new grant.
+	granted, occupied := d.checkAndAddPending("c1", "ns1", "cxi1", fits, hwAvailPlenty)
+	if !granted || occupied {
+		t.Fatalf("reallocation grant: got (granted=%v,occupied=%v), want (true,false)", granted, occupied)
+	}
+
+	if _, ok := d.nsDeviceOccupancy["ns1"]["cxi0"]; ok {
+		t.Errorf("ns1/cxi0 slot still present after c1 reallocated to cxi1 — would pin ns1 to both devices")
+	}
+	if got := d.nsDeviceOccupancy["ns1"]["cxi1"]; got != "c1" {
+		t.Errorf("ns1/cxi1 slot = %q after reallocation, want %q", got, "c1")
+	}
+	if got := d.claimToOccupancy["c1"]; got.namespace != "ns1" || got.deviceName != "cxi1" {
+		t.Errorf("claimToOccupancy[c1] = %+v after reallocation, want {ns1, cxi1}", got)
+	}
+	// Pending must also have followed the move — no stale entry on cxi0.
+	if e, ok := d.pending["c1"]; !ok {
+		t.Errorf("pending[c1] not recorded after reallocation grant")
+	} else if e.deviceName != "cxi1" {
+		t.Errorf("pending[c1].deviceName = %q after reallocation, want %q", e.deviceName, "cxi1")
+	}
+}
+
+// When the scheduler re-evaluates the SAME claim on the SAME (ns, dev) (e.g.
+// the binder's periodic re-evaluation of Ready=False claims after a retry
+// trigger), the defensive prior-release at the top of checkAndAddPending
+// must NOT cause the claim to appear "occupied by another claim" — the
+// previously-held slot is by the same claim UID, so releasing it first is
+// safe and the grant should succeed.
+func TestCheckAndAddPending_SameClaimReEvaluationIsIdempotent(t *testing.T) {
+	d := newDriverForTest()
+
+	// Initial grant.
+	granted1, _ := d.checkAndAddPending("c1", "ns1", "cxi0", fits, hwAvailPlenty)
+	if !granted1 {
+		t.Fatalf("initial grant failed unexpectedly")
+	}
+
+	// Re-evaluation: same UID, same (ns, dev). Must grant cleanly (not
+	// false-positive as occupied).
+	granted2, occupied := d.checkAndAddPending("c1", "ns1", "cxi0", fits, hwAvailPlenty)
+	if !granted2 || occupied {
+		t.Fatalf("re-evaluation of same claim on same (ns, dev): got (granted=%v,occupied=%v), want (true,false)", granted2, occupied)
+	}
+
+	// Net state must match a single grant: exactly one slot, exactly one
+	// reverse-index entry.
+	if got := d.nsDeviceOccupancy["ns1"]["cxi0"]; got != "c1" {
+		t.Errorf("ns1/cxi0 slot after re-eval = %q, want %q", got, "c1")
+	}
+	if len(d.claimToOccupancy) != 1 {
+		t.Errorf("claimToOccupancy len = %d after re-eval, want 1", len(d.claimToOccupancy))
+	}
+	if len(d.pending) != 1 {
+		t.Errorf("pending len = %d after re-eval, want 1", len(d.pending))
 	}
 }
