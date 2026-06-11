@@ -1,6 +1,13 @@
 package driver
 
-import "testing"
+import (
+	"context"
+	"testing"
+
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes/fake"
+)
 
 func TestNextFreeVNI(t *testing.T) {
 	tests := []struct {
@@ -25,5 +32,51 @@ func TestNextFreeVNI(t *testing.T) {
 					tc.assigned, tc.start, tc.end, vni, ok, tc.wantVNI, tc.wantOK)
 			}
 		})
+	}
+}
+
+func TestReconcileNamespaceAssignsVNI(t *testing.T) {
+	client := fake.NewSimpleClientset(
+		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "team-a"}},
+		// pre-existing assignment must be respected, not reassigned
+		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{
+			Name:        "team-b",
+			Annotations: map[string]string{vniAnnotationKey: "10"},
+		}},
+		// system namespace must be skipped
+		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "kube-system"}},
+	)
+	c := &namespaceVNIController{
+		client: client,
+		start:  10,
+		end:    20,
+		skip:   defaultVNISkip(),
+	}
+
+	// team-a is unassigned; lowest free VNI given team-b=10 is 11.
+	if err := c.reconcile(context.Background(), "team-a"); err != nil {
+		t.Fatalf("reconcile team-a: %v", err)
+	}
+	ns, _ := client.CoreV1().Namespaces().Get(context.Background(), "team-a", metav1.GetOptions{})
+	if got := ns.Annotations[vniAnnotationKey]; got != "11" {
+		t.Fatalf("team-a VNI = %q, want %q", got, "11")
+	}
+
+	// kube-system must remain unassigned.
+	if err := c.reconcile(context.Background(), "kube-system"); err != nil {
+		t.Fatalf("reconcile kube-system: %v", err)
+	}
+	sys, _ := client.CoreV1().Namespaces().Get(context.Background(), "kube-system", metav1.GetOptions{})
+	if _, ok := sys.Annotations[vniAnnotationKey]; ok {
+		t.Fatalf("kube-system unexpectedly got a VNI")
+	}
+
+	// re-reconciling team-b must not change its VNI.
+	if err := c.reconcile(context.Background(), "team-b"); err != nil {
+		t.Fatalf("reconcile team-b: %v", err)
+	}
+	b, _ := client.CoreV1().Namespaces().Get(context.Background(), "team-b", metav1.GetOptions{})
+	if got := b.Annotations[vniAnnotationKey]; got != "10" {
+		t.Fatalf("team-b VNI changed to %q, want 10", got)
 	}
 }
