@@ -209,26 +209,34 @@ Every pod in a namespace receives the same VNI, so any number of pods in the sam
 
 ### How scheduler placement works
 
-When a `ResourceClaim` with opaque CXI config is created, the `MutatingAdmissionPolicy` automatically injects CEL selectors into the claim. For example, a `cxi-quarter` request becomes:
+When a `ResourceClaim` with opaque CXI config is created, the `MutatingAdmissionPolicy` automatically injects two CEL selectors into the claim. For a `cxi-quarter` request from namespace `ellis` these are:
 
 ```
+# Selector 1: per-resource capacity check (one expression with all 8 fields)
 device.attributes["cxi.slingshot.hpe.com"]["avail_txqs"] >= 256 &&
 device.attributes["cxi.slingshot.hpe.com"]["avail_tles"] >= 512 &&
 ...
+
+# Selector 2: per-namespace exclusion (literal namespace interpolated at admission time)
+!device.attributes["cxi.slingshot.hpe.com"]["active_namespaces"].contains(",ellis,")
 ```
 
-These selectors steer subsequent scheduling rounds toward devices with available capacity. However, because the K8s DRA scheduler evaluates claims against a static snapshot of the `ResourceSlice` within a single scheduling batch, it may initially over-concentrate claims onto fewer devices than necessary (the custom `avail_*` attributes are not decremented between per-claim decisions in the same batch).
+The scheduler ANDs both selectors. Selector 1 steers placement to devices with capacity for the request. Selector 2 prevents the scheduler from picking a device that already hosts another claim from the same namespace — necessary because SHS14 enforces VNI uniqueness per device at the kernel level (`cxil_svc_set_vni_range` returns `-EEXIST` for overlapping ranges) and every claim in a namespace shares the namespace's VNI.
 
-The driver handles this via **Unschedulable compaction**:
+The `active_namespaces` attribute is a comma-padded sorted string (e.g. `,alpha,ellis,zeta,`) published per device on every `ResourceSlice` update. The leading and trailing commas let the CEL `.contains(",<NS>,")` perform exact, non-prefix matching — `,foo,` does not match `,foobar,`. An unoccupied device publishes the empty string.
+
+The driver re-publishes the `ResourceSlice` immediately on every occupancy 0↔1 transition (a claim grant flips 0→1; the NRI plugin's `DestroyService` callback flips 1→0). Other claims in the same namespace see the updated `active_namespaces` within milliseconds and are steered away from the now-occupied device — no waiting for the next 10-second periodic refresh.
+
+Because the K8s DRA scheduler evaluates claims against a static snapshot of the `ResourceSlice` within a single scheduling batch, it may still over-concentrate claims onto fewer devices than necessary in one batch (the custom `avail_*` attributes are not decremented between per-claim decisions in the same batch). The driver handles this via **Unschedulable compaction**, which is also the runtime safety net for the rare case where the admission-injected selector raced a stale `ResourceSlice`:
 
 1. The scheduler allocates a batch of claims, possibly concentrating multiple claims on one device.
 2. The `ClaimBinder` evaluates each allocation against real hardware capacity **and** against per-namespace device occupancy. It grants `Ready=True` to claims that fit within current capacity minus in-flight pending grants and whose `(namespace, device)` pair is not already held by another claim.
 3. Claims that exceed the device's hardware capacity receive `Unschedulable=True` with reason `DeviceAtCapacity`.
-4. Claims whose `(namespace, device)` pair is already held by another claim in the same namespace receive `Unschedulable=True` with reason `NamespaceDeviceOccupied`. SHS14 enforces VNI uniqueness per device at the kernel level (`cxil_svc_set_vni_range` returns `-EEXIST` for overlapping ranges on the same device), and every claim in a namespace shares the namespace's VNI — so two claims from the same namespace cannot co-locate on the same device.
+4. Claims whose `(namespace, device)` pair is already held by another claim in the same namespace receive `Unschedulable=True` with reason `NamespaceDeviceOccupied`. This should be rare with the admission-injected CEL selector in place; it is kept as a defense against admission-policy bypass or stale `ResourceSlice` race conditions.
 5. The scheduler sees `Unschedulable=True` in the claim's `BindingFailureConditions`, deallocates the single CXI claim, and retries.
-6. At retry time, the `ResourceSlice` has been republished with `avail_*` near zero for any device that became full, steering the retry allocation to a less-loaded device. For the namespace-occupancy case the `ResourceSlice` has no per-namespace state to update; the scheduler picks any device it would have picked anyway, and we re-check on the next allocation.
+6. At retry time, the `ResourceSlice` has been republished — `avail_*` near zero for any device that became full, `active_namespaces` updated for the same-namespace case — steering the retry allocation to an actually eligible device.
 
-The system converges to the correct distribution (≤3 `cxi-quarter` pods per device, ≤1 claim per namespace per device on any one node) within one or two compaction cycles. The per-namespace occupancy index is decremented only by the NRI plugin's `StopPodSandbox` hook after `DestroyService` runs — see "Known Limitations" for the rare leak path.
+The system converges to the correct distribution (≤3 `cxi-quarter` pods per device, ≤1 claim per namespace per device on any one node) within one or two compaction cycles in the worst case, and typically zero (CEL pre-filter catches it at scheduling time). The per-namespace occupancy index is decremented only by the NRI plugin's `StopPodSandbox` hook after `DestroyService` runs — see "Known Limitations" for the rare leak path.
 
 ## Accounting for Pre-existing System Services
 

@@ -68,6 +68,16 @@ func (d *Driver) buildDevices() []resourceapi.Device {
 				"avail_ptes": {IntValue: ptr.To(avail.PTEs)},
 				"avail_les":  {IntValue: ptr.To(avail.LEs)},
 				"avail_acs":  {IntValue: ptr.To(avail.ACs)},
+				// Comma-padded sorted list of namespaces currently holding a
+				// pending grant or live service on this device. Consumed by
+				// the MutatingAdmissionPolicy-injected per-claim CEL selector
+				// to exclude devices already occupied by the claim's
+				// namespace — pre-filtering at scheduling time enforces
+				// SHS14's per-device VNI uniqueness without relying on a
+				// late binding-failure retry. Empty string when the device
+				// is unoccupied. Always published so the CEL selector can
+				// rely on the attribute being present.
+				"active_namespaces": {StringValue: ptr.To(d.activeNamespacesFor(dev.Name))},
 			},
 		// BindingConditions: the scheduler will not bind a pod until the
 		// ClaimBinder sets Ready=True, confirming capacity is available.

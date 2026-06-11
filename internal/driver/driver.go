@@ -3,6 +3,8 @@ package driver
 import (
 	"context"
 	"fmt"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -145,6 +147,11 @@ func (d *Driver) RemovePending(claimUID types.UID) {
 // are no-ops, which makes the path idempotent if NRI fires StopPodSandbox
 // twice for the same sandbox (e.g. retry on transient runtime error).
 //
+// On a 1→0 transition this triggers an immediate ResourceSlice republish so
+// the device's active_namespaces attribute drops this namespace and the
+// MutatingAdmissionPolicy-injected CEL selector lets other claims in this
+// namespace target this device again.
+//
 // Limitation: if a pod is force-deleted before RunPodSandbox runs (so NRI
 // never fires StopPodSandbox), the occupancy increment from Ready=True
 // leaks until the driver process restarts. This is rare in practice; the
@@ -162,6 +169,11 @@ func (d *Driver) RemoveOccupancy(namespace, deviceName string) {
 		if len(devs) == 0 {
 			delete(d.nsDeviceOccupancy, namespace)
 		}
+		// 1→0 transition: the active_namespaces attribute for this device
+		// just changed. Republish so the admission-injected CEL selector
+		// sees the freed slot and other claims in this namespace can now
+		// be scheduled on this device.
+		d.TriggerRepublish()
 		return
 	}
 	devs[deviceName]--
@@ -230,6 +242,14 @@ func (d *Driver) checkAndAddPending(
 		d.nsDeviceOccupancy[namespace] = make(map[string]int)
 	}
 	d.nsDeviceOccupancy[namespace][deviceName]++
+	// Grant always corresponds to a 0→1 transition for this (namespace,
+	// device) pair — the early guard above returned `occupied` if the count
+	// was non-zero. Trigger an immediate ResourceSlice republish so:
+	//   * avail_* reflects the new pending grant
+	//   * active_namespaces gains this namespace
+	// The admission-injected CEL selector then steers other claims in this
+	// namespace away from this device.
+	d.TriggerRepublish()
 	return true, false
 }
 
@@ -267,6 +287,42 @@ func (d *Driver) effectiveAvail(deviceName string) cxi.ResourceSet {
 		}
 	}
 	return avail.Sub(pendingSum).ClampToZero()
+}
+
+// activeNamespacesFor returns a sorted, comma-padded string of namespaces
+// that currently hold a pending grant or a live service on the given device.
+//
+// Format:
+//
+//	""              when no namespaces occupy the device
+//	",ns1,"         single namespace
+//	",ns1,ns2,..."  multiple namespaces, lexicographically sorted
+//
+// The leading and trailing commas let the admission-injected CEL selector use
+// string.contains(",<NS>,") for exact, non-prefix matching:
+// ",foo,bar," does not match ",foobar," because the `,` framing is required
+// on both sides of the namespace name.
+//
+// Published as the active_namespaces attribute on each device's ResourceSlice
+// entry. The MutatingAdmissionPolicy injects a per-claim CEL selector that
+// excludes devices whose active_namespaces already contains the claim's
+// namespace — pre-filtering at scheduling time so the DRA scheduler never
+// picks a device that would later be rejected by SHS14's per-device VNI
+// uniqueness constraint. See nsDeviceOccupancy for the underlying state.
+func (d *Driver) activeNamespacesFor(deviceName string) string {
+	d.pendingMu.Lock()
+	defer d.pendingMu.Unlock()
+	var names []string
+	for ns, devs := range d.nsDeviceOccupancy {
+		if devs[deviceName] > 0 {
+			names = append(names, ns)
+		}
+	}
+	if len(names) == 0 {
+		return ""
+	}
+	sort.Strings(names)
+	return "," + strings.Join(names, ",") + ","
 }
 
 // logf prints a formatted driver log line to stdout.

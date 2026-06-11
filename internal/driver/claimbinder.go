@@ -219,8 +219,11 @@ func (b *ClaimBinder) evaluateClaim(ctx context.Context, claim *resourceapi.Reso
 	switch {
 	case granted:
 		// Case 2: grant. Record in pending so subsequent claims on the same
-		// device see reduced capacity. Republish so the scheduler sees updated
-		// avail_* and steers future pods to less-loaded devices.
+		// device see reduced capacity. checkAndAddPending already calls
+		// TriggerRepublish internally (covers both the avail_* decrement
+		// from the new pending entry and the active_namespaces addition
+		// from the 0→1 occupancy transition), so no explicit republish
+		// here.
 		b.logf("Ready=True: claim=%s/%s device=%s requested=(%s)",
 			claim.Namespace, claim.Name, result.Device, requested)
 		b.setCondition(ctx, claim, result, "Ready", metav1.ConditionTrue,
@@ -229,9 +232,6 @@ func (b *ClaimBinder) evaluateClaim(ctx context.Context, claim *resourceapi.Reso
 		b.mu.Lock()
 		delete(b.falseClaims, claim.UID)
 		b.mu.Unlock()
-		// Update ResourceSlice so the scheduler sees reduced avail_* for
-		// this device when allocating the next pod.
-		b.driver.TriggerRepublish()
 
 	case occupied:
 		// Case 1: another claim from the same namespace already holds this
