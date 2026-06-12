@@ -62,12 +62,12 @@ func TestWriteEnvSpec(t *testing.T) {
 		t.Errorf("devices = %v, want [{env}]", spec.Devices)
 	}
 	// xpmem/gdrdrv absent → no device nodes.
-	if len(spec.ContainerEdits.DeviceNodes) != 0 {
-		t.Errorf("device nodes = %d, want 0 (both absent)", len(spec.ContainerEdits.DeviceNodes))
+	if len(spec.Devices[0].ContainerEdits.DeviceNodes) != 0 {
+		t.Errorf("device nodes = %d, want 0 (both absent)", len(spec.Devices[0].ContainerEdits.DeviceNodes))
 	}
 	// libfabric should appear in mounts.
 	found := false
-	for _, m := range spec.ContainerEdits.Mounts {
+	for _, m := range spec.Devices[0].ContainerEdits.Mounts {
 		if m.HostPath == cfg.LibfabricLib {
 			found = true
 			break
@@ -78,7 +78,7 @@ func TestWriteEnvSpec(t *testing.T) {
 	}
 	// /dev/shm must be present.
 	foundShm := false
-	for _, m := range spec.ContainerEdits.Mounts {
+	for _, m := range spec.Devices[0].ContainerEdits.Mounts {
 		if m.HostPath == "/dev/shm" {
 			foundShm = true
 			break
@@ -88,7 +88,7 @@ func TestWriteEnvSpec(t *testing.T) {
 		t.Error("/dev/shm mount not found in env spec")
 	}
 	// ldcache hook must be present.
-	if len(spec.ContainerEdits.Hooks) == 0 {
+	if len(spec.Devices[0].ContainerEdits.Hooks) == 0 {
 		t.Error("no hooks in env spec, want ldcache hook")
 	}
 }
@@ -110,7 +110,7 @@ func TestWriteEnvSpecNoLibfabric(t *testing.T) {
 	if err := json.Unmarshal(data, &spec); err != nil {
 		t.Fatalf("unmarshalling spec: %v", err)
 	}
-	for _, m := range spec.ContainerEdits.Mounts {
+	for _, m := range spec.Devices[0].ContainerEdits.Mounts {
 		if m.ContainerPath == "/usr/lib64/libfabric.so.1" {
 			t.Error("libfabric mount found but LibfabricLib was empty")
 		}
@@ -163,12 +163,12 @@ func TestWriteNCCLSpec(t *testing.T) {
 	if len(spec.Devices) != 1 || spec.Devices[0].Name != "nccl" {
 		t.Errorf("devices = %v, want [{nccl}]", spec.Devices)
 	}
-	if len(spec.ContainerEdits.Mounts) != 1 ||
-		spec.ContainerEdits.Mounts[0].HostPath != cfg.NCCLPrefix ||
-		spec.ContainerEdits.Mounts[0].ContainerPath != "/host/nccl" {
-		t.Errorf("mounts = %v, want NCCL prefix → /host/nccl", spec.ContainerEdits.Mounts)
+	if len(spec.Devices[0].ContainerEdits.Mounts) != 1 ||
+		spec.Devices[0].ContainerEdits.Mounts[0].HostPath != cfg.NCCLPrefix ||
+		spec.Devices[0].ContainerEdits.Mounts[0].ContainerPath != "/host/nccl" {
+		t.Errorf("mounts = %v, want NCCL prefix → /host/nccl", spec.Devices[0].ContainerEdits.Mounts)
 	}
-	if len(spec.ContainerEdits.Hooks) == 0 {
+	if len(spec.Devices[0].ContainerEdits.Hooks) == 0 {
 		t.Error("no hooks in NCCL spec, want ldcache hook")
 	}
 }
@@ -226,18 +226,18 @@ func TestWriteAWSofiNCCLSpec(t *testing.T) {
 
 	wantHostPath := cfg.AWSofiNCCLPrefix + "/lib/libnccl-net.so"
 	found := false
-	for _, m := range spec.ContainerEdits.Mounts {
+	for _, m := range spec.Devices[0].ContainerEdits.Mounts {
 		if m.HostPath == wantHostPath && m.ContainerPath == "/usr/lib/libnccl-net.so" {
 			found = true
 			break
 		}
 	}
 	if !found {
-		t.Errorf("libnccl-net.so mount not found; mounts = %v", spec.ContainerEdits.Mounts)
+		t.Errorf("libnccl-net.so mount not found; mounts = %v", spec.Devices[0].ContainerEdits.Mounts)
 	}
 
 	foundEnv := false
-	for _, e := range spec.ContainerEdits.Env {
+	for _, e := range spec.Devices[0].ContainerEdits.Env {
 		if e == "NCCL_NET=AWS Libfabric" {
 			foundEnv = true
 			break
@@ -247,7 +247,7 @@ func TestWriteAWSofiNCCLSpec(t *testing.T) {
 		t.Error("NCCL_NET env var not found in aws-ofi-nccl spec")
 	}
 
-	if len(spec.ContainerEdits.Hooks) == 0 {
+	if len(spec.Devices[0].ContainerEdits.Hooks) == 0 {
 		t.Error("no hooks in aws-ofi-nccl spec, want ldcache hook")
 	}
 }

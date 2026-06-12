@@ -121,12 +121,14 @@ func WriteEnvSpec(cdiRoot, driverName string, cfg CDIEnvConfig) error {
 	spec := &specs.Spec{
 		Version: cdiVersion,
 		Kind:    driverName + "/env",
-		Devices: []specs.Device{{Name: "env"}},
-		ContainerEdits: specs.ContainerEdits{
-			DeviceNodes: deviceNodes,
-			Mounts:      mounts,
-			Hooks:       []*specs.Hook{ldcacheHook("/usr/lib64")},
-		},
+		Devices: []specs.Device{{
+			Name: "env",
+			ContainerEdits: specs.ContainerEdits{
+				DeviceNodes: deviceNodes,
+				Mounts:      mounts,
+				Hooks:       []*specs.Hook{ldcacheHook("/usr/lib64")},
+			},
+		}},
 	}
 
 	data, err := json.MarshalIndent(spec, "", "  ")
@@ -192,17 +194,19 @@ func WriteNCCLSpec(cdiRoot, driverName string, cfg CDIEnvConfig) error {
 	spec := &specs.Spec{
 		Version: cdiVersion,
 		Kind:    driverName + "/nccl",
-		Devices: []specs.Device{{Name: "nccl"}},
-		ContainerEdits: specs.ContainerEdits{
-			Mounts: []*specs.Mount{
-				{
-					HostPath:      cfg.NCCLPrefix,
-					ContainerPath: "/host/nccl",
-					Options:       []string{"bind", "ro", "nosuid", "nodev", "private"},
+		Devices: []specs.Device{{
+			Name: "nccl",
+			ContainerEdits: specs.ContainerEdits{
+				Mounts: []*specs.Mount{
+					{
+						HostPath:      cfg.NCCLPrefix,
+						ContainerPath: "/host/nccl",
+						Options:       []string{"bind", "ro", "nosuid", "nodev", "private"},
+					},
 				},
+				Hooks: []*specs.Hook{ldcacheHook("/host/nccl/lib")},
 			},
-			Hooks: []*specs.Hook{ldcacheHook("/host/nccl/lib")},
-		},
+		}},
 	}
 
 	data, err := json.MarshalIndent(spec, "", "  ")
@@ -262,31 +266,33 @@ func WriteAWSofiNCCLSpec(cdiRoot, driverName string, cfg CDIEnvConfig) error {
 	spec := &specs.Spec{
 		Version: cdiVersion,
 		Kind:    driverName + "/aws-ofi-nccl",
-		Devices: []specs.Device{{Name: "aws-ofi-nccl"}},
-		ContainerEdits: specs.ContainerEdits{
-			Env: []string{
-				"NCCL_NET=AWS Libfabric",
-				"NCCL_CROSS_NIC=1",
-				"NCCL_NET_GDR_LEVEL=PHB",
-				"NCCL_SOCKET_IFNAME=hsn",
-				"NCCL_MIN_NCHANNELS=4",
-				"NCCL_GDRCOPY_ENABLE=1",
-				"NCCL_NET_FORCE_FLUSH=0",
-				"FI_MR_CACHE_MONITOR=userfaultfd",
-				"FI_CXI_DISABLE_HOST_REGISTER=1",
-				"FI_HMEM_CUDA_USE_GDRCOPY=1",
-				"FI_CXI_DEFAULT_CQ_SIZE=131072",
-				"FI_CXI_DEFAULT_TX_SIZE=2048",
-				"FI_CXI_RDZV_PROTO=alt_read",
-				"FI_CXI_RDZV_THRESHOLD=0",
-				"FI_CXI_RDZV_GET_MIN=0",
-				"FI_CXI_RDZV_EAGER_SIZE=0",
-				"FI_CXI_DISABLE_NON_INJECT_MSG_IDC=1",
-				"FI_CXI_RX_MATCH_MODE=hybrid",
+		Devices: []specs.Device{{
+			Name: "aws-ofi-nccl",
+			ContainerEdits: specs.ContainerEdits{
+				Env: []string{
+					"NCCL_NET=AWS Libfabric",
+					"NCCL_CROSS_NIC=1",
+					"NCCL_NET_GDR_LEVEL=PHB",
+					"NCCL_SOCKET_IFNAME=hsn",
+					"NCCL_MIN_NCHANNELS=4",
+					"NCCL_GDRCOPY_ENABLE=1",
+					"NCCL_NET_FORCE_FLUSH=0",
+					"FI_MR_CACHE_MONITOR=userfaultfd",
+					"FI_CXI_DISABLE_HOST_REGISTER=1",
+					"FI_HMEM_CUDA_USE_GDRCOPY=1",
+					"FI_CXI_DEFAULT_CQ_SIZE=131072",
+					"FI_CXI_DEFAULT_TX_SIZE=2048",
+					"FI_CXI_RDZV_PROTO=alt_read",
+					"FI_CXI_RDZV_THRESHOLD=0",
+					"FI_CXI_RDZV_GET_MIN=0",
+					"FI_CXI_RDZV_EAGER_SIZE=0",
+					"FI_CXI_DISABLE_NON_INJECT_MSG_IDC=1",
+					"FI_CXI_RX_MATCH_MODE=hybrid",
+				},
+				Mounts: mounts,
+				Hooks:  []*specs.Hook{ldcacheHook("/usr/lib", "/usr/lib64")},
 			},
-			Mounts: mounts,
-			Hooks:  []*specs.Hook{ldcacheHook("/usr/lib", "/usr/lib64")},
-		},
+		}},
 	}
 
 	data, err := json.MarshalIndent(spec, "", "  ")
