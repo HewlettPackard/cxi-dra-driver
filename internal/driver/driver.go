@@ -41,8 +41,9 @@ type Config struct {
 	MockDevices     []*cxi.Device
 	Overhead        cxi.ResourceSet
 	RefreshInterval time.Duration
-	CDIEnvConfig    cdi.CDIEnvConfig
-	EnableCDIEnv    bool // if false, env/nccl/ofi CDI specs are not written and not injected into pods
+	CDIEnvConfig         cdi.CDIEnvConfig
+	EnableCDIEnv         bool   // if false, env/nccl/ofi CDI specs are not written and not injected into pods
+	ContainerdConfigPath string // path for the containerd CDI config drop-in; empty = skip
 }
 
 // Driver implements kubeletplugin.DRAPlugin for CXI devices.
@@ -59,9 +60,10 @@ type Driver struct {
 	store           *AllocationStore
 	overhead        cxi.ResourceSet // admin-configured per-device reserved overhead
 	refreshInterval time.Duration   // how often to republish ResourceSlice with fresh avail attrs
-	cdiEnvConfig    cdi.CDIEnvConfig
-	enableCDIEnv    bool          // if false, env/nccl/ofi CDI specs are not written and not injected into pods
-	notify          chan struct{} // signals an immediate ResourceSlice republish
+	cdiEnvConfig         cdi.CDIEnvConfig
+	enableCDIEnv         bool   // if false, env/nccl/ofi CDI specs are not written and not injected into pods
+	containerdConfigPath string // path for the containerd CDI config drop-in; empty = skip
+	notify               chan struct{} // signals an immediate ResourceSlice republish
 
 	pendingMu sync.Mutex
 	pending   map[types.UID]pendingEntry // claimUID → in-flight grant not yet backed by a service
@@ -125,8 +127,9 @@ func New(cfg Config) *Driver {
 		store:             NewAllocationStore(),
 		overhead:          cfg.Overhead,
 		refreshInterval:   cfg.RefreshInterval,
-		cdiEnvConfig:      cfg.CDIEnvConfig,
-		enableCDIEnv:      cfg.EnableCDIEnv,
+		cdiEnvConfig:         cfg.CDIEnvConfig,
+		enableCDIEnv:         cfg.EnableCDIEnv,
+		containerdConfigPath: cfg.ContainerdConfigPath,
 		notify:            make(chan struct{}, 1),
 		pending:           make(map[types.UID]pendingEntry),
 		nsDeviceOccupancy: make(map[string]map[string]types.UID),
@@ -439,6 +442,19 @@ func (d *Driver) Run(ctx context.Context) error {
 			return fmt.Errorf("discovering CXI devices: %w", err)
 		}
 		d.devices = devices
+	}
+
+	if d.containerdConfigPath != "" {
+		if err := cdi.WriteContainerdCDIConfig(d.containerdConfigPath, []string{d.cdiRoot}); err != nil {
+			return fmt.Errorf("writing containerd CDI config: %w", err)
+		}
+		pid, err := cdi.FindContainerdPID("/proc")
+		if err != nil {
+			return fmt.Errorf("finding containerd PID: %w", err)
+		}
+		if err := cdi.SignalContainerd(pid); err != nil {
+			return fmt.Errorf("signalling containerd: %w", err)
+		}
 	}
 
 	for _, dev := range d.devices {

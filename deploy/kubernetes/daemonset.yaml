@@ -53,6 +53,8 @@ spec:
             - --reserved-tle-pools=1
             - --vni-range-start=100
             - --vni-range-end=300
+            - --enable-cdi-env=true
+            - --containerd-config-path=/etc/containerd/conf.d/50-cxi-cdi.toml
             - --libfabric-lib=/opt/cray/libfabric/2.3.1/lib64/libfabric.so.1
             - --nccl-prefix=/projects/public/brics/dev/apps/linux-neoverse_v2/nccl-2.29.2-1-yjntbzz5uuuashekge53wqizfqum6swy
             - --aws-ofi-nccl-prefix=/projects/public/brics/dev/apps/linux-neoverse_v2/aws-ofi-nccl-1.18.0-6pbztrbjhvrmtu5r6nq2silgputmmcyk
@@ -88,6 +90,8 @@ spec:
               mountPath: /var/lib/kubelet/plugins/cxi.slingshot.hpe.com
             - name: kubelet-registry
               mountPath: /var/lib/kubelet/plugins_registry
+            - name: containerd-conf
+              mountPath: /etc/containerd/conf.d
             - name: cdi
               mountPath: /var/run/cdi
             - name: nri
@@ -110,6 +114,10 @@ spec:
         - name: kubelet-registry
           hostPath:
             path: /var/lib/kubelet/plugins_registry
+        - name: containerd-conf
+          hostPath:
+            path: /etc/containerd/conf.d
+            type: DirectoryOrCreate
         - name: cdi
           hostPath:
             path: /var/run/cdi
