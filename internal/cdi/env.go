@@ -109,7 +109,6 @@ func WriteEnvSpec(cdiRoot, driverName string, cfg CDIEnvConfig) error {
 		"/usr/lib64/libbrotlicommon.so.1",
 		"/usr/lib64/libkeyutils.so.1",
 		"/usr/lib64/libpcre.so.1",
-		"/usr/lib64/libxpmem.so.0",
 	} {
 		mounts = append(mounts, &specs.Mount{
 			HostPath:      so,
@@ -117,6 +116,11 @@ func WriteEnvSpec(cdiRoot, driverName string, cfg CDIEnvConfig) error {
 			Options:       []string{"bind", "ro", "nosuid", "private"},
 		})
 	}
+	mounts = append(mounts, &specs.Mount{
+		HostPath:      "/opt/xpmem/lib64/libxpmem.so.0",
+		ContainerPath: "/usr/lib64/libxpmem.so.0",
+		Options:       []string{"bind", "ro", "nosuid", "private"},
+	})
 
 	spec := &specs.Spec{
 		Version: cdiVersion,
