@@ -444,19 +444,6 @@ func (d *Driver) Run(ctx context.Context) error {
 		d.devices = devices
 	}
 
-	if d.containerdConfigPath != "" {
-		if err := cdi.WriteContainerdCDIConfig(d.containerdConfigPath, []string{d.cdiRoot}); err != nil {
-			return fmt.Errorf("writing containerd CDI config: %w", err)
-		}
-		pid, err := cdi.FindContainerdPID("/proc")
-		if err != nil {
-			return fmt.Errorf("finding containerd PID: %w", err)
-		}
-		if err := cdi.SignalContainerd(pid); err != nil {
-			return fmt.Errorf("signalling containerd: %w", err)
-		}
-	}
-
 	for _, dev := range d.devices {
 		if err := cdi.WriteSpec(d.cdiRoot, d.driverName, dev); err != nil {
 			return fmt.Errorf("writing CDI spec for %s: %w", dev.Name, err)
@@ -476,6 +463,21 @@ func (d *Driver) Run(ctx context.Context) error {
 			if err := cdi.WriteAWSofiNCCLSpec(d.cdiRoot, d.driverName, d.cdiEnvConfig); err != nil {
 				return fmt.Errorf("writing CDI aws-ofi-nccl spec: %w", err)
 			}
+		}
+	}
+
+	// Write containerd CDI config drop-in and reload containerd AFTER all spec
+	// files are on disk — containerd's CDI cache must see the complete set.
+	if d.containerdConfigPath != "" {
+		if err := cdi.WriteContainerdCDIConfig(d.containerdConfigPath, []string{d.cdiRoot}); err != nil {
+			return fmt.Errorf("writing containerd CDI config: %w", err)
+		}
+		pid, err := cdi.FindContainerdPID("/proc")
+		if err != nil {
+			return fmt.Errorf("finding containerd PID: %w", err)
+		}
+		if err := cdi.SignalContainerd(pid); err != nil {
+			return fmt.Errorf("signalling containerd: %w", err)
 		}
 	}
 

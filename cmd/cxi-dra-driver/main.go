@@ -54,7 +54,7 @@ func main() {
 		// CDI env spec configuration — all optional; empty disables the corresponding mount/spec.
 		// Set --enable-cdi-env to activate env/nccl/ofi CDI spec writing and pod injection.
 		enableCDIEnv          = flag.Bool("enable-cdi-env", false, "Write env/nccl/ofi CDI specs and inject their device IDs into pods")
-		containerdConfigPath  = flag.String("containerd-config-path", "/etc/containerd/conf.d/50-cxi-cdi.toml", "Path to write the containerd CDI config drop-in; empty disables")
+		containerdConfigPath  = flag.String("containerd-config-path", "", "Path to write the containerd CDI config drop-in; empty disables")
 		libfabricLib     = flag.String("libfabric-lib", "", "Host path to libfabric.so.1 (versioned Spack path)")
 		ncclPrefix       = flag.String("nccl-prefix", "", "Spack NCCL install prefix; empty disables NCCL CDI spec")
 		awsOfiNCCLPrefix = flag.String("aws-ofi-nccl-prefix", "", "Spack aws-ofi-nccl install prefix; empty disables OFI CDI spec")
