@@ -24,7 +24,7 @@
 # Check which device each pod is using:
 #
 #   kubectl get resourceclaims -o wide
-#   kubectl describe pods -l app=cxi-phase3-test | grep "FI_CXI_SVC_ID"
+#   kubectl describe pods -l app=cxi-phase3-test | grep "SLINGSHOT_"
 #
 # Apply pre-requisites first:
 #   kubectl apply -f deploy/kubernetes/test/resourceclaim.yaml

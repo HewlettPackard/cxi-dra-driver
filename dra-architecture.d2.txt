@@ -111,7 +111,7 @@ DRA Node Driver: {
     shape: sql_table
     role: "container lifecycle hook"
     RunPodSandbox: "per-device mutex; CreateService(dev, netnsInode, vni)"
-    CreateContainer: "(future) inject FI_CXI_SVC_ID env"
+    CreateContainer: "(future) inject SLINGSHOT_DEVICES, SLINGSHOT_VNIS, SLINGSHOT_SVC_IDS env"
     StopPodSandbox: "DestroyService; TriggerRetry"
   }
 

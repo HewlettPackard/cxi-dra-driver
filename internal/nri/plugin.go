@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"maps"
 	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -22,7 +24,7 @@ import (
 // sandbox stops (in StopPodSandbox).
 type podState struct {
 	netnsInode uint64
-	// svcIDs maps deviceName -> allocated svc_id, injected as FI_CXI_SVC_ID
+	// svcIDs maps deviceName -> allocated svc_id, injected as SLINGSHOT_SVC_IDS
 	svcIDs map[string]int
 }
 
@@ -32,7 +34,7 @@ type podState struct {
 //
 // Hooks used:
 //   - RunPodSandbox   — network namespace is available; create CXI service here.
-//   - CreateContainer — inject FI_CXI_SVC_ID env vars into each container.
+//   - CreateContainer — inject SLINGSHOT_DEVICES, SLINGSHOT_VNIS, SLINGSHOT_SVC_IDS env vars into each container.
 //   - StopPodSandbox  — tear down CXI service when the pod sandbox stops.
 type Plugin struct {
 	stub             stub.Stub
@@ -222,8 +224,10 @@ func (p *Plugin) RunPodSandbox(_ context.Context, pod *api.PodSandbox) error {
 	return nil
 }
 
-// CreateContainer injects FI_CXI_SVC_ID env vars. The service was already
-// created in RunPodSandbox.
+// CreateContainer injects SLINGSHOT_DEVICES, SLINGSHOT_VNIS, and
+// SLINGSHOT_SVC_IDS env vars into every container. The service was already
+// created in RunPodSandbox. All three variables are comma-separated lists
+// aligned by index — position N in each list refers to the same device.
 func (p *Plugin) CreateContainer(_ context.Context, pod *api.PodSandbox, container *api.Container) (*api.ContainerAdjustment, []*api.ContainerUpdate, error) {
 	podUID := types.UID(pod.GetUid())
 	allocs := p.store.Get(podUID)
@@ -244,15 +248,21 @@ func (p *Plugin) CreateContainer(_ context.Context, pod *api.PodSandbox, contain
 	inode := state.netnsInode
 	p.mu.Unlock()
 
+	// Build aligned comma-separated lists. Position N in SLINGSHOT_DEVICES,
+	// SLINGSHOT_VNIS, and SLINGSHOT_SVC_IDS all refer to the same device.
+	devNames := make([]string, 0, len(allocs))
+	vnis := make([]string, 0, len(allocs))
+	svcIDList := make([]string, 0, len(allocs))
+	for _, alloc := range allocs {
+		devNames = append(devNames, alloc.DeviceName)
+		vnis = append(vnis, strconv.Itoa(alloc.VNI))
+		svcIDList = append(svcIDList, strconv.Itoa(svcIDs[alloc.DeviceName]))
+	}
+
 	adj := &api.ContainerAdjustment{}
-	for devName, svcID := range svcIDs {
-		adj.AddEnv(fmt.Sprintf("FI_CXI_SVC_ID_%s", devName), fmt.Sprintf("%d", svcID))
-	}
-	if len(svcIDs) == 1 {
-		for _, svcID := range svcIDs {
-			adj.AddEnv("FI_CXI_SVC_ID", fmt.Sprintf("%d", svcID))
-		}
-	}
+	adj.AddEnv("SLINGSHOT_DEVICES", strings.Join(devNames, ","))
+	adj.AddEnv("SLINGSHOT_VNIS", strings.Join(vnis, ","))
+	adj.AddEnv("SLINGSHOT_SVC_IDS", strings.Join(svcIDList, ","))
 
 	if isMockManager(p.svcMgr) {
 		for _, alloc := range allocs {

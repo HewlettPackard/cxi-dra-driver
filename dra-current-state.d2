@@ -163,7 +163,7 @@ DRA Node Driver: {
     label: "■ NRI Plugin"
     impl: "internal/nri/plugin.go"
     RunPodSandbox: "per-device mutex; secondary fit-check; CreateService(dev, netnsInode, VNI, ResourceSet); RemovePending on success"
-    CreateContainer: "inject FI_CXI_SVC_ID (env-spec integration gated by --enable-cdi-env)"
+    CreateContainer: "inject SLINGSHOT_DEVICES, SLINGSHOT_VNIS, SLINGSHOT_SVC_IDS (env-spec integration gated by --enable-cdi-env)"
     StopPodSandbox: "DestroyService; RemoveOccupancy per (ns,dev) (idempotent, even on DeleteService error); TriggerRetry; TriggerRepublish"
   }
 

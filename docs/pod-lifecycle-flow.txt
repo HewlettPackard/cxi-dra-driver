@@ -125,11 +125,11 @@ state and live hardware state.
       │
       ▼
   NRI: CreateContainer
-      │  injects FI_CXI_SVC_ID=<n> env var into container spec
+      │  injects SLINGSHOT_DEVICES=cxi0, SLINGSHOT_VNIS=<n>, SLINGSHOT_SVC_IDS=<n> env vars
       │
       ▼
   Pod running ✓
-      /dev/cxiN accessible, FI_CXI_SVC_ID set, netns-scoped VNI bound
+      /dev/cxiN accessible, SLINGSHOT_DEVICES/VNIS/SVC_IDS set, netns-scoped VNI bound
 
 
 ══════════════════════════════════════════════════════════════════════════════════════
@@ -284,6 +284,6 @@ strictly in lockstep and only triggers a republish on real state change.
                             (pre-cgroup-lock)
   NRI RunPodSandbox       Live fit-check under per-device mutex; hardware
                             service create; RemovePending
-  NRI CreateContainer     FI_CXI_SVC_ID env var injection
+  NRI CreateContainer     SLINGSHOT_DEVICES/VNIS/SVC_IDS env var injection
   NRI StopPodSandbox      Hardware service destroy; RemoveOccupancy(ns, dev);
                             unblocks waiting pods via TriggerRetry

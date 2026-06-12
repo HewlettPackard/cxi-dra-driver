@@ -28,7 +28,7 @@ Scheduler ──allocates──► ResourceSlice (cxi0, cxi1, …)
                          ├── NRI plugin (RunPodSandbox)
                          │     └── creates CXI service: namespace VNI + pod netns inode
                          ├── NRI plugin (CreateContainer)
-                         │     └── injects FI_CXI_SVC_ID env vars
+                         │     └── injects SLINGSHOT_DEVICES, SLINGSHOT_VNIS, SLINGSHOT_SVC_IDS env vars
                          └── NRI plugin (StopPodSandbox)
                                └── destroys CXI service
 
@@ -287,7 +287,7 @@ The CXI service (VNI scoping + netns binding) is created in the NRI `RunPodSandb
 
 ## CXI Service Programming
 
-Each pod receives a CXI service scoped to its network namespace inode and a unique VNI. libfabric reads `FI_CXI_SVC_ID` (injected as an env var by the NRI plugin) and uses it instead of allocating its own service, ensuring the pod operates within its allocated fabric resources.
+Each pod receives a CXI service scoped to its network namespace inode and a unique VNI. libfabric reads `SLINGSHOT_SVC_IDS` (injected as an env var by the NRI plugin) and uses it instead of allocating its own service, ensuring the pod operates within its allocated fabric resources. `SLINGSHOT_DEVICES` and `SLINGSHOT_VNIS` carry the corresponding device name and VNI, aligned by position.
 
 ### Namespace-scoped VNI allocation
 
@@ -438,9 +438,9 @@ Check in order:
 
 4. **Env vars injected** — inside the pod:
    ```bash
-   env | grep FI_CXI
+   env | grep SLINGSHOT
    ```
-   Should show `FI_CXI_SVC_ID=<n>`.
+   Should show `SLINGSHOT_DEVICES=cxi0`, `SLINGSHOT_VNIS=<n>`, `SLINGSHOT_SVC_IDS=<n>`.
 
 ### Claim rejected: "has no CXI resource config"
 
