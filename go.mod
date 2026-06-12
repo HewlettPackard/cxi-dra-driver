@@ -3,7 +3,7 @@ module github.com/slingshot/cxi-dra-driver
 go 1.24.0
 
 require (
-	github.com/containerd/nri v0.12.0
+	github.com/containerd/nri v0.11.0
 	k8s.io/api v0.34.0
 	k8s.io/apimachinery v0.34.0
 	k8s.io/client-go v0.34.0

@@ -459,7 +459,7 @@ func (d *Driver) Run(ctx context.Context) error {
 				return fmt.Errorf("writing CDI NCCL spec: %w", err)
 			}
 		}
-		if d.cdiEnvConfig.AWSofiNCCLPrefix != "" {
+		if len(d.cdiEnvConfig.AWSofiMounts) > 0 {
 			if err := cdi.WriteAWSofiNCCLSpec(d.cdiRoot, d.driverName, d.cdiEnvConfig); err != nil {
 				return fmt.Errorf("writing CDI aws-ofi-nccl spec: %w", err)
 			}

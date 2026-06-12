@@ -10,24 +10,37 @@ import (
 	specs "tags.cncf.io/container-device-interface/specs-go"
 )
 
-// CDIEnvConfig holds configurable paths for environment CDI spec generation.
-// XpmemPath and GdrDrvPath default to the standard paths when empty.
+// MountSpec is one host→container bind mount in a CDI spec.
+type MountSpec struct {
+	HostPath      string `json:"hostPath"`
+	ContainerPath string `json:"containerPath"`
+}
+
+// CDIEnvConfig holds the paths and env vars that populate the env, NCCL, and
+// aws-ofi-nccl CDI specs. It is loaded from a JSON file at driver startup
+// (see LoadConfig) so paths can be updated without rebuilding the binary.
 type CDIEnvConfig struct {
-	LibfabricLib string // host path to libfabric.so.1; empty = skip mount
+	// EnvMounts is the library bind-mount list for the env spec. Each entry
+	// becomes one ro bind mount. Required when env CDI injection is enabled.
+	EnvMounts []MountSpec `json:"envMounts,omitempty"`
 
-	NCCLPrefix string // Spack NCCL install dir; empty = skip NCCL spec
+	// NCCLPrefix is the host path bind-mounted to /host/nccl in the NCCL
+	// spec. Empty disables the NCCL spec.
+	NCCLPrefix string `json:"ncclPrefix,omitempty"`
 
-	AWSofiNCCLPrefix string // Spack aws-ofi-nccl install dir; empty = skip OFI spec
-	HwlocLib         string
-	PciaccessLib     string
-	Libxml2Lib       string
-	LibatomicLib     string
-	LiblzmaLib       string
-	LibiconvLib      string
+	// AWSofiMounts is the bind-mount list for the aws-ofi-nccl spec
+	// (plugin .so, GDRCopy API, and Spack runtime dependency libs).
+	// Empty disables the aws-ofi-nccl spec.
+	AWSofiMounts []MountSpec `json:"awsOfiMounts,omitempty"`
 
-	// Optional path overrides for /dev/xpmem and /dev/gdrdrv; used in tests.
-	XpmemPath  string
-	GdrDrvPath string
+	// AWSofiEnv is the list of KEY=value env vars added to the
+	// aws-ofi-nccl spec (NCCL_NET, FI_CXI_*, etc).
+	AWSofiEnv []string `json:"awsOfiEnv,omitempty"`
+
+	// XpmemPath and GdrDrvPath override device-node host paths in tests;
+	// when empty the standard /dev/xpmem and /dev/gdrdrv are used.
+	XpmemPath  string `json:"-"`
+	GdrDrvPath string `json:"-"`
 }
 
 func EnvDeviceID(driverName string) string {
@@ -43,9 +56,9 @@ func AWSofiNCCLDeviceID(driverName string) string {
 }
 
 // WriteEnvSpec writes the shared CXI environment CDI spec containing device
-// nodes, library bind-mounts, and the ldcache hook that every CXI container
-// needs. xpmem and gdrdrv device nodes are included only when present on the
-// host; the libfabric mount is included only when LibfabricLib is non-empty.
+// nodes, library bind-mounts from cfg.EnvMounts, and the ldcache hook that
+// every CXI container needs. xpmem and gdrdrv device nodes are included only
+// when present on the host.
 func WriteEnvSpec(cdiRoot, driverName string, cfg CDIEnvConfig) error {
 	if err := os.MkdirAll(cdiRoot, 0o755); err != nil {
 		return err
@@ -74,53 +87,13 @@ func WriteEnvSpec(cdiRoot, driverName string, cfg CDIEnvConfig) error {
 			Options:       []string{"bind", "rw", "nosuid", "nodev", "private"},
 		},
 	}
-	if cfg.LibfabricLib != "" {
+	for _, m := range cfg.EnvMounts {
 		mounts = append(mounts, &specs.Mount{
-			HostPath:      cfg.LibfabricLib,
-			ContainerPath: "/usr/lib64/libfabric.so.1",
-			Options:       []string{"bind", "ro", "nosuid", "nodev", "private"},
-		})
-	}
-	for _, so := range []string{
-		"/usr/lib64/libcxi.so.1",
-		"/usr/lib64/libcurl.so.4",
-		"/usr/lib64/libjson-c.so.5",
-		"/usr/lib64/libatomic.so.1",
-		"/usr/lib64/libnl-3.so.200",
-		"/usr/lib64/libnghttp2.so.14",
-		"/usr/lib64/libidn2.so.0",
-		"/usr/lib64/libssh.so.4",
-		"/usr/lib64/libpsl.so.5",
-		"/usr/lib64/libssl.so.1.1",
-		"/usr/lib64/libcrypto.so.1.1",
-		"/usr/lib64/libgssapi_krb5.so.2",
-		"/usr/lib64/libldap_r-2.4.so.2",
-		"/usr/lib64/liblber-2.4.so.2",
-		"/usr/lib64/libzstd.so.1",
-		"/usr/lib64/libbrotlidec.so.1",
-		"/usr/lib64/libz.so.1",
-		"/usr/lib64/libunistring.so.2",
-		"/usr/lib64/libjitterentropy.so.3",
-		"/usr/lib64/libkrb5.so.3",
-		"/usr/lib64/libk5crypto.so.3",
-		"/lib64/libcom_err.so.2",
-		"/usr/lib64/libkrb5support.so.0",
-		"/usr/lib64/libsasl2.so.3",
-		"/usr/lib64/libbrotlicommon.so.1",
-		"/usr/lib64/libkeyutils.so.1",
-		"/usr/lib64/libpcre.so.1",
-	} {
-		mounts = append(mounts, &specs.Mount{
-			HostPath:      so,
-			ContainerPath: so,
+			HostPath:      m.HostPath,
+			ContainerPath: m.ContainerPath,
 			Options:       []string{"bind", "ro", "nosuid", "private"},
 		})
 	}
-	mounts = append(mounts, &specs.Mount{
-		HostPath:      "/opt/xpmem/lib64/libxpmem.so.0",
-		ContainerPath: "/usr/lib64/libxpmem.so.0",
-		Options:       []string{"bind", "ro", "nosuid", "private"},
-	})
 
 	spec := &specs.Spec{
 		Version: cdiVersion,
@@ -188,8 +161,8 @@ func removeSpec(path string) error {
 	return nil
 }
 
-// WriteNCCLSpec writes the NCCL CDI spec, mounting the whole NCCL Spack prefix
-// into /host/nccl so the container's ldcache can find the NCCL libraries.
+// WriteNCCLSpec writes the NCCL CDI spec, mounting cfg.NCCLPrefix into
+// /host/nccl so the container's ldcache can find the NCCL libraries.
 func WriteNCCLSpec(cdiRoot, driverName string, cfg CDIEnvConfig) error {
 	if err := os.MkdirAll(cdiRoot, 0o755); err != nil {
 		return err
@@ -225,44 +198,19 @@ func RemoveNCCLSpec(cdiRoot, driverName string) error {
 	return removeSpec(filepath.Join(cdiRoot, driverName+"-nccl.json"))
 }
 
-// WriteAWSofiNCCLSpec writes the AWS OFI NCCL CDI spec, mounting the plugin
-// library, GDRCopy API library, Spack dependency libs, and setting the
-// libfabric/NCCL tuning env vars used on Isambard.
+// WriteAWSofiNCCLSpec writes the AWS OFI NCCL CDI spec, bind-mounting the
+// plugin library, GDRCopy API library, and Spack dependency libs from
+// cfg.AWSofiMounts, and setting the env vars from cfg.AWSofiEnv.
 func WriteAWSofiNCCLSpec(cdiRoot, driverName string, cfg CDIEnvConfig) error {
 	if err := os.MkdirAll(cdiRoot, 0o755); err != nil {
 		return err
 	}
 
-	mounts := []*specs.Mount{
-		{
-			HostPath:      cfg.AWSofiNCCLPrefix + "/lib/libnccl-net.so",
-			ContainerPath: "/usr/lib/libnccl-net.so",
-			Options:       []string{"bind", "ro", "nosuid", "nodev", "private"},
-		},
-		{
-			HostPath:      "/usr/lib64/libgdrapi.so.2.5",
-			ContainerPath: "/usr/lib/libgdrapi.so",
-			Options:       []string{"bind", "ro", "nosuid", "nodev", "private"},
-		},
-	}
-
-	for _, dep := range []struct {
-		hostPath string
-		soName   string
-	}{
-		{cfg.HwlocLib, "libhwloc.so.15"},
-		{cfg.PciaccessLib, "libpciaccess.so.0"},
-		{cfg.Libxml2Lib, "libxml2.so.2"},
-		{cfg.LibatomicLib, "libatomic.so.1"},
-		{cfg.LiblzmaLib, "liblzma.so.5"},
-		{cfg.LibiconvLib, "libiconv.so.2"},
-	} {
-		if dep.hostPath == "" {
-			continue
-		}
+	mounts := make([]*specs.Mount, 0, len(cfg.AWSofiMounts))
+	for _, m := range cfg.AWSofiMounts {
 		mounts = append(mounts, &specs.Mount{
-			HostPath:      dep.hostPath,
-			ContainerPath: "/usr/lib/" + dep.soName,
+			HostPath:      m.HostPath,
+			ContainerPath: m.ContainerPath,
 			Options:       []string{"bind", "ro", "nosuid", "nodev", "private"},
 		})
 	}
@@ -273,26 +221,7 @@ func WriteAWSofiNCCLSpec(cdiRoot, driverName string, cfg CDIEnvConfig) error {
 		Devices: []specs.Device{{
 			Name: "aws-ofi-nccl",
 			ContainerEdits: specs.ContainerEdits{
-				Env: []string{
-					"NCCL_NET=AWS Libfabric",
-					"NCCL_CROSS_NIC=1",
-					"NCCL_NET_GDR_LEVEL=PHB",
-					"NCCL_SOCKET_IFNAME=hsn",
-					"NCCL_MIN_NCHANNELS=4",
-					"NCCL_GDRCOPY_ENABLE=1",
-					"NCCL_NET_FORCE_FLUSH=0",
-					"FI_MR_CACHE_MONITOR=userfaultfd",
-					"FI_CXI_DISABLE_HOST_REGISTER=1",
-					"FI_HMEM_CUDA_USE_GDRCOPY=1",
-					"FI_CXI_DEFAULT_CQ_SIZE=131072",
-					"FI_CXI_DEFAULT_TX_SIZE=2048",
-					"FI_CXI_RDZV_PROTO=alt_read",
-					"FI_CXI_RDZV_THRESHOLD=0",
-					"FI_CXI_RDZV_GET_MIN=0",
-					"FI_CXI_RDZV_EAGER_SIZE=0",
-					"FI_CXI_DISABLE_NON_INJECT_MSG_IDC=1",
-					"FI_CXI_RX_MATCH_MODE=hybrid",
-				},
+				Env:    append([]string(nil), cfg.AWSofiEnv...),
 				Mounts: mounts,
 				Hooks:  []*specs.Hook{ldcacheHook("/usr/lib", "/usr/lib64")},
 			},

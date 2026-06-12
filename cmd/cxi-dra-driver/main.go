@@ -51,19 +51,12 @@ func main() {
 		reservedLEPools  = flag.Int64("reserved-le-pools", 0, "LE pools reserved by pre-existing system services (1 pool = 1024 LEs)")
 		reservedTLEPools = flag.Int64("reserved-tle-pools", 0, "TLE pools reserved by pre-existing system services (1 pool = 512 TLEs)")
 
-		// CDI env spec configuration — all optional; empty disables the corresponding mount/spec.
-		// Set --enable-cdi-env to activate env/nccl/ofi CDI spec writing and pod injection.
-		enableCDIEnv          = flag.Bool("enable-cdi-env", false, "Write env/nccl/ofi CDI specs and inject their device IDs into pods")
-		containerdConfigPath  = flag.String("containerd-config-path", "", "Path to write the containerd CDI config drop-in; empty disables")
-		libfabricLib     = flag.String("libfabric-lib", "", "Host path to libfabric.so.1 (versioned Spack path)")
-		ncclPrefix       = flag.String("nccl-prefix", "", "Spack NCCL install prefix; empty disables NCCL CDI spec")
-		awsOfiNCCLPrefix = flag.String("aws-ofi-nccl-prefix", "", "Spack aws-ofi-nccl install prefix; empty disables OFI CDI spec")
-		hwlocLib         = flag.String("hwloc-lib", "", "Host path to libhwloc.so.15 (for aws-ofi-nccl)")
-		pciaccessLib     = flag.String("pciaccess-lib", "", "Host path to libpciaccess.so.0 (for aws-ofi-nccl)")
-		libxml2Lib       = flag.String("libxml2-lib", "", "Host path to libxml2.so.2 (for aws-ofi-nccl)")
-		libatomicLib     = flag.String("libatomic-lib", "", "Host path to libatomic.so.1 (for aws-ofi-nccl)")
-		liblzmaLib       = flag.String("liblzma-lib", "", "Host path to liblzma.so.5 (for aws-ofi-nccl)")
-		libiconvLib      = flag.String("libiconv-lib", "", "Host path to libiconv.so.2 (for aws-ofi-nccl)")
+		// CDI env spec configuration. When --enable-cdi-env is true, --env-config
+		// must point to a JSON file (typically mounted from a ConfigMap) that
+		// lists the library bind-mounts and env vars for the env/nccl/ofi specs.
+		enableCDIEnv         = flag.Bool("enable-cdi-env", false, "Write env/nccl/ofi CDI specs and inject their device IDs into pods")
+		containerdConfigPath = flag.String("containerd-config-path", "", "Path to write the containerd CDI config drop-in; empty disables")
+		envConfigPath        = flag.String("env-config", "", "Path to the JSON CDI env config file (required when --enable-cdi-env)")
 	)
 	flag.Parse()
 
@@ -105,30 +98,33 @@ func main() {
 		mockDevList = cxi.MockDevices(*mockDevices)
 	}
 
+	var envConfig cdi.CDIEnvConfig
+	if *enableCDIEnv {
+		if *envConfigPath == "" {
+			fmt.Fprintln(os.Stderr, "error: --env-config is required when --enable-cdi-env is set")
+			os.Exit(1)
+		}
+		envConfig, err = cdi.LoadConfig(*envConfigPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
+	}
+
 	d := driver.New(driver.Config{
-		NodeName:        *nodeName,
-		PodUID:          *podUID,
-		DriverName:      *driverName,
-		CDIRoot:         *cdiRoot,
-		PluginDir:       *pluginDir,
-		RegistrarDir:    *registrarDir,
-		KubeClient:      kubeClient,
-		MockDevices:     mockDevList,
-		Overhead:        overhead,
-		RefreshInterval: *refreshInterval,
+		NodeName:             *nodeName,
+		PodUID:               *podUID,
+		DriverName:           *driverName,
+		CDIRoot:              *cdiRoot,
+		PluginDir:            *pluginDir,
+		RegistrarDir:         *registrarDir,
+		KubeClient:           kubeClient,
+		MockDevices:          mockDevList,
+		Overhead:             overhead,
+		RefreshInterval:      *refreshInterval,
 		EnableCDIEnv:         *enableCDIEnv,
 		ContainerdConfigPath: *containerdConfigPath,
-		CDIEnvConfig: cdi.CDIEnvConfig{
-			LibfabricLib:     *libfabricLib,
-			NCCLPrefix:       *ncclPrefix,
-			AWSofiNCCLPrefix: *awsOfiNCCLPrefix,
-			HwlocLib:         *hwlocLib,
-			PciaccessLib:     *pciaccessLib,
-			Libxml2Lib:       *libxml2Lib,
-			LibatomicLib:     *libatomicLib,
-			LiblzmaLib:       *liblzmaLib,
-			LibiconvLib:      *libiconvLib,
-		},
+		CDIEnvConfig:         envConfig,
 	})
 
 	// Start the cluster-wide namespace→VNI allocator if a VNI range is
