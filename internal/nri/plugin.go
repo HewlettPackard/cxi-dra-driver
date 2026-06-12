@@ -7,6 +7,7 @@ import (
 	"os"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/containerd/nri/pkg/api"
 	"github.com/containerd/nri/pkg/stub"
@@ -98,11 +99,31 @@ func New(
 }
 
 // Run starts the NRI plugin and blocks until ctx is cancelled.
+// If containerd closes the NRI connection (e.g. during its own restart or a
+// transient handshake failure), the stub is reconnected with exponential
+// backoff. The NRI stub explicitly supports being restarted via Run()/Start().
 func (p *Plugin) Run(ctx context.Context) error {
-	if err := p.stub.Run(ctx); err != nil {
-		return fmt.Errorf("NRI plugin exited: %w", err)
+	const maxBackoff = 30 * time.Second
+	backoff := time.Second
+	for {
+		if err := p.stub.Run(ctx); err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			fmt.Printf("cxi-nri: NRI disconnected (%v), reconnecting in %s\n", err, backoff)
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-time.After(backoff):
+			}
+			backoff *= 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+			continue
+		}
+		return nil
 	}
-	return nil
 }
 
 // getDeviceLock returns the per-device mutex, creating it if needed.
