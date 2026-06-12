@@ -58,9 +58,9 @@ type Plugin struct {
 // can immediately re-evaluate claims waiting in Ready=False.
 //
 // onOccupancyFreed(namespace, deviceName) is called for each (ns, device)
-// pair after a successful DestroyService so the driver decrements its
-// per-namespace device-occupancy counter. The ClaimBinder uses this counter
-// to enforce SHS14's per-device VNI uniqueness constraint: two claims from
+// pair after a successful DestroyService so the driver releases its
+// per-namespace device-occupancy slot. The ClaimBinder uses this slot to
+// enforce SHS14's per-device VNI uniqueness constraint: two claims from
 // the same namespace cannot co-locate on the same device. See the
 // nsDeviceOccupancy field on Driver for details.
 func New(
@@ -278,7 +278,11 @@ func (p *Plugin) StopPodSandbox(_ context.Context, pod *api.PodSandbox) error {
 		// service may indicate the kernel state diverged from our records,
 		// but holding the occupancy slot forever would permanently bar the
 		// namespace from this device on this driver process. NRI is the
-		// sole decrement point — see Driver.RemoveOccupancy.
+		// hot path; the ClaimBinder watch (on Allocation=nil or claim
+		// delete) and the driver's polling reconciler cover the
+		// scheduler-side and hardware-drift cases respectively — see
+		// Driver.RemoveOccupancy, RemoveOccupancyForClaim, and
+		// reconcileOccupancyFromHardware.
 		p.onOccupancyFreed(pod.GetNamespace(), alloc.DeviceName)
 	}
 

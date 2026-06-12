@@ -262,6 +262,55 @@ static int cxi_delete_service(const char *device, uint64_t netns_inode)
     cxil_close_device(dev);
     return rc;
 }
+
+// cxi_list_service_vnis enumerates every service on the device and writes
+// each service's assigned VNI into out[0..*count). SHS14 stores one VNI per
+// service (vni_min == vni_max under our create path, see cxi_create_service),
+// so vni_min is the canonical value. Services without a VNI restriction
+// (system services, services created outside DRA without
+// cxil_svc_set_vni_range) return an error from cxil_svc_get_vni_range and
+// are silently skipped — the reconciler doesn't track them.
+//
+// out must point to a caller-allocated buffer of at least max_out elements.
+// On success *count is the number of entries actually written (always
+// <= max_out). The DRA reconciler caps max_out at 1024 which is far above
+// the kernel's per-device service ceiling.
+static int cxi_list_service_vnis(const char *device,
+                                  uint16_t *out, unsigned int max_out,
+                                  unsigned int *count)
+{
+    *count = 0;
+    struct cxil_dev *dev = NULL;
+    int dev_idx = device_index(device);
+    if (dev_idx < 0)
+        return -EINVAL;
+    int rc = cxil_open_device(dev_idx, &dev);
+    if (rc != 0) {
+        fprintf(stderr, "cxi_wrapper: cxil_open_device(%d) failed: %d\n", dev_idx, rc);
+        return rc;
+    }
+    struct cxil_svc_list *list = NULL;
+    rc = cxil_get_svc_list(dev, &list);
+    if (rc != 0) {
+        fprintf(stderr, "cxi_wrapper: cxil_get_svc_list failed: %d\n", rc);
+        cxil_close_device(dev);
+        return rc;
+    }
+    unsigned int written = 0;
+    for (unsigned int i = 0; i < list->count && written < max_out; i++) {
+        unsigned int svc_id = list->descs[i].svc_id;
+        uint16_t vmin = 0, vmax = 0;
+        if (cxil_svc_get_vni_range(dev, svc_id, &vmin, &vmax) != 0)
+            continue;
+        if (vmin == 0)
+            continue;
+        out[written++] = vmin;
+    }
+    *count = written;
+    cxil_free_svc_list(list);
+    cxil_close_device(dev);
+    return 0;
+}
 */
 import "C"
 import (
@@ -366,4 +415,45 @@ func (CXIServiceManager) DeleteService(deviceName string, netnsInode uint64) err
 			deviceName, netnsInode, int(rc))
 	}
 	return nil
+}
+
+// maxServicesPerDevice bounds the buffer readActiveServiceVNIs hands to the
+// C wrapper. The kernel's per-device service ceiling is a few hundred at
+// worst, so 1024 is safely above any realistic value while keeping the
+// per-call allocation tiny (2 KiB). If a future kernel ever exceeds this the
+// reconciler returns an error rather than silently truncating.
+const maxServicesPerDevice = 1024
+
+// readActiveServiceVNIs is the CGo-backed implementation of
+// ReadActiveServiceVNIs (see capacity_cgo.go). It calls into
+// cxi_list_service_vnis which wraps cxil_get_svc_list +
+// cxil_svc_get_vni_range. Each returned element is the VNI of one live
+// service on the device; the reconciler reverse-maps VNI → namespace via
+// the namespace annotation cache to figure out which (namespace, device)
+// occupancy slots correspond to real hardware state.
+func readActiveServiceVNIs(deviceName string) ([]uint16, error) {
+	cDev := C.CString(deviceName)
+	defer C.free(unsafe.Pointer(cDev))
+
+	buf := make([]C.uint16_t, maxServicesPerDevice)
+	var count C.uint
+	rc := C.cxi_list_service_vnis(
+		cDev,
+		(*C.uint16_t)(unsafe.Pointer(&buf[0])),
+		C.uint(maxServicesPerDevice),
+		&count,
+	)
+	if rc != 0 {
+		return nil, fmt.Errorf("cxi_list_service_vnis(%s) returned %d", deviceName, int(rc))
+	}
+	n := int(count)
+	if n > maxServicesPerDevice {
+		return nil, fmt.Errorf("cxi_list_service_vnis(%s) returned count=%d, exceeds buffer cap %d (raise maxServicesPerDevice)",
+			deviceName, n, maxServicesPerDevice)
+	}
+	out := make([]uint16, n)
+	for i := 0; i < n; i++ {
+		out[i] = uint16(buf[i])
+	}
+	return out, nil
 }

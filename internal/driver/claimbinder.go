@@ -166,7 +166,17 @@ func (b *ClaimBinder) runWatch(ctx context.Context, ticker *time.Ticker) error {
 func (b *ClaimBinder) evaluateClaim(ctx context.Context, claim *resourceapi.ResourceClaim) {
 	if claim.Status.Allocation == nil {
 		// Not yet allocated (or de-allocated) — clean up any stale state.
+		// Both pending and the (namespace, device) slot must be released
+		// here: the scheduler can clear Status.Allocation at any time
+		// (Unschedulable=True, PostFilter de-allocation, manual edit),
+		// and NRI's StopPodSandbox cannot be relied on to cover it —
+		// NRI may never have run if the pod hadn't been admitted yet.
+		// Without RemoveOccupancyForClaim the namespace would stay
+		// pinned to this device in active_namespaces and the CEL
+		// selector would keep excluding it, eventually pinning the
+		// namespace across every device on the node.
 		b.driver.RemovePending(claim.UID)
+		b.driver.RemoveOccupancyForClaim(claim.UID)
 		b.mu.Lock()
 		delete(b.falseClaims, claim.UID)
 		b.mu.Unlock()
@@ -284,7 +294,13 @@ func (b *ClaimBinder) evaluateClaim(ctx context.Context, claim *resourceapi.Reso
 }
 
 func (b *ClaimBinder) onClaimDeleted(claim *resourceapi.ResourceClaim) {
+	// Release pending and the (namespace, device) slot. A ResourceClaim
+	// can be deleted before NRI's StopPodSandbox fires (force-delete,
+	// pod never admitted, etc.), so the binder is the sole reliable
+	// cleanup path here. RemoveOccupancyForClaim is a no-op for claims
+	// that never held a slot.
 	b.driver.RemovePending(claim.UID)
+	b.driver.RemoveOccupancyForClaim(claim.UID)
 	b.mu.Lock()
 	delete(b.falseClaims, claim.UID)
 	b.mu.Unlock()
