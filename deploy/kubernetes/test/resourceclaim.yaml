@@ -18,6 +18,13 @@
 # LEs and TLEs are expressed as pool counts:
 #   le_pools:  1 pool = 1024 LEs
 #   tle_pools: 1 pool = 512  TLEs
+#
+# cdi_profiles is also required. It is the list of optional CDI specs that
+# get injected into the pod alongside the per-device node:
+#   "env"          — libcxi/libfabric and the rest of the userspace runtime
+#   "nccl"         — NCCL libraries from the configured Spack prefix
+#   "aws-ofi-nccl" — AWS-OFI NCCL plugin and tuning env vars
+# Use [] if the pod brings its own runtime libraries and only needs /dev/cxiN.
 ---
 # CXI quarter-device. Requests four LE pools (4096 LEs) and one TLE pool
 # (512 TLEs); set le_pools/tle_pools to 0 if your job does not use
@@ -47,8 +54,10 @@ spec:
               acs: 255
               le_pools: 4
               tle_pools: 1
+              cdi_profiles: ["env"]
 ---
-# CXI half-device. For bandwidth-intensive jobs needing more queues or LE pools.
+# CXI half-device with full NCCL + AWS-OFI runtime injected. For
+# bandwidth-intensive collective jobs.
 apiVersion: resource.k8s.io/v1
 kind: ResourceClaimTemplate
 metadata:
@@ -74,3 +83,33 @@ spec:
               acs: 511
               le_pools: 8
               tle_pools: 2
+              cdi_profiles: ["env", "nccl", "aws-ofi-nccl"]
+---
+# CXI quarter-device with NO injected runtime — only /dev/cxiN. Use when
+# the pod's container image already carries libfabric/libcxi.
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata:
+  name: cxi-quarter-bare
+  namespace: default
+spec:
+  spec:
+    devices:
+      requests:
+        - name: cxi
+          exactly:
+            deviceClassName: cxi-device
+      config:
+        - requests: ["cxi"]
+          opaque:
+            driver: cxi.slingshot.hpe.com
+            parameters:
+              txqs: 256
+              tgqs: 128
+              eqs: 511
+              cts: 511
+              ptes: 512
+              acs: 255
+              le_pools: 4
+              tle_pools: 1
+              cdi_profiles: []

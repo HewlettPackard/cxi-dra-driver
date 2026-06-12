@@ -347,7 +347,7 @@ func (b *ClaimBinder) findOurDevice(claim *resourceapi.ResourceClaim) (*resource
 		if alloc.Pool != b.nodeName {
 			continue
 		}
-		requested, err := b.driver.resolveResources(claim, alloc)
+		requested, _, err := b.driver.resolveClaim(claim, alloc)
 		if err != nil {
 			return nil, cxi.ResourceSet{}, fmt.Errorf("resolving resources: %w", err)
 		}
