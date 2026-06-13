@@ -77,7 +77,9 @@ type Driver struct {
 	// Used by the ClaimBinder to enforce the SHS14 per-device VNI
 	// uniqueness constraint: every claim in a namespace shares the
 	// namespace's VNI, and the kernel rejects two services with the same
-	// VNI on the same device with -EEXIST from cxil_svc_set_vni_range.
+	// VNI on the same device with -EEXIST from cxil_alloc_svc (the RX-
+	// profile vni_overlap_test rejects a second service whose VNI matches
+	// an existing one on the device).
 	// Also drives the active_namespaces ResourceSlice attribute that
 	// pre-filters scheduling via the admission-injected CEL selector — see
 	// activeNamespacesFor.
@@ -197,7 +199,8 @@ func (d *Driver) removeOccupancyLocked(namespace, deviceName string) bool {
 // NRI plugin in StopPodSandbox after a successful DestroyService: at that
 // point the kernel no longer holds the VNI on the device and another claim
 // in the same namespace can be placed here without triggering -EEXIST from
-// cxil_svc_set_vni_range.
+// cxil_alloc_svc (whose RX-profile vni_overlap_test would otherwise reject
+// the new service).
 //
 // Idempotent: calls for an unknown (namespace, deviceName) pair are no-ops,
 // so the path is safe if NRI fires StopPodSandbox twice for the same sandbox

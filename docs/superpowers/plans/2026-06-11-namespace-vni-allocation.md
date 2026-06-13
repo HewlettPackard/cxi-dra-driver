@@ -1,5 +1,17 @@
 # Namespace-Scoped VNI Allocation Implementation Plan
 
+> **STATUS: COMPLETED — DO NOT TREAT AS LIVE INSTRUCTIONS.** Implemented and
+> merged. Current behaviour: `internal/driver/vniallocator.go` runs a
+> leader-elected namespace controller that assigns one VNI per namespace via
+> the `cxi.slingshot.hpe.com/vni` annotation; `prepareClaim` reads that
+> annotation and programs the CXI service. Templates have been renamed
+> `cxi-quarter`/`cxi-half` → `cxi-small`/`cxi-medium`/`cxi-large`/`cxi-whole`
+> and now also carry the required `cdi_profiles` field. Retained for
+> historical reference; do not follow the checkboxes below as if they were
+> unfinished work.
+
+---
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Replace DRA-allocated VNIs (a ResourceSlice pool + per-pod `cxi-vni` ResourceClaim) with a controller that auto-assigns one unique VNI per namespace, written as a namespace annotation and read by the node driver at prepare time — so every pod in a namespace shares a VNI for RDMA while each pod still gets its own DRA-scheduled CXI device.

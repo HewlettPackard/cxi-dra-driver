@@ -1,5 +1,15 @@
 # CDI Environment Integration Implementation Plan
 
+> **STATUS: COMPLETED — DO NOT TREAT AS LIVE INSTRUCTIONS.** Implemented and
+> merged. Current behaviour: `internal/cdi/env.go` writes the env/NCCL/AWS-OFI
+> CDI specs; `internal/cdi/containerd.go` auto-writes the containerd drop-in;
+> `--enable-cdi-env=true` is set in the daemonset; the per-claim
+> `cdi_profiles` opaque field opts each claim into the desired profiles.
+> Retained for historical reference; do not follow the checkboxes below as
+> if they were unfinished work.
+
+---
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Expand the DRA driver's CDI spec generation to include the full CXI container environment — shared device nodes, library bind-mounts, and optional NCCL/AWS-OFI-NCCL support — using separate per-kind CDI spec files alongside the existing per-device specs.

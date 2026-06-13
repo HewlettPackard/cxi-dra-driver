@@ -127,8 +127,8 @@ func TestClaimBinder_EvaluateClaim_GrantsReady(t *testing.T) {
 // Two claims from the same namespace allocated to the same device: the first
 // gets Ready=True; the second must get Unschedulable=True with reason
 // NamespaceDeviceOccupied so the scheduler reallocates it elsewhere. SHS14
-// would reject the second cxil_svc_set_vni_range with -EEXIST since both
-// claims share the namespace's VNI.
+// would reject the second cxil_alloc_svc with -EEXIST (RX-profile
+// vni_overlap_test) since both claims share the namespace's VNI.
 func TestClaimBinder_EvaluateClaim_SameNsSameDeviceUnschedulable(t *testing.T) {
 	first := makeClaim("c1", "ns1", "first", "cxi0")
 	second := makeClaim("c2", "ns1", "second", "cxi0")

@@ -16,31 +16,27 @@
 # defaults. Claims without opaque config (or with any missing field) will
 # be rejected at prepare time with a clear error.
 #
-# Parameter reference (one sentence each):
-#   txqs      — Transmit command queues; allocate roughly one per CPU thread
-#               that will post sends concurrently (most single-process jobs
-#               need 2–4).
-#   tgqs      — Target (receive-side) command queues; same rule as txqs but
-#               for the receive path (typically half the txqs count).
-#   eqs       — Event queues used to collect completions and errors; the
-#               libfabric CXI provider needs ~4–8 internally, so 8 is the
-#               practical floor.
-#   cts       — Counting triggers used for barriers, AMO ordering, and as
-#               thresholds for triggered operations; NCCL / collective-heavy
-#               jobs need more (64–256), simple benchmarks need very few.
-#   ptes      — Portal table entries used for hardware tag-matching of
-#               incoming messages; 2–4 is enough for most single-endpoint
-#               jobs.
-#   acs       — Address contexts for memory protection / translation; almost
-#               all jobs need only 1–2 but a small number is harmless.
-#   le_pools  — List-entry pools (1 pool = 1024 LEs) used to buffer
-#               unexpected incoming messages in hardware; running out causes
-#               silent performance degradation via retransmits, so err on
-#               the side of more for large MPI jobs.
-#   tle_pools — Triggered list-entry pools (1 pool = 512 TLEs) for deferred
-#               (triggered) operations such as NCCL allreduce trees; the system
-#               services consume 8 TLEs internally so 1 full pool is unavailable
-#               on each device.
+# Parameter reference (concise — see README "Resource field reference" for
+# the source-grounded explanation of what each field actually controls):
+#   txqs      — Transmit command queues; the libfabric provider shares one
+#               per endpoint (control + TX context reuse the same CMDQ).
+#   tgqs      — Target (receive-side) command queues; same shared-per-endpoint
+#               model as txqs.
+#   eqs       — Hardware event queues; libfabric allocates 4 per endpoint
+#               (TX data, RX data, TX ctrl, TGT ctrl), so 8 is a safe floor.
+#   cts       — Hardware counters; only consumed when the application opens
+#               a libfabric counter (fi_cntr_open) — NCCL/MPI: 64–256,
+#               simple benchmarks: 0.
+#   ptes      — Portal table entries; 2 unconditional per endpoint (control +
+#               RX) plus memory regions / rendezvous / collectives on demand.
+#   acs       — Address contexts (memory protection / IOMMU); reused via the
+#               libfabric MR cache so typical jobs need only a few.
+#   le_pools  — List-entry pools (1 pool = 1024 LEs). 0 = use the shared
+#               default pool (best effort); >0 = reserve N pools exclusively
+#               for guaranteed capacity under contention.
+#   tle_pools — Triggered list-entry pools (1 pool = 512 TLEs). 0 = shared
+#               default; only triggered operations (NCCL allreduce trees,
+#               counter-triggered MPI collectives) consume TLEs.
 #
 # cdi_profiles — required list of optional CDI specs to inject into the pod
 #                alongside the per-device /dev/cxiN node:
@@ -50,9 +46,13 @@
 #   []             — no injection; use when the container image already
 #                    carries libfabric/libcxi (BYO runtime)
 #
-# Available resources on this hardware after system reservation:
+# Per-device resources visible to claims under the daemonset's current
+# --reserved-* policy (see deploy/kubernetes/daemonset.yaml):
 #   TXQs 1019 · TGQs 507 · EQs 2037 · CTs 2047 · PTEs 2036 · ACs 1018
 #   le_pools 14 (14336 LEs) · tle_pools 3 (1536 TLEs)
+# The --reserved-* flags are an operator policy intended to leave headroom
+# for pre-existing system services on the node. Adjust them in daemonset.yaml
+# if your node's actual system consumption differs.
 #
 ---
 # cxi-small — benchmarks, fi_pingpong, development, simple single-threaded tools.
@@ -142,7 +142,8 @@ spec:
               cdi_profiles: ["env", "nccl", "aws-ofi-nccl"]
 ---
 # cxi-whole — exclusive device access; for a single demanding workload that
-#             needs the full NIC (all remaining resources after system reservation).
+#             needs the full NIC (all resources remaining after the daemonset's
+#             --reserved-* policy).
 apiVersion: resource.k8s.io/v1
 kind: ResourceClaimTemplate
 metadata:

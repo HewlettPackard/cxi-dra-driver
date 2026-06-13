@@ -1,3 +1,12 @@
+> **STATUS: HISTORICAL — DO NOT TREAT AS LIVE INSTRUCTIONS.** This was the
+> very first PoC plan (a generic cluster-scoped DRA controller). The actual
+> driver is a per-node DaemonSet exposing node-local CXI devices with
+> namespace-scoped VNI allocation and CDI-based device injection. See
+> `README.md` and `dra-current-state.d2` for the current architecture.
+> Retained for project history only.
+
+---
+
 DRA Driver for Cluster-Wide Resources — Initial PoC Plan
 Goal
 Build a minimal DRA (Dynamic Resource Allocation) driver that exposes a finite pool of cluster-scoped resources (not tied to any specific node) via Kubernetes ResourceSlices. When a pod claims one of these resources, it's consumed from the entire cluster's pool, not just from the node the pod lands on.

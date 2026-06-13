@@ -17,7 +17,7 @@ Workload: {
     shape: sql_table
     type: "ResourceClaimTemplate"
     deviceClassName: "cxi-device"
-    shape_examples: "cxi-quarter / cxi-half"
+    shape_examples: "cxi-small / cxi-medium / cxi-large / cxi-whole"
     per_pod: "ephemeral claim per pod"
     note: "exactly one CXI claim per pod"
   }

@@ -25,7 +25,7 @@ Workload: {
     shape: sql_table
     type: "ResourceClaimTemplate"
     deviceClassName: "cxi-device"
-    shape_examples: "cxi-quarter / cxi-half"
+    shape_examples: "cxi-small / cxi-medium / cxi-large / cxi-whole"
     per_pod: "ephemeral claim per pod (one CXI, no VNI claim)"
   }
 
@@ -296,11 +296,12 @@ Container: {
 
   CDI Env Spec: {
     shape: sql_table
-    label: "□ CDI Env Spec (gated; not loading)"
-    impl: "internal/cdi/env.go"
-    flag: "--enable-cdi-env (default false)"
-    purpose: "injects FI_CXI_*, NCCL_*, AWSofiNCCL_* env"
-    status: "specs written but containerd registry not loading them"
+    label: "■ CDI Env Spec"
+    impl: "internal/cdi/env.go + internal/cdi/containerd.go"
+    flag: "--enable-cdi-env=true (set in daemonset)"
+    purpose: "injects libfabric/libcxi libs + optional NCCL/AWS-OFI-NCCL"
+    opt_in: "per-claim cdi_profiles: [env, nccl, aws-ofi-nccl]"
+    auto_configure: "writes /etc/containerd/conf.d/50-cxi-cdi.toml + SIGHUPs containerd at startup"
   }
 
   Pod Container: {

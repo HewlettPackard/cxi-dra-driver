@@ -52,8 +52,10 @@ import (
 //     same namespace is already pending or active on this device. SHS14
 //     enforces VNI uniqueness per device, and every claim in a namespace
 //     shares the namespace's VNI, so co-locating two claims from the same
-//     namespace on the same device would collide at cxil_svc_set_vni_range
-//     with -EEXIST. Setting Unschedulable forces the scheduler to retry on
+//     namespace on the same device would collide at cxil_alloc_svc with
+//     -EEXIST (the RX-profile vni_overlap_test rejects overlapping VNIs
+//     on the same device). Setting Unschedulable forces the scheduler to
+//     retry on
 //     a different device. (The ResourceSlice cannot express this constraint
 //     directly because it has no notion of per-namespace state.)
 //
@@ -245,8 +247,9 @@ func (b *ClaimBinder) evaluateClaim(ctx context.Context, claim *resourceapi.Reso
 
 	case occupied:
 		// Case 1: another claim from the same namespace already holds this
-		// device. SHS14 would reject the second cxil_svc_set_vni_range with
-		// -EEXIST. Tell the scheduler to put this claim on a different
+		// device. SHS14 would reject the second cxil_alloc_svc with
+		// -EEXIST (RX-profile vni_overlap_test). Tell the scheduler to put
+		// this claim on a different
 		// device. ResourceSlice has no per-namespace state, so we cannot
 		// steer scheduling via avail_* — Unschedulable is the only signal.
 		b.logf("Unschedulable: claim=%s/%s device=%s — namespace %s already holds this device",

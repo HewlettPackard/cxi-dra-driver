@@ -111,9 +111,12 @@ state and live hardware state.
       │                                between Ready=True and service create)    ││
       │  ═════════════════════════════════════════════════════════════════════   ││
       │                                                                          ││
-      │  cxil_svc_create / cxil_svc_set_vni_range / cxil_svc_enable             ││
-      │     ▲ SHS14 kernel rejects overlap with -EEXIST; the CEL selector +    ││
-      │       per-ns occupancy gate above prevents this from being hit          ││
+      │  cxil_alloc_svc (VNI in descriptor) → cxil_svc_enable(off) →            ││
+      │    cxil_svc_set_netns → cxil_svc_enable(on)                              ││
+      │     ▲ Kernel RX-profile vni_overlap_test rejects overlap on a device    ││
+      │       with -EEXIST; CEL selector + per-ns occupancy gate above prevent  ││
+      │       this from being hit. SHS14 requires the service to be disabled    ││
+      │       before cxil_svc_set_netns and re-enabled after.                   ││
       │                                                                          ││
       │  per-device mutex.Unlock()                                               ││
       │                                                                          ││

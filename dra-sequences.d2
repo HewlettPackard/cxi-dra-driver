@@ -92,7 +92,7 @@ pod_lifecycle: {
   nri
   cxi_svc
 
-  user -> apiserver: "kubectl apply -f pod.yaml\n(refs ResourceClaimTemplate cxi-quarter)"
+  user -> apiserver: "kubectl apply -f pod.yaml\n(refs ResourceClaimTemplate cxi-small)"
 
   apiserver -> admission: "ResourceClaim CREATE intercepted"
   admission -> admission: "CEL: inject opaque CXI config\n(all 8 fields present? injected if not)"
