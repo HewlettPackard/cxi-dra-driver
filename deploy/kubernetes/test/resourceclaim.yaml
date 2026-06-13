@@ -1,7 +1,7 @@
-# CXI ResourceClaimTemplates with explicit resource allocation.
+# CXI ResourceClaimTemplates — one per pod, four sizes.
 #
-# Each pod gets one ResourceClaim that allocates a single CXI device. The
-# fabric VNI is NOT part of the claim: it is assigned per-namespace by the
+# Each pod gets one ResourceClaim that allocates a single CXI NIC. The fabric
+# VNI is NOT part of the claim: it is assigned per-namespace by the
 # leader-elected namespace VNI allocator and read at prepare time, so every
 # pod in a namespace shares the namespace's VNI for RDMA.
 #
@@ -12,27 +12,55 @@
 # in a partially-allocated state, so the DRA Score plugin cannot hit the
 # "number of allocations N is smaller than number of claims" mismatch.
 #
-# All resource fields are required — the driver has no defaults. Claims
-# without opaque config will be rejected at prepare time with a clear error.
+# All resource fields PLUS cdi_profiles are required — the driver has no
+# defaults. Claims without opaque config (or with any missing field) will
+# be rejected at prepare time with a clear error.
 #
-# LEs and TLEs are expressed as pool counts:
-#   le_pools:  1 pool = 1024 LEs
-#   tle_pools: 1 pool = 512  TLEs
+# Parameter reference (one sentence each):
+#   txqs      — Transmit command queues; allocate roughly one per CPU thread
+#               that will post sends concurrently (most single-process jobs
+#               need 2–4).
+#   tgqs      — Target (receive-side) command queues; same rule as txqs but
+#               for the receive path (typically half the txqs count).
+#   eqs       — Event queues used to collect completions and errors; the
+#               libfabric CXI provider needs ~4–8 internally, so 8 is the
+#               practical floor.
+#   cts       — Counting triggers used for barriers, AMO ordering, and as
+#               thresholds for triggered operations; NCCL / collective-heavy
+#               jobs need more (64–256), simple benchmarks need very few.
+#   ptes      — Portal table entries used for hardware tag-matching of
+#               incoming messages; 2–4 is enough for most single-endpoint
+#               jobs.
+#   acs       — Address contexts for memory protection / translation; almost
+#               all jobs need only 1–2 but a small number is harmless.
+#   le_pools  — List-entry pools (1 pool = 1024 LEs) used to buffer
+#               unexpected incoming messages in hardware; running out causes
+#               silent performance degradation via retransmits, so err on
+#               the side of more for large MPI jobs.
+#   tle_pools — Triggered list-entry pools (1 pool = 512 TLEs) for deferred
+#               (triggered) operations such as NCCL allreduce trees; the system
+#               services consume 8 TLEs internally so 1 full pool is unavailable
+#               on each device.
 #
-# cdi_profiles is also required. It is the list of optional CDI specs that
-# get injected into the pod alongside the per-device node:
-#   "env"          — libcxi/libfabric and the rest of the userspace runtime
+# cdi_profiles — required list of optional CDI specs to inject into the pod
+#                alongside the per-device /dev/cxiN node:
+#   "env"          — libcxi / libfabric / userspace runtime libraries
 #   "nccl"         — NCCL libraries from the configured Spack prefix
 #   "aws-ofi-nccl" — AWS-OFI NCCL plugin and tuning env vars
-# Use [] if the pod brings its own runtime libraries and only needs /dev/cxiN.
+#   []             — no injection; use when the container image already
+#                    carries libfabric/libcxi (BYO runtime)
+#
+# Available resources on this hardware after system reservation:
+#   TXQs 1019 · TGQs 507 · EQs 2037 · CTs 2047 · PTEs 2036 · ACs 1018
+#   le_pools 14 (14336 LEs) · tle_pools 3 (1536 TLEs)
+#
 ---
-# CXI quarter-device. Requests four LE pools (4096 LEs) and one TLE pool
-# (512 TLEs); set le_pools/tle_pools to 0 if your job does not use
-# triggered operations.
+# cxi-small — benchmarks, fi_pingpong, development, simple single-threaded tools.
+# Injects libfabric/libcxi only; add nccl/aws-ofi-nccl if the workload needs them.
 apiVersion: resource.k8s.io/v1
 kind: ResourceClaimTemplate
 metadata:
-  name: cxi-quarter
+  name: cxi-small
   namespace: default
 spec:
   spec:
@@ -46,22 +74,21 @@ spec:
           opaque:
             driver: cxi.slingshot.hpe.com
             parameters:
-              txqs: 256
-              tgqs: 128
-              eqs: 511
-              cts: 511
-              ptes: 512
-              acs: 255
-              le_pools: 4
+              txqs: 4
+              tgqs: 2
+              eqs: 8
+              cts: 4
+              ptes: 4
+              acs: 2
+              le_pools: 1
               tle_pools: 1
               cdi_profiles: ["env"]
 ---
-# CXI half-device with full NCCL + AWS-OFI runtime injected. For
-# bandwidth-intensive collective jobs.
+# cxi-medium — standard MPI jobs, NCCL at moderate scale, typical HPC workloads.
 apiVersion: resource.k8s.io/v1
 kind: ResourceClaimTemplate
 metadata:
-  name: cxi-half
+  name: cxi-medium
   namespace: default
 spec:
   spec:
@@ -75,22 +102,51 @@ spec:
           opaque:
             driver: cxi.slingshot.hpe.com
             parameters:
-              txqs: 512
-              tgqs: 256
-              eqs: 1023
-              cts: 1023
-              ptes: 1024
-              acs: 511
-              le_pools: 8
+              txqs: 16
+              tgqs: 8
+              eqs: 32
+              cts: 32
+              ptes: 16
+              acs: 8
+              le_pools: 2
+              tle_pools: 1
+              cdi_profiles: ["env", "nccl", "aws-ofi-nccl"]
+---
+# cxi-large — multi-threaded MPI, NCCL at scale, collectives-heavy workloads,
+#             or jobs that generate many concurrent unexpected messages.
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata:
+  name: cxi-large
+  namespace: default
+spec:
+  spec:
+    devices:
+      requests:
+        - name: cxi
+          exactly:
+            deviceClassName: cxi-device
+      config:
+        - requests: ["cxi"]
+          opaque:
+            driver: cxi.slingshot.hpe.com
+            parameters:
+              txqs: 64
+              tgqs: 32
+              eqs: 128
+              cts: 256
+              ptes: 64
+              acs: 32
+              le_pools: 4
               tle_pools: 2
               cdi_profiles: ["env", "nccl", "aws-ofi-nccl"]
 ---
-# CXI quarter-device with NO injected runtime — only /dev/cxiN. Use when
-# the pod's container image already carries libfabric/libcxi.
+# cxi-whole — exclusive device access; for a single demanding workload that
+#             needs the full NIC (all remaining resources after system reservation).
 apiVersion: resource.k8s.io/v1
 kind: ResourceClaimTemplate
 metadata:
-  name: cxi-quarter-bare
+  name: cxi-whole
   namespace: default
 spec:
   spec:
@@ -104,12 +160,12 @@ spec:
           opaque:
             driver: cxi.slingshot.hpe.com
             parameters:
-              txqs: 256
-              tgqs: 128
-              eqs: 511
-              cts: 511
-              ptes: 512
-              acs: 255
-              le_pools: 4
-              tle_pools: 1
-              cdi_profiles: []
+              txqs: 1019
+              tgqs: 507
+              eqs: 2037
+              cts: 2047
+              ptes: 2036
+              acs: 1018
+              le_pools: 14
+              tle_pools: 3
+              cdi_profiles: ["env", "nccl", "aws-ofi-nccl"]

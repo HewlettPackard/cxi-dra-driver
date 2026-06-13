@@ -1,102 +1,83 @@
-# Phase 3 test: 24-pod ReplicaSet exhausting all device capacity on both nodes.
+# 8-pod ReplicaSet pinned to two nodes — exercises BindingConditions gating
+# and Unschedulable compaction at full device capacity.
 #
-# With 4 CXI devices per node × 2 nodes and 3 cxi-quarter slots per device,
-# total capacity is 4 × 3 × 2 = 24 pods. This ReplicaSet exercises the full
-# BindingConditions gating path:
+# 2 nodes × 4 CXI devices × 4 cxi-small slots = 8 pods capacity
+# (One pod per namespace per device)
 #
-#  1. The DRA scheduler allocates all 24 claims (possibly concentrating on fewer
-#     devices due to alphabetical first-fit).
-#  2. The ClaimBinder evaluates each claim. For each device it grants Ready=True
-#     to the first 3 claims (3 × 512 TLEs = 1536 = ReadAvailableCapacity on a
-#     fresh device), deferring the rest to falseClaims.
-#  3. Over-concentrated claims (>3 per device) receive Unschedulable=True; the
-#     scheduler deallocates the single CXI claim and retries on a less-loaded
-#     device — correctly converging to 3 per device. There is no second claim
-#     to leave partially allocated because VNI is namespace-scoped (assigned
-#     once by the namespace allocator, not part of the claim).
-#  4. As pods finish, StopPodSandbox deletes services and fires TriggerRetry(),
-#     unblocking the next wave of deferred pods.
+# Each pod uses the single-CXI cxi-small template. The fabric VNI is
+# namespace-scoped (assigned once by the namespace VNI allocator) and read at
+# prepare time, so it is not part of the claim. This one-claim-per-pod model
+# is what lets Unschedulable compaction work cleanly: when the ClaimBinder
+# sets Unschedulable=True on an over-subscribed device, the scheduler
+# deallocates the single CXI claim and retries on a less-loaded device — no
+# second claim is left in a partial-allocation state, so the DRA Score
+# plugin cannot hit the "N allocations < N claims" mismatch.
 #
-# Expected observation:
-#   kubectl get pods -l app=cxi-phase3-test
-#   → 24 Running after at most a few Unschedulable compaction cycles.
-#
-# Check which device each pod is using:
-#
-#   kubectl get resourceclaims -o wide
-#   kubectl describe pods -l app=cxi-phase3-test | grep "SLINGSHOT_"
+# Library injection is handled entirely by CDI (cdi_profiles: ["env"] on the
+# cxi-small template injects libfabric, libcxi, libxpmem + transitive deps
+# and updates ld.so.cache). NRI injects SLINGSHOT_DEVICES/VNIS/SVC_IDS env
+# vars. The only hostPath here is the patched libfabric install carrying the
+# fi_* binaries — its /fi/lib/libfabric.so.1 is the same build CDI injects
+# at /usr/lib64/libfabric.so.1, so there is no ABI drift.
 #
 # Apply pre-requisites first:
 #   kubectl apply -f deploy/kubernetes/test/resourceclaim.yaml
 #
-# To clean up: kubectl delete replicaset cxi-phase3-test
+# Inspect placement:
+#   kubectl get pods -l app=cxi-2node-test -o wide
+#   kubectl get resourceclaims -o wide
+#
+# To switch nodes, edit the values under nodeAffinity below.
+# To clean up: kubectl delete replicaset cxi-2node-test
 ---
 apiVersion: apps/v1
 kind: ReplicaSet
 metadata:
-  name: cxi-phase3-test
+  name: cxi-2node-test
   namespace: default
 spec:
-  replicas: 24
+  replicas: 8
   selector:
     matchLabels:
-      app: cxi-phase3-test
+      app: cxi-2node-test
   template:
     metadata:
       labels:
-        app: cxi-phase3-test
+        app: cxi-2node-test
     spec:
       restartPolicy: Always
 
-      # Single CXI device claim — the fabric VNI is namespace-scoped (assigned
-      # by the namespace VNI allocator) and read at prepare time, not part of
-      # the claim.
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: In
+                    values:
+                      - nid001006
+                      - nid001005
+
       resourceClaims:
         - name: cxi
-          resourceClaimTemplateName: cxi-quarter
+          resourceClaimTemplateName: cxi-small
+
       containers:
         - name: workload
           image: ubuntu:24.04
-          command: ["sh", "-c"]
-          args:
-            - |
-              echo "=== CXI devices ==="
-              ls -la /dev/cxi* || echo "none"
-              echo "=== CXI service files (from NRI plugin) ==="
-              ls -la /run/cxi/ || echo "none"
-              cat /run/cxi/cxi0-service.yaml 2>/dev/null || echo "no service file for cxi0"
-              echo "=== libfabric providers ==="
-              /extras/bin/fi_info --provider cxi 2>&1 || echo "fi_info not found or no CXI provider"
-              sleep 3600
+          command: ["sleep", "3600"]
           resources:
             claims:
               - name: cxi
           env:
-            - name: LD_LIBRARY_PATH      
-              value: "/usr/lib64/:/extras/lib/:/hostlibs:/xpmem/lib64"
-            - name: CXIP_DEFAULT_LINK
-              value: "1"
-            - name: CXIP_DEFAULT_SPEED
-              value: "200000"
-            - name: CXIP_SKIP_AMA_CHECK
-              value: "1"
+            - name: PATH
+              value: "/fi/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
           volumeMounts:
-            - name: libcxi
-              mountPath: /hostlibs
-            - name: build
-              mountPath: /extras
-            - name: xpmem
-              mountPath: /xpmem/lib64
+            - name: fi-install
+              mountPath: /fi
+
       volumes:
-        - name: libcxi
+        - name: fi-install
           hostPath:
-            path: /usr/lib64/
-            type: Directory
-        - name: xpmem
-          hostPath:
-            path: /opt/xpmem/lib64
-            type: Directory
-        - name: build
-          hostPath:
-            path: /home/brics/jwatson.brics/k8s-on-compute/shs-libfabric/build-output
+            path: /home/vendor/pirese.vendor/source/libfabric/install
             type: Directory

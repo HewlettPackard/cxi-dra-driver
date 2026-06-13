@@ -129,9 +129,9 @@ metadata:
 EOF
 }
 
-# Deploy a CXI ResourceClaimTemplate + Pod into NS using the cxi-quarter shape.
+# Deploy a CXI ResourceClaimTemplate + Pod into NS using the cxi-small shape.
 make_cxi_pod() {
-  local ns="$1" pod="$2" claim_template="cxi-quarter"
+  local ns="$1" pod="$2" claim_template="cxi-small"
   kubectl apply -n "${ns}" -f - <<EOF >/dev/null
 apiVersion: resource.k8s.io/v1
 kind: ResourceClaimTemplate
@@ -150,14 +150,15 @@ spec:
           opaque:
             driver: ${DRIVER}
             parameters:
-              txqs: 256
-              tgqs: 128
-              eqs: 511
-              cts: 511
-              ptes: 512
-              acs: 255
-              le_pools: 4
+              txqs: 4
+              tgqs: 2
+              eqs: 8
+              cts: 4
+              ptes: 4
+              acs: 2
+              le_pools: 1
               tle_pools: 1
+              cdi_profiles: []
 ---
 apiVersion: v1
 kind: Pod

@@ -1,3 +1,24 @@
+# Single-pod smoke test for a cxi-small claim.
+#
+# Library injection is handled entirely by CDI (cdi_profiles: ["env"] on the
+# cxi-small template injects libfabric, libcxi, libxpmem + transitive deps
+# and updates ld.so.cache). NRI injects SLINGSHOT_DEVICES/VNIS/SVC_IDS env
+# vars. The only hostPath here is the patched libfabric install carrying the
+# fi_* binaries — its /fi/lib/libfabric.so.1 is the same build CDI injects
+# at /usr/lib64/libfabric.so.1, so there is no ABI drift.
+#
+# Apply pre-requisites first:
+#   kubectl apply -f deploy/kubernetes/test/resourceclaim.yaml
+#
+# Useful diagnostics once the pod is Running:
+#   kubectl exec cxi-test-3 -- ls -la /dev/cxi*
+#   kubectl exec cxi-test-3 -- env | grep -E 'SLINGSHOT|FI_'
+#   kubectl exec cxi-test-3 -- fi_info --provider cxi
+#   kubectl exec cxi-test-3 -- ldd /fi/bin/fi_pingpong | grep -E 'libfabric|libcxi'
+#
+# Cleanup:
+#   kubectl delete pod cxi-test-3
+---
 apiVersion: v1
 kind: Pod
 metadata:
@@ -6,57 +27,26 @@ metadata:
 spec:
   restartPolicy: Never
 
-  # Single CXI device claim — the fabric VNI is namespace-scoped (assigned
-  # by the namespace VNI allocator) and read at prepare time, not part of
-  # the claim.
   resourceClaims:
     - name: cxi
-      resourceClaimTemplateName: cxi-quarter
+      resourceClaimTemplateName: cxi-small
 
   containers:
     - name: workload
       image: ubuntu:24.04
-      command: ["sh", "-c"]
-      args:
-        - |
-          echo "=== CXI devices ==="
-          ls -la /dev/cxi* || echo "none"
-          echo "=== CXI service files (from NRI plugin) ==="
-          ls -la /run/cxi/ || echo "none"
-          cat /run/cxi/cxi0-service.yaml 2>/dev/null || echo "no service file for cxi0"
-          echo "=== libfabric providers ==="
-          /extras/bin/fi_info --provider cxi 2>&1 || echo "fi_info not found or no CXI provider"
-          sleep 3600
+      command: ["sleep", "3600"]
       resources:
         claims:
           - name: cxi
       env:
-        - name: LD_LIBRARY_PATH      
-          value: "/usr/lib64/:/extras/lib/:/hostlibs:/xpmem/lib64"
-        - name: CXIP_DEFAULT_LINK
-          value: "1"
-        - name: CXIP_DEFAULT_SPEED
-          value: "200000"
-        - name: CXIP_SKIP_AMA_CHECK
-          value: "1"
+        - name: PATH
+          value: "/fi/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
       volumeMounts:
-        - name: libcxi
-          mountPath: /hostlibs
-        - name: build
-          mountPath: /extras
-        - name: xpmem
-          mountPath: /xpmem/lib64
-  volumes:
-    - name: libcxi
-      hostPath:
-        path: /usr/lib64/
-        type: Directory
-    - name: xpmem
-      hostPath:
-        path: /opt/xpmem/lib64
-        type: Directory
-    - name: build
-      hostPath:
-        path: /home/brics/jwatson.brics/k8s-on-compute/shs-libfabric/build-output
-        type: Directory
+        - name: fi-install
+          mountPath: /fi
 
+  volumes:
+    - name: fi-install
+      hostPath:
+        path: /home/vendor/pirese.vendor/source/libfabric/install
+        type: Directory

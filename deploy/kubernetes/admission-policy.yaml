@@ -41,7 +41,8 @@ spec:
     # for selector injection to target the right request. With the namespace-
     # scoped VNI model, claims now carry a single CXI-only request — this
     # condition still tolerates >1 requests for forward compatibility, but the
-    # supported templates (cxi-quarter, cxi-half) are single-request.
+    # supported templates (cxi-small, cxi-medium, cxi-large, cxi-whole) are
+    # single-request.
     - name: has-requests
       expression: >
         object.spec.devices.requests.size() >= 1
