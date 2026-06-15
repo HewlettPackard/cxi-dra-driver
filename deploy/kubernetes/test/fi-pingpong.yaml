@@ -79,7 +79,9 @@ spec:
           topologyKey: kubernetes.io/hostname
 
   resourceClaims:
-    - name: cxi
+    - name: cxi-1
+      resourceClaimTemplateName: cxi-small
+    - name: cxi-2
       resourceClaimTemplateName: cxi-small
 
   containers:
@@ -88,7 +90,8 @@ spec:
       command: ["sleep", "infinity"]
       resources:
         claims:
-          - name: cxi
+          - name: cxi-1
+          - name: cxi-2
       env:
         - name: FI_PROVIDER
           value: "cxi"
@@ -123,7 +126,9 @@ spec:
           topologyKey: kubernetes.io/hostname
 
   resourceClaims:
-    - name: cxi
+    - name: cxi-1
+      resourceClaimTemplateName: cxi-small
+    - name: cxi-2
       resourceClaimTemplateName: cxi-small
 
   containers:
@@ -132,7 +137,8 @@ spec:
       command: ["sleep", "infinity"]
       resources:
         claims:
-          - name: cxi
+          - name: cxi-1
+          - name: cxi-2
       env:
         - name: FI_PROVIDER
           value: "cxi"

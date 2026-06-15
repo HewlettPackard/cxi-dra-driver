@@ -185,115 +185,131 @@ func (b *ClaimBinder) evaluateClaim(ctx context.Context, claim *resourceapi.Reso
 		return
 	}
 
-	result, requested, err := b.findOurDevice(claim)
+	devices, err := b.findOurDevices(claim)
 	if err != nil {
 		b.logf("warning: resolving device for claim %s/%s: %v", claim.Namespace, claim.Name, err)
 		return
 	}
-	if result == nil {
+	if len(devices) == 0 {
 		return // not our claim / not our node
 	}
 
-	// Already granted — pending entry exists, service not yet created.
-	if b.driver.hasPending(claim.UID) {
-		return
+	// Release any slot/pending this claim held for a device that is no longer
+	// in the current allocation (subset reallocation without an intervening
+	// Allocation=nil). Without this, the dropped device would leak in
+	// nsDeviceOccupancy and stay pinned to this namespace via active_namespaces.
+	currentDevs := make(map[string]bool, len(devices))
+	for _, dr := range devices {
+		currentDevs[dr.result.Device] = true
+	}
+	b.driver.reconcileClaimDevices(claim.UID, currentDevs)
+
+	// A claim with a count>1 request allocates several devices. The scheduler
+	// will not bind the pod until EVERY allocated device's Ready binding
+	// condition is True, so we must evaluate and set a condition for each one.
+	// anyPending tracks whether any device is waiting on capacity (Ready=False)
+	// so the claim stays in falseClaims for retry.
+	anyPending := false
+	for _, dr := range devices {
+		result, requested := dr.result, dr.requested
+
+		// Already granted — pending entry exists, service not yet created.
+		if b.driver.hasPending(claim.UID, result.Device) {
+			continue
+		}
+		// Already granted and service was created (or being torn down).
+		if cond := b.getCondition(claim, result, "Ready"); cond != nil && cond.Status == metav1.ConditionTrue {
+			continue
+		}
+
+		// Read hardware capacity outside the lock to avoid blocking the mutex
+		// during I/O. Do NOT subtract overhead — ReadAvailableCapacity already
+		// reflects all running service consumption including system services.
+		hwAvail, readErr := cxi.ReadAvailableCapacity(result.Device)
+		if readErr != nil {
+			// Skip this device this cycle; using zero capacity would
+			// incorrectly trigger Unschedulable for a transient read failure.
+			// Keep the claim in falseClaims so the device is retried.
+			b.logf("warning: reading capacity for %s: %v; skipping evaluation", result.Device, readErr)
+			anyPending = true
+			continue
+		}
+
+		// Four-way decision based on namespace occupancy and hardware capacity:
+		//
+		//  1. (namespace, device) is already occupied by another claim from this
+		//     namespace                                  → Unschedulable
+		//                                                 (NamespaceDeviceOccupied)
+		//  2. hwAvail − pendingSum  fits requested       → Ready=True  (grant)
+		//  3. hwAvail alone         fits requested       → Ready=False (pending
+		//                                                 blocking, retry)
+		//  4. hwAvail               can't fit alone      → Unschedulable
+		//                                                 (DeviceAtCapacity)
+		granted, occupied := b.driver.checkAndAddPending(
+			claim.UID, claim.Namespace, result.Device, requested, hwAvail,
+		)
+		switch {
+		case granted:
+			// Case 2: grant. Record in pending so subsequent claims on the same
+			// device see reduced capacity. checkAndAddPending already calls
+			// TriggerRepublish internally (covers both the avail_* decrement
+			// from the new pending entry and the active_namespaces addition
+			// from the 0→1 occupancy transition), so no explicit republish
+			// here.
+			b.logf("Ready=True: claim=%s/%s device=%s requested=(%s)",
+				claim.Namespace, claim.Name, result.Device, requested)
+			b.setCondition(ctx, claim, result, "Ready", metav1.ConditionTrue,
+				"DeviceCapacityAvailable",
+				fmt.Sprintf("requested resources (%s) fit within effective available capacity", requested))
+
+		case occupied:
+			// Case 1: another claim from the same namespace already holds this
+			// device. SHS14 would reject the second cxil_alloc_svc with
+			// -EEXIST (RX-profile vni_overlap_test). Tell the scheduler to put
+			// this claim on a different device. ResourceSlice has no
+			// per-namespace state, so we cannot steer scheduling via avail_* —
+			// Unschedulable is the only signal.
+			b.logf("Unschedulable: claim=%s/%s device=%s — namespace %s already holds this device",
+				claim.Namespace, claim.Name, result.Device, claim.Namespace)
+			b.setCondition(ctx, claim, result, "Unschedulable", metav1.ConditionTrue,
+				"NamespaceDeviceOccupied",
+				fmt.Sprintf("namespace %s already has another claim on device %s; the scheduler will reallocate to a different device (SHS14 enforces VNI uniqueness per device)",
+					claim.Namespace, result.Device))
+
+		case requested.Fits(hwAvail):
+			// Case 3: hardware would fit but in-flight pending grants are consuming
+			// the remaining capacity. Keep the claim in falseClaims for
+			// re-evaluation when TriggerRetry fires (after a pending service is
+			// actually created and RemovePending is called).
+			b.logf("Ready=False: claim=%s/%s device=%s requested=(%s)",
+				claim.Namespace, claim.Name, result.Device, requested)
+			b.setCondition(ctx, claim, result, "Ready", metav1.ConditionFalse,
+				"InsufficientCapacity",
+				fmt.Sprintf("requested resources (%s) do not fit after accounting for in-flight grants; waiting", requested))
+			anyPending = true
+
+		default:
+			// Case 4: hardware is truly at capacity — the request cannot fit even
+			// without counting any pending grants. Signal Unschedulable so the DRA
+			// scheduler deallocates this claim and retries on a different device.
+			b.logf("Unschedulable: claim=%s/%s device=%s requested=(%s) — device at capacity",
+				claim.Namespace, claim.Name, result.Device, requested)
+			b.setCondition(ctx, claim, result, "Unschedulable", metav1.ConditionTrue,
+				"DeviceAtCapacity",
+				fmt.Sprintf("device %s hardware capacity is exhausted; the scheduler will reallocate to a less-loaded device", result.Device))
+			// Republish so the updated avail_* (near zero for the full device)
+			// steers the retry allocation to a device with real capacity.
+			b.driver.TriggerRepublish()
+		}
 	}
 
-	// Already granted and service was created (or being torn down).
-	if cond := b.getCondition(claim, result, "Ready"); cond != nil && cond.Status == metav1.ConditionTrue {
-		return
-	}
-
-	// Read hardware capacity outside the lock to avoid blocking the mutex
-	// during I/O. Do NOT subtract overhead — ReadAvailableCapacity already
-	// reflects all running service consumption including system services.
-	hwAvail, readErr := cxi.ReadAvailableCapacity(result.Device)
-	if readErr != nil {
-		// Skip this evaluation cycle; using zero capacity would incorrectly
-		// trigger Unschedulable for a transient read failure.
-		b.logf("warning: reading capacity for %s: %v; skipping evaluation", result.Device, readErr)
-		return
-	}
-
-	// Four-way decision based on namespace occupancy and hardware capacity:
-	//
-	//  1. (namespace, device) is already occupied by another claim from this
-	//     namespace                                  → Unschedulable
-	//                                                 (NamespaceDeviceOccupied)
-	//  2. hwAvail − pendingSum  fits requested       → Ready=True  (grant)
-	//  3. hwAvail alone         fits requested       → Ready=False (pending
-	//                                                 blocking, retry)
-	//  4. hwAvail               can't fit alone      → Unschedulable
-	//                                                 (DeviceAtCapacity)
-	granted, occupied := b.driver.checkAndAddPending(
-		claim.UID, claim.Namespace, result.Device, requested, hwAvail,
-	)
-	switch {
-	case granted:
-		// Case 2: grant. Record in pending so subsequent claims on the same
-		// device see reduced capacity. checkAndAddPending already calls
-		// TriggerRepublish internally (covers both the avail_* decrement
-		// from the new pending entry and the active_namespaces addition
-		// from the 0→1 occupancy transition), so no explicit republish
-		// here.
-		b.logf("Ready=True: claim=%s/%s device=%s requested=(%s)",
-			claim.Namespace, claim.Name, result.Device, requested)
-		b.setCondition(ctx, claim, result, "Ready", metav1.ConditionTrue,
-			"DeviceCapacityAvailable",
-			fmt.Sprintf("requested resources (%s) fit within effective available capacity", requested))
-		b.mu.Lock()
-		delete(b.falseClaims, claim.UID)
-		b.mu.Unlock()
-
-	case occupied:
-		// Case 1: another claim from the same namespace already holds this
-		// device. SHS14 would reject the second cxil_alloc_svc with
-		// -EEXIST (RX-profile vni_overlap_test). Tell the scheduler to put
-		// this claim on a different
-		// device. ResourceSlice has no per-namespace state, so we cannot
-		// steer scheduling via avail_* — Unschedulable is the only signal.
-		b.logf("Unschedulable: claim=%s/%s device=%s — namespace %s already holds this device",
-			claim.Namespace, claim.Name, result.Device, claim.Namespace)
-		b.setCondition(ctx, claim, result, "Unschedulable", metav1.ConditionTrue,
-			"NamespaceDeviceOccupied",
-			fmt.Sprintf("namespace %s already has another claim on device %s; the scheduler will reallocate to a different device (SHS14 enforces VNI uniqueness per device)",
-				claim.Namespace, result.Device))
-		b.mu.Lock()
-		delete(b.falseClaims, claim.UID)
-		b.mu.Unlock()
-
-	case requested.Fits(hwAvail):
-		// Case 3: hardware would fit but in-flight pending grants are consuming
-		// the remaining capacity. Add to falseClaims for re-evaluation when
-		// TriggerRetry fires (after a pending service is actually created and
-		// RemovePending is called).
-		b.logf("Ready=False: claim=%s/%s device=%s requested=(%s)",
-			claim.Namespace, claim.Name, result.Device, requested)
-		b.setCondition(ctx, claim, result, "Ready", metav1.ConditionFalse,
-			"InsufficientCapacity",
-			fmt.Sprintf("requested resources (%s) do not fit after accounting for in-flight grants; waiting", requested))
-		b.mu.Lock()
+	b.mu.Lock()
+	if anyPending {
 		b.falseClaims[claim.UID] = claim
-		b.mu.Unlock()
-
-	default:
-		// Case 4: hardware is truly at capacity — the request cannot fit even
-		// without counting any pending grants. Signal Unschedulable so the DRA
-		// scheduler deallocates this (single, CXI-only) claim and retries on a
-		// different device. The VNI is namespace-scoped and not part of the
-		// claim, so there is no partial-allocation state on retry.
-		b.logf("Unschedulable: claim=%s/%s device=%s requested=(%s) — device at capacity",
-			claim.Namespace, claim.Name, result.Device, requested)
-		b.setCondition(ctx, claim, result, "Unschedulable", metav1.ConditionTrue,
-			"DeviceAtCapacity",
-			fmt.Sprintf("device %s hardware capacity is exhausted; the scheduler will reallocate to a less-loaded device", result.Device))
-		b.mu.Lock()
+	} else {
 		delete(b.falseClaims, claim.UID)
-		b.mu.Unlock()
-		// Republish so the updated avail_* (near zero for the full device)
-		// steers the retry allocation to a device with real capacity.
-		b.driver.TriggerRepublish()
 	}
+	b.mu.Unlock()
 }
 
 func (b *ClaimBinder) onClaimDeleted(claim *resourceapi.ResourceClaim) {
@@ -336,13 +352,22 @@ func (b *ClaimBinder) reEvaluateFalse(ctx context.Context) {
 	}
 }
 
-// findOurDevice returns the allocation result for a CXI device on this node
-// plus the parsed ResourceSet. Returns (nil, {}, nil) if the claim is not
-// ours or has no CXI device allocated on this node.
-func (b *ClaimBinder) findOurDevice(claim *resourceapi.ResourceClaim) (*resourceapi.DeviceRequestAllocationResult, cxi.ResourceSet, error) {
+// deviceRequest pairs one of our allocation results with its parsed
+// ResourceSet, so evaluateClaim can process each device a claim allocated.
+type deviceRequest struct {
+	result    *resourceapi.DeviceRequestAllocationResult
+	requested cxi.ResourceSet
+}
+
+// findOurDevices returns every allocation result for a CXI device on this node
+// (a count>1 request yields more than one) paired with its parsed ResourceSet.
+// Returns an empty slice if the claim is not ours or has no CXI device
+// allocated on this node.
+func (b *ClaimBinder) findOurDevices(claim *resourceapi.ResourceClaim) ([]deviceRequest, error) {
 	if claim.Status.Allocation == nil {
-		return nil, cxi.ResourceSet{}, nil
+		return nil, nil
 	}
+	var out []deviceRequest
 	for i, alloc := range claim.Status.Allocation.Devices.Results {
 		if alloc.Driver != b.driverName {
 			continue
@@ -352,11 +377,14 @@ func (b *ClaimBinder) findOurDevice(claim *resourceapi.ResourceClaim) (*resource
 		}
 		requested, _, err := b.driver.resolveClaim(claim, alloc)
 		if err != nil {
-			return nil, cxi.ResourceSet{}, fmt.Errorf("resolving resources: %w", err)
+			return nil, fmt.Errorf("resolving resources for device %s: %w", alloc.Device, err)
 		}
-		return &claim.Status.Allocation.Devices.Results[i], requested, nil
+		out = append(out, deviceRequest{
+			result:    &claim.Status.Allocation.Devices.Results[i],
+			requested: requested,
+		})
 	}
-	return nil, cxi.ResourceSet{}, nil
+	return out, nil
 }
 
 // getCondition returns the named condition from the claim's AllocatedDeviceStatus

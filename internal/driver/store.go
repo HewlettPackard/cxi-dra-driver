@@ -35,15 +35,38 @@ func NewAllocationStore() *AllocationStore {
 	}
 }
 
-// Set stores the allocations for a pod, replacing any previous entry. The input
-// slice is copied so later mutation of the caller's slice cannot alter the stored
-// allocation — prepareClaim reuses one slice across every pod sharing a claim.
+// Set merges allocs into the pod's stored allocation, keyed by device name:
+// a device already recorded for the pod is overwritten, new devices are
+// appended. This makes a pod that references more than one CXI claim
+// accumulate every claim's device(s) instead of the last writer silently
+// clobbering the earlier ones (each claim's prepare calls Set independently
+// for the same pod UID). Re-preparing the same claim is idempotent because the
+// device names match and overwrite in place.
+//
+// The input slice is not retained — entries are copied into the stored slice,
+// so later mutation of the caller's slice cannot alter the stored allocation
+// (prepareClaim reuses one slice across every pod sharing a claim).
 func (s *AllocationStore) Set(podUID types.UID, allocs []PodAllocation) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	stored := make([]PodAllocation, len(allocs))
-	copy(stored, allocs)
-	s.byPodUID[podUID] = stored
+	existing := s.byPodUID[podUID]
+	merged := make([]PodAllocation, len(existing))
+	copy(merged, existing)
+	for _, a := range allocs {
+		idx := -1
+		for i := range merged {
+			if merged[i].DeviceName == a.DeviceName {
+				idx = i
+				break
+			}
+		}
+		if idx >= 0 {
+			merged[idx] = a
+		} else {
+			merged = append(merged, a)
+		}
+	}
+	s.byPodUID[podUID] = merged
 }
 
 // SetClaimPods records that claimUID was reserved by podUID. Multiple calls

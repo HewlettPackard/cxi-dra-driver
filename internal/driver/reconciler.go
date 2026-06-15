@@ -145,7 +145,7 @@ func (d *Driver) applyReconcile(hwSet map[occupancyKey]struct{}) {
 	var toRemove []occupancyKey
 	for ns, devs := range d.nsDeviceOccupancy {
 		for devName, claimUID := range devs {
-			if _, inPending := d.pending[claimUID]; inPending {
+			if _, inPending := d.pending[pendingKey{claimUID: claimUID, deviceName: devName}]; inPending {
 				continue
 			}
 			if _, inHw := hwSet[occupancyKey{namespace: ns, deviceName: devName}]; inHw {
@@ -171,7 +171,7 @@ func (d *Driver) applyReconcile(hwSet map[occupancyKey]struct{}) {
 		}
 		syntheticUID := syntheticOccupancyUID(key.deviceName, key.namespace)
 		d.nsDeviceOccupancy[key.namespace][key.deviceName] = syntheticUID
-		d.claimToOccupancy[syntheticUID] = occupancyKey{namespace: key.namespace, deviceName: key.deviceName}
+		d.claimToOccupancy[syntheticUID] = []occupancyKey{{namespace: key.namespace, deviceName: key.deviceName}}
 		changed = true
 		d.logf("reconciler: discovered hardware occupancy ns=%s dev=%s (synthetic uid)", key.namespace, key.deviceName)
 	}

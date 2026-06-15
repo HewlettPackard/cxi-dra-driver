@@ -66,7 +66,7 @@ func TestApplyReconcile_KeepsPendingEntryNotYetInHardware(t *testing.T) {
 	if got := d.nsDeviceOccupancy["ns1"]["cxi0"]; got != "c1" {
 		t.Errorf("ns1/cxi0 = %q, want %q (pending claim must not be cleared)", got, "c1")
 	}
-	if _, ok := d.pending["c1"]; !ok {
+	if !hasPend(d, "c1", "cxi0") {
 		t.Errorf("pending[c1] removed by reconcile; reconciler must not touch pending")
 	}
 	if notifyFired(d) {
@@ -92,7 +92,7 @@ func TestApplyReconcile_KeepsRealClaimBackedByHardware(t *testing.T) {
 	if got := d.nsDeviceOccupancy["ns1"]["cxi0"]; got != "c1" {
 		t.Errorf("ns1/cxi0 = %q, want %q (real claim with hw backing must not be overwritten by synthetic)", got, "c1")
 	}
-	if got := d.claimToOccupancy["c1"]; got.namespace != "ns1" || got.deviceName != "cxi0" {
+	if got := occSlot(t, d, "c1"); got.namespace != "ns1" || got.deviceName != "cxi0" {
 		t.Errorf("claimToOccupancy[c1] = %+v, want {ns1, cxi0}", got)
 	}
 	if notifyFired(d) {
@@ -151,7 +151,7 @@ func TestApplyReconcile_AddsHardwareOnlyEntryWithSyntheticUID(t *testing.T) {
 	// Reverse index must be populated so future RemoveOccupancy(ns1, cxi0)
 	// (e.g. when NRI eventually fires StopPodSandbox for this service)
 	// finds and removes the entry.
-	if rev := d.claimToOccupancy[want]; rev.namespace != "ns1" || rev.deviceName != "cxi0" {
+	if rev := occSlot(t, d, want); rev.namespace != "ns1" || rev.deviceName != "cxi0" {
 		t.Errorf("claimToOccupancy[%q] = %+v, want {ns1, cxi0}", want, rev)
 	}
 	if !notifyFired(d) {
