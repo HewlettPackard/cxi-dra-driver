@@ -540,15 +540,24 @@ func (d *Driver) Run(ctx context.Context) error {
 	// Write containerd CDI config drop-in and reload containerd AFTER all spec
 	// files are on disk — containerd's CDI cache must see the complete set.
 	if d.containerdConfigPath != "" {
-		if err := cdi.WriteContainerdCDIConfig(d.containerdConfigPath, []string{d.cdiRoot}); err != nil {
+		changed, err := cdi.WriteContainerdCDIConfig(d.containerdConfigPath, []string{d.cdiRoot})
+		if err != nil {
 			return fmt.Errorf("writing containerd CDI config: %w", err)
 		}
-		pid, err := cdi.FindContainerdPID("/proc")
-		if err != nil {
-			return fmt.Errorf("finding containerd PID: %w", err)
-		}
-		if err := cdi.SignalContainerd(pid); err != nil {
-			return fmt.Errorf("signalling containerd: %w", err)
+		// Only reload containerd when the drop-in actually changed. The file
+		// lives on a persistent hostPath, so an image-only DaemonSet rollout
+		// finds identical content; SIGHUPing containerd in that case is a
+		// gratuitous reload that tears down the CRI/NRI subsystems and can
+		// briefly flip the node into NotReady. Reload only on genuine change
+		// (first install or a config edit).
+		if changed {
+			pid, err := cdi.FindContainerdPID("/proc")
+			if err != nil {
+				return fmt.Errorf("finding containerd PID: %w", err)
+			}
+			if err := cdi.SignalContainerd(pid); err != nil {
+				return fmt.Errorf("signalling containerd: %w", err)
+			}
 		}
 	}
 
