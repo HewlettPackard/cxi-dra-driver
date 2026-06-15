@@ -51,6 +51,14 @@ func (d *Driver) prepareClaim(ctx context.Context, claim *resourceapi.ResourceCl
 	var kubeletDevices []kubeletplugin.Device
 	var podAllocs []PodAllocation
 
+	// Shared CDI profile specs (env/nccl/aws-ofi-nccl) are driver-global
+	// singletons. For a multi-device claim (count > 1) each device's
+	// resolveCDIDeviceIDs returns the same profile IDs, but containerd must
+	// reference each profile spec only once — applying its bind-mounts twice
+	// makes container creation fail. seenCDIIDs dedupes across devices; the
+	// per-device cxi= ID is unique so it always passes through.
+	seenCDIIDs := make(map[string]bool)
+
 	for _, alloc := range claim.Status.Allocation.Devices.Results {
 		if alloc.Driver != d.driverName {
 			continue
@@ -79,6 +87,19 @@ func (d *Driver) prepareClaim(ctx context.Context, claim *resourceapi.ResourceCl
 					claim.Namespace, claim.Name, alloc.Device, err),
 			}
 		}
+
+		// Drop any CDI ID already referenced by an earlier device in this
+		// claim. Shared profile specs are emitted once; per-device cxi= IDs
+		// are unique and always survive.
+		deduped := cdiIDs[:0]
+		for _, id := range cdiIDs {
+			if seenCDIIDs[id] {
+				continue
+			}
+			seenCDIIDs[id] = true
+			deduped = append(deduped, id)
+		}
+		cdiIDs = deduped
 
 		kubeletDevices = append(kubeletDevices, kubeletplugin.Device{
 			Requests:     []string{alloc.Request},

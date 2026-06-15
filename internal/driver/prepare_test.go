@@ -237,6 +237,74 @@ func TestPrepareClaimCDIDeviceIDs(t *testing.T) {
 	}
 }
 
+// A multi-device claim (e.g. count: 2) must reference each shared CDI
+// profile spec (env/nccl/aws-ofi-nccl) exactly once across all devices.
+// Those specs are driver-global singletons; emitting them per device would
+// make containerd apply their bind-mounts twice and reject the container.
+// Per-device cxi= IDs are still emitted for every device.
+func TestPrepareClaimCDIDeviceIDsMultiDevice(t *testing.T) {
+	d := &Driver{
+		driverName:   testDriver,
+		devices:      cxi.MockDevices(2), // "cxi0", "cxi1"
+		store:        NewAllocationStore(),
+		cdiEnvConfig: fullyConfiguredEnv(),
+		enableCDIEnv: true,
+		kubeClient:   fake.NewSimpleClientset(annotatedNamespace()),
+	}
+
+	claim := &resourceapi.ResourceClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-claim", Namespace: testNamespace, UID: "claim-uid-1"},
+		Spec:       resourceapi.ResourceClaimSpec{Devices: resourceapi.DeviceClaim{Config: cxiConfigWithProfiles(`["env","nccl"]`)}},
+		Status: resourceapi.ResourceClaimStatus{
+			Allocation: &resourceapi.AllocationResult{
+				Devices: resourceapi.DeviceAllocationResult{
+					Results: []resourceapi.DeviceRequestAllocationResult{cxiResult("cxi0"), cxiResult("cxi1")},
+				},
+			},
+			ReservedFor: []resourceapi.ResourceClaimConsumerReference{
+				{Resource: "pods", UID: "pod-a"},
+			},
+		},
+	}
+
+	result := d.prepareClaim(context.Background(), claim)
+	if result.Err != nil {
+		t.Fatalf("prepareClaim error: %v", result.Err)
+	}
+	if len(result.Devices) != 2 {
+		t.Fatalf("got %d devices, want 2", len(result.Devices))
+	}
+
+	// Every device must carry its own per-device cxi= ID.
+	var cxiIDs []string
+	counts := map[string]int{}
+	for _, dev := range result.Devices {
+		for _, id := range dev.CDIDeviceIDs {
+			counts[id]++
+		}
+	}
+	for _, dev := range result.Devices {
+		want := cdi.DeviceID(testDriver, dev.DeviceName)
+		found := false
+		for _, id := range dev.CDIDeviceIDs {
+			if id == want {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("device %s missing its own CDI ID %q; got %v", dev.DeviceName, want, dev.CDIDeviceIDs)
+		}
+		cxiIDs = append(cxiIDs, want)
+	}
+
+	// Shared profile specs must appear exactly once across the whole claim.
+	for _, id := range []string{cdi.EnvDeviceID(testDriver), cdi.NCCLDeviceID(testDriver)} {
+		if counts[id] != 1 {
+			t.Errorf("shared CDI ID %q appears %d times across devices, want exactly 1 (counts=%v)", id, counts[id], counts)
+		}
+	}
+}
+
 // Reject claims that ask for a profile the node hasn't configured, or
 // that ask for any profile when CDI env injection is disabled cluster-side.
 func TestPrepareClaimCDIProfileErrors(t *testing.T) {
