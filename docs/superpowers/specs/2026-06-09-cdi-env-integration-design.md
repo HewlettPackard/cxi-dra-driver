@@ -1,5 +1,12 @@
 # CDI Environment Integration Design
 
+> **STATUS: COMPLETED — DO NOT TREAT AS LIVE INSTRUCTIONS.** The corresponding
+> plan (`docs/superpowers/plans/2026-06-09-cdi-env-integration.md`) was fully
+> implemented. The driver now writes env/NCCL/AWS-OFI-NCCL CDI specs and
+> auto-configures containerd. Retained for historical design context only.
+
+---
+
 **Date:** 2026-06-09
 **Branch:** cdi-env-integration (to be created)
 **Status:** Approved

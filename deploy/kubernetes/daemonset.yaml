@@ -53,15 +53,9 @@ spec:
             - --reserved-tle-pools=1
             - --vni-range-start=100
             - --vni-range-end=300
-            - --libfabric-lib=/opt/cray/libfabric/2.3.1/lib64/libfabric.so.1
-            - --nccl-prefix=/projects/public/brics/dev/apps/linux-neoverse_v2/nccl-2.29.2-1-yjntbzz5uuuashekge53wqizfqum6swy
-            - --aws-ofi-nccl-prefix=/projects/public/brics/dev/apps/linux-neoverse_v2/aws-ofi-nccl-1.18.0-6pbztrbjhvrmtu5r6nq2silgputmmcyk
-            - --hwloc-lib=/projects/public/brics/dev/apps/linux-neoverse_v2/hwloc-2.12.2-xbbx7czzg3oczc3trftvj2dat3t6qj3o/lib/libhwloc.so.15
-            - --pciaccess-lib=/projects/public/brics/dev/apps/linux-neoverse_v2/libpciaccess-0.17-yisowb26ojigtiis73t5dukyrvx7r6rk/lib/libpciaccess.so.0
-            - --libxml2-lib=/projects/public/brics/dev/apps/linux-neoverse_v2/libxml2-2.13.5-xr3mgbb5y3midpndczeurgot35yosxkd/lib/libxml2.so.2
-            - --libatomic-lib=/projects/public/brics/dev/apps/linux-neoverse_v2/gcc-runtime-14.3.0-4aynqrbkrzeranfuqhyfg7wktmszdenq/lib/libatomic.so.1
-            - --liblzma-lib=/projects/public/brics/dev/apps/linux-neoverse_v2/xz-5.6.3-iqien4jp4hkpdks2rzyflpvgw3b72zqc/lib/liblzma.so.5
-            - --libiconv-lib=/projects/public/brics/dev/apps/linux-neoverse_v2/libiconv-1.18-4ok6y76vboaxcwzvxwnwhc6uaxzookdp/lib/libiconv.so.2
+            - --enable-cdi-env=true
+            - --containerd-config-path=/etc/containerd/conf.d/50-cxi-cdi.toml
+            - --env-config=/etc/cxi-dra/env.json
           env:
             - name: NODE_NAME
               valueFrom:
@@ -88,12 +82,17 @@ spec:
               mountPath: /var/lib/kubelet/plugins/cxi.slingshot.hpe.com
             - name: kubelet-registry
               mountPath: /var/lib/kubelet/plugins_registry
+            - name: containerd-conf
+              mountPath: /etc/containerd/conf.d
             - name: cdi
               mountPath: /var/run/cdi
             - name: nri
               mountPath: /var/run/nri
             - name: netns
               mountPath: /var/run/netns
+              readOnly: true
+            - name: env-config
+              mountPath: /etc/cxi-dra
               readOnly: true
 
       volumes:
@@ -110,6 +109,10 @@ spec:
         - name: kubelet-registry
           hostPath:
             path: /var/lib/kubelet/plugins_registry
+        - name: containerd-conf
+          hostPath:
+            path: /etc/containerd/conf.d
+            type: DirectoryOrCreate
         - name: cdi
           hostPath:
             path: /var/run/cdi
@@ -122,3 +125,6 @@ spec:
           hostPath:
             path: /var/run/netns
             type: DirectoryOrCreate
+        - name: env-config
+          configMap:
+            name: cxi-dra-driver-env

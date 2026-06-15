@@ -51,15 +51,23 @@ func (d *Driver) prepareClaim(ctx context.Context, claim *resourceapi.ResourceCl
 	var kubeletDevices []kubeletplugin.Device
 	var podAllocs []PodAllocation
 
+	// Shared CDI profile specs (env/nccl/aws-ofi-nccl) are driver-global
+	// singletons. For a multi-device claim (count > 1) each device's
+	// resolveCDIDeviceIDs returns the same profile IDs, but containerd must
+	// reference each profile spec only once — applying its bind-mounts twice
+	// makes container creation fail. seenCDIIDs dedupes across devices; the
+	// per-device cxi= ID is unique so it always passes through.
+	seenCDIIDs := make(map[string]bool)
+
 	for _, alloc := range claim.Status.Allocation.Devices.Results {
 		if alloc.Driver != d.driverName {
 			continue
 		}
 
-		requested, err := d.resolveResources(claim, alloc)
+		requested, profiles, err := d.resolveClaim(claim, alloc)
 		if err != nil {
 			return kubeletplugin.PrepareResult{
-				Err: fmt.Errorf("claim %s/%s device %s: resolving resources: %w",
+				Err: fmt.Errorf("claim %s/%s device %s: resolving config: %w",
 					claim.Namespace, claim.Name, alloc.Device, err),
 			}
 		}
@@ -72,16 +80,26 @@ func (d *Driver) prepareClaim(ctx context.Context, claim *resourceapi.ResourceCl
 			}
 		}
 
-		cdiIDs := []string{cdi.DeviceID(d.driverName, alloc.Device)}
-		if d.enableCDIEnv {
-			cdiIDs = append(cdiIDs, cdi.EnvDeviceID(d.driverName))
-			if d.cdiEnvConfig.NCCLPrefix != "" {
-				cdiIDs = append(cdiIDs, cdi.NCCLDeviceID(d.driverName))
-			}
-			if d.cdiEnvConfig.AWSofiNCCLPrefix != "" {
-				cdiIDs = append(cdiIDs, cdi.AWSofiNCCLDeviceID(d.driverName))
+		cdiIDs, err := d.resolveCDIDeviceIDs(alloc.Device, profiles)
+		if err != nil {
+			return kubeletplugin.PrepareResult{
+				Err: fmt.Errorf("claim %s/%s device %s: %w",
+					claim.Namespace, claim.Name, alloc.Device, err),
 			}
 		}
+
+		// Drop any CDI ID already referenced by an earlier device in this
+		// claim. Shared profile specs are emitted once; per-device cxi= IDs
+		// are unique and always survive.
+		deduped := cdiIDs[:0]
+		for _, id := range cdiIDs {
+			if seenCDIIDs[id] {
+				continue
+			}
+			seenCDIIDs[id] = true
+			deduped = append(deduped, id)
+		}
+		cdiIDs = deduped
 
 		kubeletDevices = append(kubeletDevices, kubeletplugin.Device{
 			Requests:     []string{alloc.Request},
@@ -153,16 +171,22 @@ func (d *Driver) namespaceVNI(ctx context.Context, namespace string) (int, error
 	return 0, fmt.Errorf("VNI not available for namespace %s after %d attempts: %w", namespace, attempts, lastErr)
 }
 
-// resolveResources returns the ResourceSet to use for a single device
-// allocation. All fields must be present in the claim's opaque config —
-// there are no driver-level defaults. Claims without opaque config are
-// rejected with a clear error directing the user to the example templates.
-func (d *Driver) resolveResources(
+// Valid values for the cdi_profiles field in a claim's opaque config.
+const (
+	CDIProfileEnv        = "env"
+	CDIProfileNCCL       = "nccl"
+	CDIProfileAWSofiNCCL = "aws-ofi-nccl"
+)
+
+// resolveClaim parses the claim's opaque config and returns the ResourceSet
+// and the list of requested CDI profiles for a single device allocation.
+// All fields are required; claims without matching opaque config are
+// rejected with an error directing the user to the example templates.
+func (d *Driver) resolveClaim(
 	claim *resourceapi.ResourceClaim,
 	alloc resourceapi.DeviceRequestAllocationResult,
-) (cxi.ResourceSet, error) {
-	// Look for opaque config entries in the claim spec targeting this driver
-	// and request. We read from spec (where the user wrote it) rather than
+) (cxi.ResourceSet, []string, error) {
+	// Read from spec (where the user wrote it) rather than
 	// status.allocation.devices.config, which is a scheduler-copied mirror
 	// and may not be present if the claim was allocated by an older scheduler.
 	for _, cfg := range claim.Spec.Devices.Config {
@@ -185,33 +209,73 @@ func (d *Driver) resolveResources(
 		}
 		return parseResourceConfig(cfg.Opaque.Parameters.Raw)
 	}
-	return cxi.ResourceSet{}, fmt.Errorf(
+	return cxi.ResourceSet{}, nil, fmt.Errorf(
 		"claim %s/%s has no CXI resource config for request %q — "+
 			"all resource fields are required; see deploy/kubernetes/test/resourceclaim.yaml for examples",
 		claim.Namespace, claim.Name, alloc.Request,
 	)
 }
 
-// CXIResourceConfig is the JSON structure the user places in the claim's
-// opaque config parameters to request specific CXI resources.
-// All fields are required — there are no driver-level defaults.
-type CXIResourceConfig struct {
-	TXQs     *int64 `json:"txqs"`
-	TGQs     *int64 `json:"tgqs"`
-	EQs      *int64 `json:"eqs"`
-	CTs      *int64 `json:"cts"`
-	PTEs     *int64 `json:"ptes"`
-	ACs      *int64 `json:"acs"`
-	LEPools  *int64 `json:"le_pools"`  // expressed as pool count; 1 pool = 1024 LEs
-	TLEPools *int64 `json:"tle_pools"` // expressed as pool count; 1 pool = 512 TLEs
+// resolveCDIDeviceIDs translates the requested CDI profile names into the
+// CDI device IDs that must be attached to the pod. It rejects unknown
+// profile names, and profiles whose backing spec is not configured on
+// this node (e.g. "nccl" requested when ncclPrefix is empty).
+func (d *Driver) resolveCDIDeviceIDs(deviceName string, profiles []string) ([]string, error) {
+	ids := []string{cdi.DeviceID(d.driverName, deviceName)}
+	if len(profiles) == 0 {
+		return ids, nil
+	}
+	if !d.enableCDIEnv {
+		return nil, fmt.Errorf("cdi_profiles requested but --enable-cdi-env is not set on the driver")
+	}
+	for _, p := range profiles {
+		switch p {
+		case CDIProfileEnv:
+			if len(d.cdiEnvConfig.EnvMounts) == 0 {
+				return nil, fmt.Errorf("cdi_profile %q requested but envMounts is empty in the driver's env config", p)
+			}
+			ids = append(ids, cdi.EnvDeviceID(d.driverName))
+		case CDIProfileNCCL:
+			if d.cdiEnvConfig.NCCLPrefix == "" {
+				return nil, fmt.Errorf("cdi_profile %q requested but ncclPrefix is empty in the driver's env config", p)
+			}
+			ids = append(ids, cdi.NCCLDeviceID(d.driverName))
+		case CDIProfileAWSofiNCCL:
+			if len(d.cdiEnvConfig.AWSofiMounts) == 0 {
+				return nil, fmt.Errorf("cdi_profile %q requested but awsOfiMounts is empty in the driver's env config", p)
+			}
+			ids = append(ids, cdi.AWSofiNCCLDeviceID(d.driverName))
+		default:
+			return nil, fmt.Errorf("unknown cdi_profile %q (valid: %q, %q, %q)", p,
+				CDIProfileEnv, CDIProfileNCCL, CDIProfileAWSofiNCCL)
+		}
+	}
+	return ids, nil
 }
 
-// parseResourceConfig unmarshals opaque claim parameters into a ResourceSet.
-// Returns an error if any field is missing — all fields are required.
-func parseResourceConfig(raw []byte) (cxi.ResourceSet, error) {
+// CXIResourceConfig is the JSON structure the user places in the claim's
+// opaque config parameters. All fields are required — there are no
+// driver-level defaults. CDIProfiles may be an empty list to indicate
+// "no CDI injection beyond the per-device node," but the field itself
+// must be present.
+type CXIResourceConfig struct {
+	TXQs        *int64    `json:"txqs"`
+	TGQs        *int64    `json:"tgqs"`
+	EQs         *int64    `json:"eqs"`
+	CTs         *int64    `json:"cts"`
+	PTEs        *int64    `json:"ptes"`
+	ACs         *int64    `json:"acs"`
+	LEPools     *int64    `json:"le_pools"`     // expressed as pool count; 1 pool = 1024 LEs
+	TLEPools    *int64    `json:"tle_pools"`    // expressed as pool count; 1 pool = 512  TLEs
+	CDIProfiles *[]string `json:"cdi_profiles"` // env / nccl / aws-ofi-nccl; [] means none
+}
+
+// parseResourceConfig unmarshals opaque claim parameters into a ResourceSet
+// and a CDI-profile list. Returns an error if any field is missing.
+func parseResourceConfig(raw []byte) (cxi.ResourceSet, []string, error) {
 	var cfg CXIResourceConfig
 	if err := json.Unmarshal(raw, &cfg); err != nil {
-		return cxi.ResourceSet{}, fmt.Errorf("parsing CXI resource config: %w", err)
+		return cxi.ResourceSet{}, nil, fmt.Errorf("parsing CXI resource config: %w", err)
 	}
 	missing := []string{}
 	if cfg.TXQs == nil {
@@ -238,14 +302,17 @@ func parseResourceConfig(raw []byte) (cxi.ResourceSet, error) {
 	if cfg.TLEPools == nil {
 		missing = append(missing, "tle_pools")
 	}
+	if cfg.CDIProfiles == nil {
+		missing = append(missing, "cdi_profiles")
+	}
 	if len(missing) > 0 {
-		return cxi.ResourceSet{}, fmt.Errorf("CXI resource config missing required fields: %v", missing)
+		return cxi.ResourceSet{}, nil, fmt.Errorf("CXI resource config missing required fields: %v", missing)
 	}
 	// Reject negative values — they would pass Fits checks (e.g. -1 <= available)
 	// and then overflow to very large unsigned values in the CGo service creation path.
 	if *cfg.TXQs < 0 || *cfg.TGQs < 0 || *cfg.EQs < 0 || *cfg.CTs < 0 ||
 		*cfg.PTEs < 0 || *cfg.ACs < 0 || *cfg.LEPools < 0 || *cfg.TLEPools < 0 {
-		return cxi.ResourceSet{}, fmt.Errorf("CXI resource config values must be non-negative")
+		return cxi.ResourceSet{}, nil, fmt.Errorf("CXI resource config values must be non-negative")
 	}
 	return cxi.ResourceSet{
 		TXQs: *cfg.TXQs,
@@ -256,7 +323,7 @@ func parseResourceConfig(raw []byte) (cxi.ResourceSet, error) {
 		ACs:  *cfg.ACs,
 		LEs:  cxi.PoolsToLEs(*cfg.LEPools),
 		TLEs: cxi.PoolsToTLEs(*cfg.TLEPools),
-	}, nil
+	}, *cfg.CDIProfiles, nil
 }
 
 // usableCeiling returns the maximum resources a service can ever request on

@@ -1,0 +1,149 @@
+# fi_pingpong two-pod test: server + client pinned to different nodes, each
+# with a cxi-small claim and CDI env injection. Exercises namespace-VNI
+# isolation across nodes and proves end-to-end RDMA over CXI works under DRA.
+#
+# Library injection is handled entirely by CDI (cdi_profiles: ["env"] on the
+# cxi-small template injects libfabric, libcxi, libxpmem + transitive deps
+# and updates ld.so.cache). NRI injects SLINGSHOT_DEVICES/VNIS/SVC_IDS env
+# vars. The only hostPath here is the patched libfabric install carrying the
+# fi_* binaries — its /fi/lib/libfabric.so.1 is the same build CDI injects
+# at /usr/lib64/libfabric.so.1, so there is no ABI drift.
+#
+# ----------------------------------------------------------------------------
+# ROOT USAGE
+# ----------------------------------------------------------------------------
+#
+# Apply pre-requisites and pods:
+#   kubectl apply -f deploy/kubernetes/test/resourceclaim.yaml
+#   kubectl apply -f deploy/kubernetes/test/fi-pingpong.yaml
+#
+# Wait for both pods Running:
+#   kubectl get pods -l app=cxi-pingpong -o wide
+#
+# Start the server (note the address it prints):
+#   kubectl exec -it cxi-pingpong-server -- fi_pingpong -p cxi
+#
+# Connect from the client (replace <server-addr> with what the server printed):
+#   kubectl exec -it cxi-pingpong-client -- fi_pingpong -p cxi <server-addr>
+#
+# ----------------------------------------------------------------------------
+# NON-ROOT USAGE (via setpriv inside the same root pod)
+# ----------------------------------------------------------------------------
+#
+# Prefer this over a separate non-root pod manifest. Pods stay as root so
+# CAP_SETUID is available; setpriv drops to UID 1000 just for fi_pingpong.
+# This is the pattern used to falsify the SHS14 kernel-bug hypothesis — see
+# docs/netcassini-vni-isolation-bug.md.
+#
+# Host prerequisite (run once per node, persists until reboot):
+#   sudo chmod 666 /dev/cxi* /dev/xpmem /dev/gdrdrv
+#
+# Install setpriv if the image lacks it (ubuntu:24.04 ships it):
+#   kubectl exec cxi-pingpong-server -- which setpriv
+#
+# Run server as UID 1000 (uses the namespace-registered VNI):
+#   kubectl exec -it cxi-pingpong-server -- \
+#     setpriv --reuid=1000 --regid=1000 --clear-groups fi_pingpong -p cxi
+#
+# Run client as UID 1000:
+#   kubectl exec -it cxi-pingpong-client -- \
+#     setpriv --reuid=1000 --regid=1000 --clear-groups \
+#       fi_pingpong -p cxi <server-addr>
+#
+# To force an unregistered VNI (V2 falsification scenario — should fail with
+# -ENOENT translated to FI_ENOSPC by libfabric):
+#   kubectl exec -it cxi-pingpong-server -- \
+#     setpriv --reuid=1000 --regid=1000 --clear-groups \
+#       env SLINGSHOT_VNIS=999 fi_pingpong -p cxi
+#
+# ----------------------------------------------------------------------------
+# Cleanup:
+#   kubectl delete -f deploy/kubernetes/test/fi-pingpong.yaml
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: cxi-pingpong-server
+  namespace: default
+  labels:
+    app: cxi-pingpong
+spec:
+  restartPolicy: Never
+
+  affinity:
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        - labelSelector:
+            matchLabels:
+              app: cxi-pingpong
+          topologyKey: kubernetes.io/hostname
+
+  resourceClaims:
+    - name: cxi
+      resourceClaimTemplateName: cxi-small
+
+  containers:
+    - name: pingpong
+      image: ubuntu:24.04
+      command: ["sleep", "infinity"]
+      resources:
+        claims:
+          - name: cxi
+      env:
+        - name: FI_PROVIDER
+          value: "cxi"
+        - name: PATH
+          value: "/fi/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+      volumeMounts:
+        - name: fi-install
+          mountPath: /fi
+
+  volumes:
+    - name: fi-install
+      hostPath:
+        path: /home/vendor/pirese.vendor/source/libfabric/install
+        type: Directory
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: cxi-pingpong-client
+  namespace: default
+  labels:
+    app: cxi-pingpong
+spec:
+  restartPolicy: Never
+
+  affinity:
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        - labelSelector:
+            matchLabels:
+              app: cxi-pingpong
+          topologyKey: kubernetes.io/hostname
+
+  resourceClaims:
+    - name: cxi
+      resourceClaimTemplateName: cxi-small
+
+  containers:
+    - name: pingpong
+      image: ubuntu:24.04
+      command: ["sleep", "infinity"]
+      resources:
+        claims:
+          - name: cxi
+      env:
+        - name: FI_PROVIDER
+          value: "cxi"
+        - name: PATH
+          value: "/fi/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+      volumeMounts:
+        - name: fi-install
+          mountPath: /fi
+
+  volumes:
+    - name: fi-install
+      hostPath:
+        path: /home/vendor/pirese.vendor/source/libfabric/install
+        type: Directory

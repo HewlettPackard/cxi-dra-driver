@@ -104,13 +104,18 @@ static int cxi_sum_reserved(const char *device, resource_args *out)
     return 0;
 }
 
-// cxi_create_service allocates a CXI service and then associates the network
-// namespace and VNI via the SHS14 dedicated ioctls (cxil_svc_set_netns and
-// cxil_svc_set_vni_range). In SHS12/Friese the netns was embedded in
-// cxi_svc_desc via members[].type=CXI_SVC_MEMBER_NET_NS and the VNI via
-// restricted_vnis/vnis[]. SHS14 removed those desc fields and introduced
-// separate post-creation ioctls. restricted_members is still a desc field in
-// SHS14 and must be set to 1 for cxil_svc_set_netns to accept the call.
+// cxi_create_service allocates a CXI service with the VNI and network
+// namespace bound at creation time via cxi_svc_desc fields and the
+// cxil_svc_set_netns post-creation ioctl respectively.
+//
+// VNI is set in the descriptor (restricted_vnis=1, num_vld_vnis=1, vnis[0])
+// rather than via the post-creation cxil_svc_set_vni_range ioctl. The range
+// ioctl was found to cause EEXIST on domain allocation for VNIs occupied at
+// the kernel domain level by system components.
+//
+// restricted_members=1 is set in the descriptor so that cxil_svc_set_netns
+// accepts the call. SHS14 requires the service to be disabled before
+// cxil_svc_set_netns and re-enabled after.
 static int cxi_create_service(const char *device, uint64_t netns_inode, int vni,
                                resource_args res)
 {
@@ -129,6 +134,13 @@ static int cxi_create_service(const char *device, uint64_t netns_inode, int vni,
     // restricted_members=1 is required for cxil_svc_set_netns to succeed;
     // without it the kernel returns EEXIST regardless of other parameters.
     desc.restricted_members = 1;
+    // restricted_vnis=1 with num_vld_vnis=1 and vnis[0]=vni locks the service
+    // to a single VNI at allocation time. This avoids the post-creation
+    // cxil_svc_set_vni_range ioctl which was found to cause EEXIST on domain
+    // allocation for VNIs that are pre-occupied at the kernel domain level.
+    desc.restricted_vnis = 1;
+    desc.num_vld_vnis = 1;
+    desc.vnis[0] = (uint16_t)vni;
 
     // Resource limits: max == res for all resources except LEs.
     //
@@ -193,17 +205,6 @@ static int cxi_create_service(const char *device, uint64_t netns_inode, int vni,
         return rc;
     }
 
-    // SHS14: restrict service to the allocated VNI via a range (min==max for a
-    // single VNI). No disable/enable required for cxil_svc_set_vni_range.
-    rc = cxil_svc_set_vni_range(dev, svc_id, (uint16_t)vni, (uint16_t)vni);
-    if (rc != 0) {
-        fprintf(stderr, "cxi_wrapper: cxil_svc_set_vni_range(%d, vni=%d) failed: %d\n",
-                svc_id, vni, rc);
-        cxil_destroy_svc(dev, svc_id);
-        cxil_close_device(dev);
-        return rc;
-    }
-
     fprintf(stderr, "cxi_wrapper: created service id=%d on %s inode=%llu vni=%d "
             "txqs=%lld tgqs=%lld eqs=%lld cts=%lld tles=%lld ptes=%lld les=%lld acs=%lld\n",
             svc_id, device, (unsigned long long)netns_inode, vni,
@@ -264,12 +265,12 @@ static int cxi_delete_service(const char *device, uint64_t netns_inode)
 }
 
 // cxi_list_service_vnis enumerates every service on the device and writes
-// each service's assigned VNI into out[0..*count). SHS14 stores one VNI per
-// service (vni_min == vni_max under our create path, see cxi_create_service),
-// so vni_min is the canonical value. Services without a VNI restriction
-// (system services, services created outside DRA without
-// cxil_svc_set_vni_range) return an error from cxil_svc_get_vni_range and
-// are silently skipped — the reconciler doesn't track them.
+// each service's assigned VNI into out[0..*count). Only services created with
+// restricted_vnis=1 and num_vld_vnis>0 are included; system services and
+// services without a VNI restriction are silently skipped — the reconciler
+// cannot attribute them to any namespace. The VNI is read directly from
+// desc.vnis[0] in the service list returned by cxil_get_svc_list, avoiding
+// the need for a separate cxil_svc_get_vni_range ioctl per service.
 //
 // out must point to a caller-allocated buffer of at least max_out elements.
 // On success *count is the number of entries actually written (always
@@ -298,13 +299,14 @@ static int cxi_list_service_vnis(const char *device,
     }
     unsigned int written = 0;
     for (unsigned int i = 0; i < list->count && written < max_out; i++) {
-        unsigned int svc_id = list->descs[i].svc_id;
-        uint16_t vmin = 0, vmax = 0;
-        if (cxil_svc_get_vni_range(dev, svc_id, &vmin, &vmax) != 0)
+        const struct cxi_svc_desc *d = &list->descs[i];
+        // Only services created with restricted_vnis=1 have a meaningful
+        // vnis[0]. System services and services without VNI restriction are
+        // silently skipped — the reconciler cannot attribute them to any
+        // namespace and must not block decisions about attributable slots.
+        if (!d->restricted_vnis || d->num_vld_vnis == 0 || d->vnis[0] == 0)
             continue;
-        if (vmin == 0)
-            continue;
-        out[written++] = vmin;
+        out[written++] = d->vnis[0];
     }
     *count = written;
     cxil_free_svc_list(list);

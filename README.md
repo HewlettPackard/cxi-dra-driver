@@ -28,7 +28,7 @@ Scheduler ──allocates──► ResourceSlice (cxi0, cxi1, …)
                          ├── NRI plugin (RunPodSandbox)
                          │     └── creates CXI service: namespace VNI + pod netns inode
                          ├── NRI plugin (CreateContainer)
-                         │     └── injects FI_CXI_SVC_ID env vars
+                         │     └── injects SLINGSHOT_DEVICES, SLINGSHOT_VNIS, SLINGSHOT_SVC_IDS env vars
                          └── NRI plugin (StopPodSandbox)
                                └── destroys CXI service
 
@@ -131,23 +131,27 @@ You should see one slice per node with devices `cxi0`, `cxi1`, … and attribute
 kubectl apply -f deploy/kubernetes/test/resourceclaim.yaml
 kubectl apply -f deploy/kubernetes/test/pod.yaml
 kubectl get pod cxi-test-3
-kubectl exec -it cxi-test-3 -- fi_info -p cxi
+kubectl exec cxi-test-3 -- fi_info --provider cxi
 ```
 
-The test pod claims one CXI device via the `cxi-quarter` template. Its fabric VNI is the one assigned to the `default` namespace by the namespace VNI allocator (visible as the `cxi.slingshot.hpe.com/vni` annotation on the namespace). You should see CXI providers enumerated without `privileged: true`.
+The test pod claims one CXI device via the `cxi-small` template. Its fabric VNI is the one assigned to the `default` namespace by the namespace VNI allocator (visible as the `cxi.slingshot.hpe.com/vni` annotation on the namespace). You should see CXI providers enumerated without `privileged: true`.
 
 ## Requesting CXI Resources
 
 Each pod that uses a CXI device needs a `ResourceClaimTemplate` that requests one CXI device. Pods do **not** request a VNI — VNIs are assigned per namespace by the leader-elected namespace VNI allocator and shared across every pod in the namespace, so each tenant gets exactly one cluster allocation that all of its pods communicate over.
 
-Two templates are provided in [deploy/kubernetes/test/resourceclaim.yaml](deploy/kubernetes/test/resourceclaim.yaml):
+Four templates are provided in [deploy/kubernetes/test/resourceclaim.yaml](deploy/kubernetes/test/resourceclaim.yaml):
 
-| Template | TXQs | TGQs | LE pools | TLE pools | Use case |
-|---|---|---|---|---|---|
-| `cxi-quarter` | 256 | 128 | 4 (4096 LEs) | 1 (512 TLEs) | Most jobs |
-| `cxi-half`    | 512 | 256 | 8 (8192 LEs) | 2 (1024 TLEs) | Bandwidth-intensive jobs |
+| Template | TXQs | TGQs | LE pools | TLE pools | Pods/device | Use case |
+|---|---|---|---|---|---|---|
+| `cxi-small`  | 4    | 2   | 1 (1024 LEs)  | 1 (512 TLEs)  | 3 | Benchmarks, `fi_pingpong`, development, single-threaded tools |
+| `cxi-medium` | 16   | 8   | 2 (2048 LEs)  | 1 (512 TLEs)  | 3 | Standard MPI, NCCL at moderate scale, typical HPC workloads |
+| `cxi-large`  | 64   | 32  | 4 (4096 LEs)  | 2 (1024 TLEs) | 1 | Multi-threaded MPI, NCCL at scale, collectives-heavy workloads |
+| `cxi-whole`  | 1019 | 507 | 14 (14336 LEs) | 3 (1536 TLEs) | 1 | Exclusive device — single demanding workload taking the whole NIC |
 
-All resource fields are **required** — the driver has no defaults. Claims without an opaque config block will be rejected at prepare time with a clear error.
+The `Pods/device` column assumes the daemonset's current `--reserved-tle-pools=1` policy (3 of the device's 4 TLE pools available to claims) and the template values shown above. For mixed-template workloads the binding constraint is whichever resource saturates first; with the current templates `tle_pools` is the first to saturate. If your workloads follow Slingshot's "don't reserve LEs/TLEs unless you need them" guidance and use templates with `tle_pools: 0`, the per-device pod ceiling is set by some other resource (typically TXQs).
+
+All resource fields **plus `cdi_profiles`** are required — the driver has no defaults. Claims without an opaque config block (or with any field missing) will be rejected at prepare time with a clear error.
 
 ### Claim template structure
 
@@ -155,7 +159,7 @@ All resource fields are **required** — the driver has no defaults. Claims with
 apiVersion: resource.k8s.io/v1
 kind: ResourceClaimTemplate
 metadata:
-  name: cxi-quarter
+  name: cxi-small
   namespace: default
 spec:
   spec:
@@ -171,21 +175,54 @@ spec:
           opaque:
             driver: cxi.slingshot.hpe.com
             parameters:
-              txqs: 256
-              tgqs: 128
-              eqs: 511
-              cts: 511
-              ptes: 512
-              acs: 255
-              le_pools: 4    # 1 pool = 1024 LEs
-              tle_pools: 1   # 1 pool = 512 TLEs
+              txqs: 4
+              tgqs: 2
+              eqs: 8
+              cts: 4
+              ptes: 4
+              acs: 2
+              le_pools: 1               # 1 pool = 1024 LEs
+              tle_pools: 1              # 1 pool = 512 TLEs
+              cdi_profiles: ["env"]     # see "CDI Profiles" below
 ```
 
 LEs and TLEs are expressed as **pool counts** due to hardware allocation granularity:
 - `le_pools: 1` reserves 1024 LEs
 - `tle_pools: 1` reserves 512 TLEs
 
-Set `le_pools: 0` and `tle_pools: 0` if your job does not use triggered operations.
+A value of `0` for `le_pools` or `tle_pools` does **not** mean "no LEs/TLEs available" — the service is mapped to a shared default pool (`DEFAULT_LE_POOL_ID` / `DEFAULT_TLE_POOL_ID` in the kernel rgroup, see `cxi_rgroup.c:425`) which has `max_alloc` set to the device-wide total and `num_reserved=0`. The service can still consume LEs/TLEs from the default pool on a best-effort basis, but has no guaranteed capacity under contention. A value `>0` carves out exclusive reservation for the service. Slingshot's general guidance is to leave both at `0` for ordinary workloads and raise them only when the workload specifically depends on guaranteed receive-buffer capacity (large MPI with steady unexpected traffic) or triggered operations (NCCL allreduce, counter-driven MPI collectives).
+
+### Resource field reference
+
+The per-claim resource values map directly to fields in the per-service `cxi_svc_desc.resource_limits[]` quota in the kernel. The libfabric CXI provider (`shs-libfabric/prov/cxi/`) allocates resources from these quotas on demand via libcxi ioctls; allocations fail (and the application fails) when the quota is exhausted. The "shared default pool" model applies only to `le_pools` and `tle_pools` — all other fields are hard caps.
+
+- **`txqs` — Transmit command queues.** The provider allocates **one shared TX CMDQ per endpoint** (`cxip_ep.c:85`; reused via ref-counting between the data TX context and the control TX path — both write to `ep_obj->txq`). Optional extras: one domain-level trigger CMDQ if any triggered operation is issued; one dedicated counter trigger CMDQ per counter if `FI_CXI_CNTR_TRIG_CMDQ=1`. A value of 2–4 covers a typical single-endpoint job with headroom; jobs that open multiple endpoints from one domain need proportionally more.
+
+- **`tgqs` — Target (receive-side) command queues.** Same pattern as `txqs` — **one shared TGQ per endpoint** (`cxip_ep.c:85` with `transmit=false`), reused between the RX context and the control TGT path via `ep_obj->tgq`. A value of 1–2 is sufficient for a single-endpoint job.
+
+- **`eqs` — Hardware event queues.** The provider allocates **exactly 4 hardware EQs per endpoint** via `cxil_alloc_evtq`: one RX-data EQ (`cxip_rxc.c:130`), one TX-data EQ (`cxip_txc.c:333`), one TX-control EQ and one TGT-control EQ (`cxip_ctrl.c:495`, called twice from `cxip_ep_ctrl_init`). 8 is a safe floor (one endpoint with headroom or two endpoints).
+
+- **`cts` — Hardware counters.** Allocated only when the application explicitly opens a libfabric counter via `fi_cntr_open` (`cxip_cntr.c:730`). Basic point-to-point benchmarks like `fi_pingpong` need zero. NCCL and collective-heavy workloads use them extensively (64–256 is typical).
+
+- **`ptes` — Portal table entries.** The provider allocates **2 unconditional PTEs per endpoint** — one control PTE in `cxip_ctrl.c:570` and one RX PTE in `cxip_msg_hpc.c:3946` (or `cxip_msg_rnr.c:374`) — plus one per memory region, one per rendezvous instance if the rendezvous protocol activates, and one per collective. A value of 2–4 covers single-endpoint jobs; raise for jobs with many MRs or collectives.
+
+- **`acs` — Address contexts.** Allocated implicitly per `cxil_map` call for memory protection / IOMMU translation. The libfabric MR cache (`cxip_iomm.c:368`) aggregates repeated mappings of the same region, so typical jobs need only 2–4 ACs (EQ buffers + send/recv buffers). Frequent buffer reuse minimises AC pressure.
+
+- **`le_pools` — List-entry pools** (1 pool = 1024 LEs). LEs are consumed by **every** `cxip_pte_append`: control messaging during `cxip_ep_ctrl_init` (`cxip_ctrl.c:206`), every receive append in the HPC/RNR paths (`cxip_msg_hpc.c:4218`, `cxip_msg_rnr.c:169`), every memory region (`cxip_mr.c`), rendezvous (`cxip_rdzv_pte.c`), and collectives (`cxip_coll.c`). See the shared-default-pool note above — a value of `0` means "use the shared default LE pool on a best-effort basis"; `>0` reserves N pools exclusively for guaranteed capacity.
+
+- **`tle_pools` — Triggered list-entry pools** (1 pool = 512 TLEs). TLEs are consumed only by triggered commands — `cxi_cq_emit_trig_*` in `cxip_dom.c:2013, 2073, 2086` and counter-triggered events in `cxip_cntr.c:572`. A workload without triggered operations (e.g. `fi_pingpong`) needs zero. With `tle_pools: 0`, any triggered operations that do occur draw from the shared default pool on a best-effort basis; `>0` reserves dedicated TLE capacity.
+
+### CDI Profiles
+
+`cdi_profiles` is a required list of optional CDI specs to inject into the pod alongside the per-device `/dev/cxiN` node:
+
+| Profile | Contents |
+|---|---|
+| `env`          | libcxi / libfabric / userspace runtime libraries (`ld.so.cache` refresh) |
+| `nccl`         | NCCL libraries from the configured Spack prefix |
+| `aws-ofi-nccl` | AWS-OFI NCCL plugin and tuning env vars |
+
+An empty list (`cdi_profiles: []`) means **no env injection** — use this when the container image already carries libfabric/libcxi (BYO runtime). The driver itself has no defaults; the claim must declare what it needs.
 
 ### Wiring the claim into a pod
 
@@ -193,7 +230,7 @@ Set `le_pools: 0` and `tle_pools: 0` if your job does not use triggered operatio
 spec:
   resourceClaims:
     - name: cxi
-      resourceClaimTemplateName: cxi-quarter
+      resourceClaimTemplateName: cxi-small
   containers:
     - name: workload
       resources:
@@ -215,11 +252,11 @@ Every pod in a namespace receives the same VNI, so any number of pods in the sam
 
 ### How scheduler placement works
 
-When a `ResourceClaim` with opaque CXI config is created, the `MutatingAdmissionPolicy` automatically injects two CEL selectors into the claim. For a `cxi-quarter` request from namespace `ellis` these are:
+When a `ResourceClaim` with opaque CXI config is created, the `MutatingAdmissionPolicy` automatically injects two CEL selectors into the claim. For a `cxi-small` request from namespace `ellis` these are:
 
 ```
 # Selector 1: per-resource capacity check (one expression with all 8 fields)
-device.attributes["cxi.slingshot.hpe.com"]["avail_txqs"] >= 256 &&
+device.attributes["cxi.slingshot.hpe.com"]["avail_txqs"] >= 4 &&
 device.attributes["cxi.slingshot.hpe.com"]["avail_tles"] >= 512 &&
 ...
 
@@ -227,7 +264,7 @@ device.attributes["cxi.slingshot.hpe.com"]["avail_tles"] >= 512 &&
 !device.attributes["cxi.slingshot.hpe.com"]["active_namespaces"].contains(",ellis,")
 ```
 
-The scheduler ANDs both selectors. Selector 1 steers placement to devices with capacity for the request. Selector 2 prevents the scheduler from picking a device that already hosts another claim from the same namespace — necessary because SHS14 enforces VNI uniqueness per device at the kernel level (`cxil_svc_set_vni_range` returns `-EEXIST` for overlapping ranges) and every claim in a namespace shares the namespace's VNI.
+The scheduler ANDs both selectors. Selector 1 steers placement to devices with capacity for the request. Selector 2 prevents the scheduler from picking a device that already hosts another claim from the same namespace — necessary because SHS14 enforces VNI uniqueness per device at the kernel level (`cxil_alloc_svc` runs the RX-profile `vni_overlap_test` against the device's existing services and rejects a second service whose VNI matches an existing one with `-EEXIST`), and every claim in a namespace shares the namespace's VNI.
 
 The `active_namespaces` attribute is a comma-padded sorted string (e.g. `,alpha,ellis,zeta,`) published per device on every `ResourceSlice` update. The leading and trailing commas let the CEL `.contains(",<NS>,")` perform exact, non-prefix matching — `,foo,` does not match `,foobar,`. An unoccupied device publishes the empty string.
 
@@ -242,7 +279,7 @@ Because the K8s DRA scheduler evaluates claims against a static snapshot of the 
 5. The scheduler sees `Unschedulable=True` in the claim's `BindingFailureConditions`, deallocates the single CXI claim, and retries.
 6. At retry time, the `ResourceSlice` has been republished — `avail_*` near zero for any device that became full, `active_namespaces` updated for the same-namespace case — steering the retry allocation to an actually eligible device.
 
-The system converges to the correct distribution (≤3 `cxi-quarter` pods per device, ≤1 claim per namespace per device on any one node) within one or two compaction cycles in the worst case, and typically zero (CEL pre-filter catches it at scheduling time).
+The system converges to the correct distribution (≤3 `cxi-small`/`cxi-medium` pods per device, ≤1 `cxi-large`/`cxi-whole` pod per device, ≤1 claim per namespace per device on any one node) within one or two compaction cycles in the worst case, and typically zero (CEL pre-filter catches it at scheduling time).
 
 The per-namespace occupancy index is released by three independent, idempotent paths that all converge on a single `removeOccupancyLocked` helper:
 
@@ -287,7 +324,7 @@ The CXI service (VNI scoping + netns binding) is created in the NRI `RunPodSandb
 
 ## CXI Service Programming
 
-Each pod receives a CXI service scoped to its network namespace inode and a unique VNI. libfabric reads `FI_CXI_SVC_ID` (injected as an env var by the NRI plugin) and uses it instead of allocating its own service, ensuring the pod operates within its allocated fabric resources.
+Each pod receives a CXI service scoped to its network namespace inode and a unique VNI. libfabric reads `SLINGSHOT_SVC_IDS` (injected as an env var by the NRI plugin) and uses it instead of allocating its own service, ensuring the pod operates within its allocated fabric resources. `SLINGSHOT_DEVICES` and `SLINGSHOT_VNIS` carry the corresponding device name and VNI, aligned by position.
 
 ### Namespace-scoped VNI allocation
 
@@ -438,9 +475,9 @@ Check in order:
 
 4. **Env vars injected** — inside the pod:
    ```bash
-   env | grep FI_CXI
+   env | grep SLINGSHOT
    ```
-   Should show `FI_CXI_SVC_ID=<n>`.
+   Should show `SLINGSHOT_DEVICES=cxi0`, `SLINGSHOT_VNIS=<n>`, `SLINGSHOT_SVC_IDS=<n>`.
 
 ### Claim rejected: "has no CXI resource config"
 

@@ -41,8 +41,9 @@ type Config struct {
 	MockDevices     []*cxi.Device
 	Overhead        cxi.ResourceSet
 	RefreshInterval time.Duration
-	CDIEnvConfig    cdi.CDIEnvConfig
-	EnableCDIEnv    bool // if false, env/nccl/ofi CDI specs are not written and not injected into pods
+	CDIEnvConfig         cdi.CDIEnvConfig
+	EnableCDIEnv         bool   // if false, env/nccl/ofi CDI specs are not written and not injected into pods
+	ContainerdConfigPath string // path for the containerd CDI config drop-in; empty = skip
 }
 
 // Driver implements kubeletplugin.DRAPlugin for CXI devices.
@@ -59,9 +60,10 @@ type Driver struct {
 	store           *AllocationStore
 	overhead        cxi.ResourceSet // admin-configured per-device reserved overhead
 	refreshInterval time.Duration   // how often to republish ResourceSlice with fresh avail attrs
-	cdiEnvConfig    cdi.CDIEnvConfig
-	enableCDIEnv    bool          // if false, env/nccl/ofi CDI specs are not written and not injected into pods
-	notify          chan struct{} // signals an immediate ResourceSlice republish
+	cdiEnvConfig         cdi.CDIEnvConfig
+	enableCDIEnv         bool   // if false, env/nccl/ofi CDI specs are not written and not injected into pods
+	containerdConfigPath string // path for the containerd CDI config drop-in; empty = skip
+	notify               chan struct{} // signals an immediate ResourceSlice republish
 
 	pendingMu sync.Mutex
 	pending   map[types.UID]pendingEntry // claimUID → in-flight grant not yet backed by a service
@@ -75,7 +77,9 @@ type Driver struct {
 	// Used by the ClaimBinder to enforce the SHS14 per-device VNI
 	// uniqueness constraint: every claim in a namespace shares the
 	// namespace's VNI, and the kernel rejects two services with the same
-	// VNI on the same device with -EEXIST from cxil_svc_set_vni_range.
+	// VNI on the same device with -EEXIST from cxil_alloc_svc (the RX-
+	// profile vni_overlap_test rejects a second service whose VNI matches
+	// an existing one on the device).
 	// Also drives the active_namespaces ResourceSlice attribute that
 	// pre-filters scheduling via the admission-injected CEL selector — see
 	// activeNamespacesFor.
@@ -125,8 +129,9 @@ func New(cfg Config) *Driver {
 		store:             NewAllocationStore(),
 		overhead:          cfg.Overhead,
 		refreshInterval:   cfg.RefreshInterval,
-		cdiEnvConfig:      cfg.CDIEnvConfig,
-		enableCDIEnv:      cfg.EnableCDIEnv,
+		cdiEnvConfig:         cfg.CDIEnvConfig,
+		enableCDIEnv:         cfg.EnableCDIEnv,
+		containerdConfigPath: cfg.ContainerdConfigPath,
 		notify:            make(chan struct{}, 1),
 		pending:           make(map[types.UID]pendingEntry),
 		nsDeviceOccupancy: make(map[string]map[string]types.UID),
@@ -194,7 +199,8 @@ func (d *Driver) removeOccupancyLocked(namespace, deviceName string) bool {
 // NRI plugin in StopPodSandbox after a successful DestroyService: at that
 // point the kernel no longer holds the VNI on the device and another claim
 // in the same namespace can be placed here without triggering -EEXIST from
-// cxil_svc_set_vni_range.
+// cxil_alloc_svc (whose RX-profile vni_overlap_test would otherwise reject
+// the new service).
 //
 // Idempotent: calls for an unknown (namespace, deviceName) pair are no-ops,
 // so the path is safe if NRI fires StopPodSandbox twice for the same sandbox
@@ -456,10 +462,25 @@ func (d *Driver) Run(ctx context.Context) error {
 				return fmt.Errorf("writing CDI NCCL spec: %w", err)
 			}
 		}
-		if d.cdiEnvConfig.AWSofiNCCLPrefix != "" {
+		if len(d.cdiEnvConfig.AWSofiMounts) > 0 {
 			if err := cdi.WriteAWSofiNCCLSpec(d.cdiRoot, d.driverName, d.cdiEnvConfig); err != nil {
 				return fmt.Errorf("writing CDI aws-ofi-nccl spec: %w", err)
 			}
+		}
+	}
+
+	// Write containerd CDI config drop-in and reload containerd AFTER all spec
+	// files are on disk — containerd's CDI cache must see the complete set.
+	if d.containerdConfigPath != "" {
+		if err := cdi.WriteContainerdCDIConfig(d.containerdConfigPath, []string{d.cdiRoot}); err != nil {
+			return fmt.Errorf("writing containerd CDI config: %w", err)
+		}
+		pid, err := cdi.FindContainerdPID("/proc")
+		if err != nil {
+			return fmt.Errorf("finding containerd PID: %w", err)
+		}
+		if err := cdi.SignalContainerd(pid); err != nil {
+			return fmt.Errorf("signalling containerd: %w", err)
 		}
 	}
 
