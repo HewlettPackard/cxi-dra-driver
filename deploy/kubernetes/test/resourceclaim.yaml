@@ -170,3 +170,36 @@ spec:
               le_pools: 14
               tle_pools: 3
               cdi_profiles: ["env", "nccl", "aws-ofi-nccl"]
+---
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata:
+  annotations:
+  name: cxi-2-small
+  namespace: default
+spec:
+  metadata: {}
+  spec:
+    devices:
+      config:
+      - opaque:
+          driver: cxi.slingshot.hpe.com
+          parameters:
+            acs: 2
+            cdi_profiles:
+            - env
+            cts: 4
+            eqs: 8
+            le_pools: 1
+            ptes: 4
+            tgqs: 2
+            tle_pools: 1
+            txqs: 4
+        requests:
+        - cxi
+      requests:
+      - exactly:
+          allocationMode: ExactCount
+          count: 2
+          deviceClassName: cxi-device
+        name: cxi
