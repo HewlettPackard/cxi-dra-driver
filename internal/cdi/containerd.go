@@ -11,16 +11,19 @@ import (
 )
 
 // WriteContainerdCDIConfig writes a containerd config fragment that enables
-// CDI and registers cdiSpecDirs as the CDI spec search paths. It is idempotent
-// — calling it again with the same arguments overwrites the file in place.
+// CDI and registers cdiSpecDirs as the CDI spec search paths.
+//
+// It reports whether the on-disk content changed. If the file already exists
+// with byte-identical content, it is left untouched and changed=false is
+// returned. This lets callers skip the disruptive containerd SIGHUP reload on
+// no-op rollouts: the drop-in lives on a persistent hostPath, so an image-only
+// DaemonSet rollout finds identical content and must NOT reload containerd —
+// a gratuitous reload tears down the CRI/NRI subsystems and can briefly flip
+// the node into NotReady.
 //
 // The file must be placed under containerd's conf.d drop-in directory
 // (typically /etc/containerd/conf.d/) so containerd picks it up on restart.
-func WriteContainerdCDIConfig(path string, cdiSpecDirs []string) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return fmt.Errorf("creating containerd conf.d dir: %w", err)
-	}
-
+func WriteContainerdCDIConfig(path string, cdiSpecDirs []string) (changed bool, err error) {
 	quoted := make([]string, len(cdiSpecDirs))
 	for i, d := range cdiSpecDirs {
 		quoted[i] = fmt.Sprintf("%q", d)
@@ -31,7 +34,17 @@ func WriteContainerdCDIConfig(path string, cdiSpecDirs []string) error {
   cdi_spec_dirs = [%s]
 `, strings.Join(quoted, ", "))
 
-	return os.WriteFile(path, []byte(content), 0o644)
+	if existing, err := os.ReadFile(path); err == nil && string(existing) == content {
+		return false, nil
+	}
+
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return false, fmt.Errorf("creating containerd conf.d dir: %w", err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // FindContainerdPID scans procRoot (normally "/proc") for a process whose comm

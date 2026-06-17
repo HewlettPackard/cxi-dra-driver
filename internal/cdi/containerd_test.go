@@ -14,7 +14,7 @@ func TestWriteContainerdCDIConfig_CreatesFile(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "50-cxi-cdi.toml")
 
-	if err := WriteContainerdCDIConfig(path, []string{"/var/run/cdi"}); err != nil {
+	if _, err := WriteContainerdCDIConfig(path, []string{"/var/run/cdi"}); err != nil {
 		t.Fatalf("WriteContainerdCDIConfig: %v", err)
 	}
 
@@ -40,7 +40,7 @@ func TestWriteContainerdCDIConfig_MultipleDirs(t *testing.T) {
 	path := filepath.Join(dir, "50-cxi-cdi.toml")
 
 	dirs := []string{"/var/run/cdi", "/etc/cdi"}
-	if err := WriteContainerdCDIConfig(path, dirs); err != nil {
+	if _, err := WriteContainerdCDIConfig(path, dirs); err != nil {
 		t.Fatalf("WriteContainerdCDIConfig: %v", err)
 	}
 
@@ -56,7 +56,7 @@ func TestWriteContainerdCDIConfig_CreatesParentDir(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "conf.d", "50-cxi-cdi.toml")
 
-	if err := WriteContainerdCDIConfig(path, []string{"/var/run/cdi"}); err != nil {
+	if _, err := WriteContainerdCDIConfig(path, []string{"/var/run/cdi"}); err != nil {
 		t.Fatalf("WriteContainerdCDIConfig: %v", err)
 	}
 
@@ -69,11 +69,80 @@ func TestWriteContainerdCDIConfig_IdempotentOnRerun(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "50-cxi-cdi.toml")
 
-	if err := WriteContainerdCDIConfig(path, []string{"/var/run/cdi"}); err != nil {
+	if _, err := WriteContainerdCDIConfig(path, []string{"/var/run/cdi"}); err != nil {
 		t.Fatalf("first write: %v", err)
 	}
-	if err := WriteContainerdCDIConfig(path, []string{"/var/run/cdi"}); err != nil {
+	if _, err := WriteContainerdCDIConfig(path, []string{"/var/run/cdi"}); err != nil {
 		t.Fatalf("second write: %v", err)
+	}
+}
+
+// TestWriteContainerdCDIConfig_ReportsChangedOnCreate ensures the first write
+// to a fresh path reports changed=true so the caller knows it must reload
+// containerd.
+func TestWriteContainerdCDIConfig_ReportsChangedOnCreate(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "50-cxi-cdi.toml")
+
+	changed, err := WriteContainerdCDIConfig(path, []string{"/var/run/cdi"})
+	if err != nil {
+		t.Fatalf("WriteContainerdCDIConfig: %v", err)
+	}
+	if !changed {
+		t.Error("expected changed=true on first write, got false")
+	}
+}
+
+// TestWriteContainerdCDIConfig_NoChangeOnIdenticalRerun is the regression test
+// for the rollout-restart NotReady bug: when the drop-in already exists with
+// identical content (the case on every image-only rollout, since the file
+// lives on a persistent hostPath), the function must report changed=false and
+// leave the file untouched so the caller skips the disruptive containerd SIGHUP.
+func TestWriteContainerdCDIConfig_NoChangeOnIdenticalRerun(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "50-cxi-cdi.toml")
+
+	if _, err := WriteContainerdCDIConfig(path, []string{"/var/run/cdi"}); err != nil {
+		t.Fatalf("first write: %v", err)
+	}
+	before, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	changed, err := WriteContainerdCDIConfig(path, []string{"/var/run/cdi"})
+	if err != nil {
+		t.Fatalf("second write: %v", err)
+	}
+	if changed {
+		t.Error("expected changed=false when content is identical, got true")
+	}
+
+	after, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !before.ModTime().Equal(after.ModTime()) {
+		t.Error("file was rewritten despite identical content (mtime changed)")
+	}
+}
+
+// TestWriteContainerdCDIConfig_ReportsChangedWhenContentDiffers ensures a
+// genuine config change (different spec dirs) still triggers a reload.
+func TestWriteContainerdCDIConfig_ReportsChangedWhenContentDiffers(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "50-cxi-cdi.toml")
+
+	if _, err := WriteContainerdCDIConfig(path, []string{"/var/run/cdi"}); err != nil {
+		t.Fatalf("first write: %v", err)
+	}
+
+	changed, err := WriteContainerdCDIConfig(path, []string{"/var/run/cdi", "/etc/cdi"})
+	if err != nil {
+		t.Fatalf("second write: %v", err)
+	}
+	if !changed {
+		t.Error("expected changed=true when spec dirs differ, got false")
 	}
 }
 

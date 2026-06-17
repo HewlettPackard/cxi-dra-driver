@@ -29,6 +29,14 @@ type pendingEntry struct {
 	resources  cxi.ResourceSet
 }
 
+// pendingKey identifies one in-flight grant. A claim that allocates more than
+// one CXI device (a count>1 request) holds one pending entry per device, so
+// the map is keyed by (claim, device) rather than claim alone.
+type pendingKey struct {
+	claimUID   types.UID
+	deviceName string
+}
+
 // Config holds all configuration for a Driver instance.
 type Config struct {
 	NodeName        string
@@ -66,7 +74,7 @@ type Driver struct {
 	notify               chan struct{} // signals an immediate ResourceSlice republish
 
 	pendingMu sync.Mutex
-	pending   map[types.UID]pendingEntry // claimUID → in-flight grant not yet backed by a service
+	pending   map[pendingKey]pendingEntry // (claim, device) → in-flight grant not yet backed by a service
 	// nsDeviceOccupancy records which claim currently holds each
 	// (namespace, device) slot. Keyed namespace → device → claim UID.
 	// At most one entry per (namespace, device) is ever present:
@@ -105,7 +113,11 @@ type Driver struct {
 	// scheduler has cleared Status.Allocation. The two maps are kept in
 	// lockstep by removeOccupancyLocked and checkAndAddPending; the binder
 	// holds no occupancy state of its own.
-	claimToOccupancy map[types.UID]occupancyKey
+	//
+	// A claim that allocates more than one CXI device (count>1) holds one
+	// slot per device, so the value is a slice. Single-device claims — the
+	// common case — hold a one-element slice.
+	claimToOccupancy map[types.UID][]occupancyKey
 }
 
 // occupancyKey identifies one namespace's hold on one device. Used as the
@@ -133,9 +145,9 @@ func New(cfg Config) *Driver {
 		enableCDIEnv:         cfg.EnableCDIEnv,
 		containerdConfigPath: cfg.ContainerdConfigPath,
 		notify:            make(chan struct{}, 1),
-		pending:           make(map[types.UID]pendingEntry),
+		pending:           make(map[pendingKey]pendingEntry),
 		nsDeviceOccupancy: make(map[string]map[string]types.UID),
-		claimToOccupancy:  make(map[types.UID]occupancyKey),
+		claimToOccupancy:  make(map[types.UID][]occupancyKey),
 	}
 }
 
@@ -154,10 +166,12 @@ func (d *Driver) TriggerRepublish() {
 	}
 }
 
-// RemovePending removes the in-flight pending grant for a claim. Called by
-// the NRI plugin after a CXI service is successfully created — at that point
-// the hardware service accounts for the resources and the pending entry would
-// otherwise double-subtract from effective capacity.
+// RemovePending removes all in-flight pending grants for a claim. Called by
+// the NRI plugin after a pod's CXI services are successfully created — at that
+// point the hardware services account for the resources and the pending
+// entries would otherwise double-subtract from effective capacity. A claim
+// that allocated more than one device has one pending entry per device; all of
+// them are cleared here.
 //
 // Does NOT touch nsDeviceOccupancy. The service is alive on the device until
 // DestroyService runs, so the namespace continues to occupy this device for
@@ -167,7 +181,11 @@ func (d *Driver) TriggerRepublish() {
 func (d *Driver) RemovePending(claimUID types.UID) {
 	d.pendingMu.Lock()
 	defer d.pendingMu.Unlock()
-	delete(d.pending, claimUID)
+	for k := range d.pending {
+		if k.claimUID == claimUID {
+			delete(d.pending, k)
+		}
+	}
 }
 
 // removeOccupancyLocked releases the (namespace, deviceName) slot, if any,
@@ -191,7 +209,22 @@ func (d *Driver) removeOccupancyLocked(namespace, deviceName string) bool {
 	if len(devs) == 0 {
 		delete(d.nsDeviceOccupancy, namespace)
 	}
-	delete(d.claimToOccupancy, claimUID)
+	// Drop this (namespace, device) slot from the claim's slot list, keeping
+	// any other devices the claim still holds. Delete the claim's entry only
+	// once its last slot is released.
+	keys := d.claimToOccupancy[claimUID]
+	kept := keys[:0]
+	for _, k := range keys {
+		if k.namespace == namespace && k.deviceName == deviceName {
+			continue
+		}
+		kept = append(kept, k)
+	}
+	if len(kept) == 0 {
+		delete(d.claimToOccupancy, claimUID)
+	} else {
+		d.claimToOccupancy[claimUID] = kept
+	}
 	return true
 }
 
@@ -236,45 +269,54 @@ func (d *Driver) RemoveOccupancy(namespace, deviceName string) {
 // nsDeviceOccupancy and the active_namespaces attribute would keep
 // excluding the device for this namespace.
 //
-// Idempotent: claims with no recorded slot are no-ops. Triggers an
-// immediate republish on real state change so the freed slot becomes
-// visible to other claims in the namespace immediately, not at the next
-// 10s periodic refresh.
+// Idempotent: claims with no recorded slot are no-ops. A claim that allocated
+// more than one device releases every slot it holds. Triggers an immediate
+// republish on real state change so the freed slots become visible to other
+// claims in the namespace immediately, not at the next 10s periodic refresh.
 func (d *Driver) RemoveOccupancyForClaim(claimUID types.UID) {
 	d.pendingMu.Lock()
 	defer d.pendingMu.Unlock()
-	key, ok := d.claimToOccupancy[claimUID]
+	keys, ok := d.claimToOccupancy[claimUID]
 	if !ok {
 		return
 	}
-	if d.removeOccupancyLocked(key.namespace, key.deviceName) {
+	// Copy first: removeOccupancyLocked mutates the slice stored under this
+	// claim, so ranging over the live slice while it shrinks is unsafe.
+	changed := false
+	for _, key := range append([]occupancyKey(nil), keys...) {
+		if d.removeOccupancyLocked(key.namespace, key.deviceName) {
+			changed = true
+		}
+	}
+	if changed {
 		d.TriggerRepublish()
 	}
 }
 
-// checkAndAddPending atomically validates a grant request against two
-// constraints:
+// checkAndAddPending atomically validates a grant request for one
+// (claim, device) against two constraints:
 //
-//  1. (namespace, deviceName) must not already be occupied by another claim
-//     from the same namespace. This enforces the SHS14 per-device VNI
+//  1. (namespace, deviceName) must not already be occupied by a DIFFERENT
+//     claim from the same namespace. This enforces the SHS14 per-device VNI
 //     uniqueness constraint (see the nsDeviceOccupancy field docs).
 //  2. requested must fit within (hwAvail − sum of pending grants on this
-//     device, excluding any prior in-flight entry for this same claim UID).
+//     device, excluding this claim's own prior entry for this device).
+//
+// A claim that allocates more than one device calls this once per device; the
+// grants are independent because each targets a distinct (namespace, device)
+// slot. Two distinct devices in one namespace at the same VNI do not violate
+// SHS14 (uniqueness is per device), so the occupancy guard only fires for a
+// different claim on the same device.
 //
 // hwAvail must be the raw value from ReadAvailableCapacity — do NOT subtract
 // overhead before calling, as ReadAvailableCapacity already reflects all
 // running service consumption including system services.
 //
-// Atomic reallocation: if the same claim UID previously held a slot (the
-// scheduler can re-allocate without our seeing Allocation=nil in between,
-// e.g. PostFilter clears + next PreFilter re-allocates within one watch
-// event), the prior slot and prior pending entry are released first so they
-// do not leak and the capacity check does not double-count.
-//
-// On a successful grant the new entry is recorded in pending and the
-// (namespace, deviceName) slot is taken in nsDeviceOccupancy +
-// claimToOccupancy. A single TriggerRepublish covers both the prior release
-// (if any) and the new grant.
+// Idempotent: if THIS claim already holds (namespace, deviceName), the call is
+// a no-op grant — re-evaluation does not double-count or churn the slice.
+// Stale slots from a subset reallocation (claim dropped a device without an
+// intervening Allocation=nil) are released by reconcileClaimDevices before the
+// per-device loop, not here.
 //
 // Return values:
 //
@@ -296,29 +338,24 @@ func (d *Driver) checkAndAddPending(
 	d.pendingMu.Lock()
 	defer d.pendingMu.Unlock()
 
-	// Defensive cleanup: if the scheduler re-allocated this claim to a new
-	// device without our seeing Allocation=nil in between, the prior slot
-	// and prior pending entry are stale. Release them up front so they
-	// don't (a) leak in nsDeviceOccupancy, (b) over-block other grants on
-	// the old device, or (c) inflate the pendingSum below. Track whether
-	// the release was a real state change so a subsequent refusal still
-	// triggers a republish.
-	priorReleased := false
-	if oldKey, ok := d.claimToOccupancy[claimUID]; ok {
-		priorReleased = d.removeOccupancyLocked(oldKey.namespace, oldKey.deviceName)
+	// Idempotent re-grant: this claim already holds this exact (ns, device)
+	// slot. Nothing to change — re-evaluation of an already-granted device
+	// (e.g. while another device of the same claim is still settling) must
+	// not release-and-readd the slot or double-count its pending entry.
+	if held, ok := d.nsDeviceOccupancy[namespace][deviceName]; ok && held == claimUID {
+		return true, false
 	}
-	delete(d.pending, claimUID)
 
 	// SHS14 enforces VNI uniqueness per device kernel-side. Every claim in
-	// the same namespace shares the namespace VNI, so two claims from the
-	// same namespace cannot co-locate on the same device.
+	// the same namespace shares the namespace VNI, so a DIFFERENT claim from
+	// the same namespace cannot co-locate on this device.
 	if _, exists := d.nsDeviceOccupancy[namespace][deviceName]; exists {
-		if priorReleased {
-			d.TriggerRepublish()
-		}
 		return false, true
 	}
 
+	// Capacity check excludes this claim's own prior pending entry for this
+	// device (there is none — the idempotent guard above returned early if it
+	// held the slot), so the sum reflects only OTHER claims on the device.
 	var pendingSum cxi.ResourceSet
 	for _, e := range d.pending {
 		if e.deviceName == deviceName {
@@ -327,13 +364,10 @@ func (d *Driver) checkAndAddPending(
 	}
 	effective := hwAvail.Sub(pendingSum).ClampToZero()
 	if !requested.Fits(effective) {
-		if priorReleased {
-			d.TriggerRepublish()
-		}
 		return false, false
 	}
 
-	d.pending[claimUID] = pendingEntry{
+	d.pending[pendingKey{claimUID: claimUID, deviceName: deviceName}] = pendingEntry{
 		namespace:  namespace,
 		deviceName: deviceName,
 		resources:  requested,
@@ -342,26 +376,60 @@ func (d *Driver) checkAndAddPending(
 		d.nsDeviceOccupancy[namespace] = make(map[string]types.UID)
 	}
 	d.nsDeviceOccupancy[namespace][deviceName] = claimUID
-	d.claimToOccupancy[claimUID] = occupancyKey{namespace: namespace, deviceName: deviceName}
-	// Grant corresponds to a 0→1 transition on (namespace, device) — the
-	// early guard above returned `occupied` if a different claim held the
-	// slot, and the defensive release at the top cleared any prior hold by
-	// this claim. Trigger an immediate ResourceSlice republish so:
+	d.claimToOccupancy[claimUID] = append(d.claimToOccupancy[claimUID],
+		occupancyKey{namespace: namespace, deviceName: deviceName})
+	// Grant corresponds to a 0→1 transition on (namespace, device). Trigger an
+	// immediate ResourceSlice republish so:
 	//   * avail_* reflects the new pending grant
 	//   * active_namespaces gains this namespace on this device
 	// The admission-injected CEL selector then steers other claims in this
-	// namespace away from this device. The single TriggerRepublish here
-	// covers both the new grant and any prior release.
+	// namespace away from this device.
 	d.TriggerRepublish()
 	return true, false
 }
 
-// hasPending reports whether there is an active in-flight pending grant for
-// the given claim.
-func (d *Driver) hasPending(claimUID types.UID) bool {
+// reconcileClaimDevices releases any pending grant and occupancy slot the
+// claim holds for a device NOT in currentDevices. It covers a subset
+// reallocation: the scheduler can move a claim from device set {A,B} to {A,C}
+// without our ever seeing Allocation=nil in between, which would otherwise
+// leak B's slot in nsDeviceOccupancy and keep the namespace pinned to B via
+// active_namespaces. Called by the ClaimBinder before it (re)evaluates the
+// claim's current device set. Triggers a single republish on any change.
+func (d *Driver) reconcileClaimDevices(claimUID types.UID, currentDevices map[string]bool) {
 	d.pendingMu.Lock()
 	defer d.pendingMu.Unlock()
-	_, ok := d.pending[claimUID]
+	changed := false
+
+	// Release occupancy slots for devices the claim no longer holds. Copy the
+	// slice first: removeOccupancyLocked mutates it.
+	for _, key := range append([]occupancyKey(nil), d.claimToOccupancy[claimUID]...) {
+		if currentDevices[key.deviceName] {
+			continue
+		}
+		if d.removeOccupancyLocked(key.namespace, key.deviceName) {
+			changed = true
+		}
+	}
+	// Drop pending entries for the same dropped devices so they don't inflate
+	// the per-device pendingSum or linger after the service is gone.
+	for k := range d.pending {
+		if k.claimUID == claimUID && !currentDevices[k.deviceName] {
+			delete(d.pending, k)
+			changed = true
+		}
+	}
+
+	if changed {
+		d.TriggerRepublish()
+	}
+}
+
+// hasPending reports whether there is an active in-flight pending grant for
+// the given (claim, device).
+func (d *Driver) hasPending(claimUID types.UID, deviceName string) bool {
+	d.pendingMu.Lock()
+	defer d.pendingMu.Unlock()
+	_, ok := d.pending[pendingKey{claimUID: claimUID, deviceName: deviceName}]
 	return ok
 }
 
@@ -472,15 +540,24 @@ func (d *Driver) Run(ctx context.Context) error {
 	// Write containerd CDI config drop-in and reload containerd AFTER all spec
 	// files are on disk — containerd's CDI cache must see the complete set.
 	if d.containerdConfigPath != "" {
-		if err := cdi.WriteContainerdCDIConfig(d.containerdConfigPath, []string{d.cdiRoot}); err != nil {
+		changed, err := cdi.WriteContainerdCDIConfig(d.containerdConfigPath, []string{d.cdiRoot})
+		if err != nil {
 			return fmt.Errorf("writing containerd CDI config: %w", err)
 		}
-		pid, err := cdi.FindContainerdPID("/proc")
-		if err != nil {
-			return fmt.Errorf("finding containerd PID: %w", err)
-		}
-		if err := cdi.SignalContainerd(pid); err != nil {
-			return fmt.Errorf("signalling containerd: %w", err)
+		// Only reload containerd when the drop-in actually changed. The file
+		// lives on a persistent hostPath, so an image-only DaemonSet rollout
+		// finds identical content; SIGHUPing containerd in that case is a
+		// gratuitous reload that tears down the CRI/NRI subsystems and can
+		// briefly flip the node into NotReady. Reload only on genuine change
+		// (first install or a config edit).
+		if changed {
+			pid, err := cdi.FindContainerdPID("/proc")
+			if err != nil {
+				return fmt.Errorf("finding containerd PID: %w", err)
+			}
+			if err := cdi.SignalContainerd(pid); err != nil {
+				return fmt.Errorf("signalling containerd: %w", err)
+			}
 		}
 	}
 

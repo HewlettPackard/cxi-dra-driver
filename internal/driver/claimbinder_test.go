@@ -58,9 +58,9 @@ func newClaimBinderHarness(t *testing.T, claims ...*resourceapi.ResourceClaim) (
 		store:             NewAllocationStore(),
 		kubeClient:        client,
 		notify:            make(chan struct{}, 1),
-		pending:           make(map[types.UID]pendingEntry),
+		pending:           make(map[pendingKey]pendingEntry),
 		nsDeviceOccupancy: make(map[string]map[string]types.UID),
-		claimToOccupancy:  make(map[types.UID]occupancyKey),
+		claimToOccupancy:  make(map[types.UID][]occupancyKey),
 	}
 	binder := NewClaimBinder(d, client, testDriver, nodePool)
 	return binder, d, client
@@ -121,6 +121,35 @@ func TestClaimBinder_EvaluateClaim_GrantsReady(t *testing.T) {
 	}
 	if got := d.nsDeviceOccupancy["ns1"]["cxi0"]; got != "c1" {
 		t.Errorf("occupancy[ns1][cxi0] = %q, want %q", got, "c1")
+	}
+}
+
+// A single claim allocating two devices (a count: 2 request) must drive BOTH
+// devices' Ready binding conditions to True — the scheduler will not bind the
+// pod until every allocated device is Ready. Before the multi-device fix the
+// binder only evaluated the first result, leaving cxi1 stuck in
+// BindingConditionsPending forever. Both occupancy slots must be held by the
+// claim; two distinct devices at the same namespace VNI do not violate SHS14.
+func TestClaimBinder_EvaluateClaim_MultiDeviceGrantsAllReady(t *testing.T) {
+	claim := makeClaim("c1", "ns1", "claim-1", "cxi0")
+	// Add a second allocated device to the same claim.
+	claim.Status.Allocation.Devices.Results = append(
+		claim.Status.Allocation.Devices.Results, cxiResult("cxi1"))
+	binder, d, client := newClaimBinderHarness(t, claim)
+
+	binder.evaluateClaim(context.Background(), claim)
+
+	for _, dev := range []string{"cxi0", "cxi1"} {
+		cond := conditionFor(t, client, claim, dev, "Ready")
+		if cond == nil || cond.Status != metav1.ConditionTrue {
+			t.Fatalf("%s Ready condition = %+v, want Status=True", dev, cond)
+		}
+		if got := d.nsDeviceOccupancy["ns1"][dev]; got != "c1" {
+			t.Errorf("occupancy[ns1][%s] = %q, want %q", dev, got, "c1")
+		}
+	}
+	if slots := d.claimToOccupancy["c1"]; len(slots) != 2 {
+		t.Errorf("claimToOccupancy[c1] = %+v, want 2 slots (cxi0, cxi1)", slots)
 	}
 }
 
@@ -262,7 +291,7 @@ func TestClaimBinder_EvaluateClaim_AllocationNilCleansOccupancy(t *testing.T) {
 	if _, ok := d.claimToOccupancy["c1"]; ok {
 		t.Errorf("claimToOccupancy[c1] still present after Allocation=nil")
 	}
-	if _, ok := d.pending["c1"]; ok {
+	if hasPend(d, "c1", "cxi0") {
 		t.Errorf("pending[c1] still present after Allocation=nil")
 	}
 
@@ -302,7 +331,7 @@ func TestClaimBinder_OnClaimDeleted_CleansOccupancy(t *testing.T) {
 	if _, ok := d.claimToOccupancy["c1"]; ok {
 		t.Errorf("claimToOccupancy[c1] still present after onClaimDeleted")
 	}
-	if _, ok := d.pending["c1"]; ok {
+	if hasPend(d, "c1", "cxi0") {
 		t.Errorf("pending[c1] still present after onClaimDeleted")
 	}
 

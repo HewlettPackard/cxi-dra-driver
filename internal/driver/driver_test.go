@@ -17,9 +17,9 @@ import (
 // through to the default branch when the send case is on a nil channel.
 func newDriverForTest() *Driver {
 	return &Driver{
-		pending:           make(map[types.UID]pendingEntry),
+		pending:           make(map[pendingKey]pendingEntry),
 		nsDeviceOccupancy: make(map[string]map[string]types.UID),
-		claimToOccupancy:  make(map[types.UID]occupancyKey),
+		claimToOccupancy:  make(map[types.UID][]occupancyKey),
 	}
 }
 
@@ -58,6 +58,23 @@ func notifyFired(d *Driver) bool {
 // pending logic, not resource fit.
 var fits = cxi.ResourceSet{TXQs: 1, TGQs: 1, EQs: 1, CTs: 1, PTEs: 1, ACs: 1}
 
+// hasPend reports whether the (claim, device) pending grant is recorded.
+func hasPend(d *Driver, claim types.UID, device string) bool {
+	_, ok := d.pending[pendingKey{claimUID: claim, deviceName: device}]
+	return ok
+}
+
+// occSlot returns the single occupancy slot a claim holds, failing the test if
+// the claim holds zero or more than one (the count==1 case these tests cover).
+func occSlot(t *testing.T, d *Driver, claim types.UID) occupancyKey {
+	t.Helper()
+	ks := d.claimToOccupancy[claim]
+	if len(ks) != 1 {
+		t.Fatalf("claimToOccupancy[%s] has %d slots, want 1: %+v", claim, len(ks), ks)
+	}
+	return ks[0]
+}
+
 // hwAvailPlenty is a hardware capacity well above the resources requested in
 // these tests, so the capacity branch never fires.
 var hwAvailPlenty = cxi.ResourceSet{TXQs: 1000, TGQs: 1000, EQs: 1000, CTs: 1000, PTEs: 1000, ACs: 1000, LEs: 1000, TLEs: 1000}
@@ -71,13 +88,13 @@ func TestCheckAndAddPending_GrantsWhenFreeAndFits(t *testing.T) {
 	if got := d.nsDeviceOccupancy["ns1"]["cxi0"]; got != "c1" {
 		t.Errorf("nsDeviceOccupancy[ns1][cxi0] = %q, want %q", got, "c1")
 	}
-	if _, ok := d.pending["c1"]; !ok {
+	if !hasPend(d, "c1", "cxi0") {
 		t.Errorf("pending[c1] not recorded after grant")
 	}
 	// claimToOccupancy must be kept in lockstep with nsDeviceOccupancy so
 	// RemoveOccupancyForClaim can find this entry when the binder later
 	// observes Allocation=nil or a claim deletion.
-	if got := d.claimToOccupancy["c1"]; got.namespace != "ns1" || got.deviceName != "cxi0" {
+	if got := occSlot(t, d, "c1"); got.namespace != "ns1" || got.deviceName != "cxi0" {
 		t.Errorf("claimToOccupancy[c1] = %+v, want {ns1, cxi0}", got)
 	}
 }
@@ -99,7 +116,7 @@ func TestCheckAndAddPending_SameNamespaceSameDeviceRejects(t *testing.T) {
 	if got := d.nsDeviceOccupancy["ns1"]["cxi0"]; got != "c1" {
 		t.Errorf("slot holder after refused second grant = %q, want %q", got, "c1")
 	}
-	if _, ok := d.pending["c2"]; ok {
+	if hasPend(d, "c2", "cxi0") {
 		t.Errorf("pending[c2] must not be recorded on occupancy refusal")
 	}
 	if _, ok := d.claimToOccupancy["c2"]; ok {
@@ -146,7 +163,7 @@ func TestCheckAndAddPending_OverHardwareDoesNotIncrement(t *testing.T) {
 	if granted || occupied {
 		t.Fatalf("over hardware: got (granted=%v,occupied=%v), want (false,false)", granted, occupied)
 	}
-	if _, ok := d.pending["c1"]; ok {
+	if hasPend(d, "c1", "cxi0") {
 		t.Errorf("pending[c1] must not be recorded on capacity refusal")
 	}
 	if _, ok := d.nsDeviceOccupancy["ns1"]["cxi0"]; ok {
@@ -190,7 +207,7 @@ func TestRemoveOccupancy(t *testing.T) {
 	if _, ok := d.claimToOccupancy["c1"]; ok {
 		t.Errorf("claimToOccupancy[c1] still present after RemoveOccupancy(ns1, cxi0)")
 	}
-	if got := d.claimToOccupancy["c2"]; got.namespace != "ns1" || got.deviceName != "cxi1" {
+	if got := occSlot(t, d, "c2"); got.namespace != "ns1" || got.deviceName != "cxi1" {
 		t.Errorf("claimToOccupancy[c2] = %+v, want {ns1, cxi1}", got)
 	}
 
@@ -242,7 +259,7 @@ func TestRemovePending_DoesNotDecrementOccupancy(t *testing.T) {
 	if got := d.nsDeviceOccupancy["ns1"]["cxi0"]; got != "c1" {
 		t.Errorf("slot after RemovePending = %q, want %q (RemovePending must NOT release the occupancy slot)", got, "c1")
 	}
-	if got := d.claimToOccupancy["c1"]; got.namespace != "ns1" || got.deviceName != "cxi0" {
+	if got := occSlot(t, d, "c1"); got.namespace != "ns1" || got.deviceName != "cxi0" {
 		t.Errorf("claimToOccupancy[c1] after RemovePending = %+v, want {ns1, cxi0}", got)
 	}
 }
@@ -399,9 +416,9 @@ func TestBuildDevices_AlwaysPublishesActiveNamespaces(t *testing.T) {
 	d := &Driver{
 		nodeName:          "test-node",
 		devices:           cxi.MockDevices(3), // cxi0..cxi2
-		pending:           make(map[types.UID]pendingEntry),
+		pending:           make(map[pendingKey]pendingEntry),
 		nsDeviceOccupancy: make(map[string]map[string]types.UID),
-		claimToOccupancy:  make(map[types.UID]occupancyKey),
+		claimToOccupancy:  make(map[types.UID][]occupancyKey),
 	}
 
 	devices := d.buildDevices()
@@ -431,9 +448,9 @@ func TestBuildDevices_PublishesPerDeviceOccupancy(t *testing.T) {
 	d := &Driver{
 		nodeName:          "test-node",
 		devices:           cxi.MockDevices(3), // cxi0..cxi2
-		pending:           make(map[types.UID]pendingEntry),
+		pending:           make(map[pendingKey]pendingEntry),
 		nsDeviceOccupancy: make(map[string]map[string]types.UID),
-		claimToOccupancy:  make(map[types.UID]occupancyKey),
+		claimToOccupancy:  make(map[types.UID][]occupancyKey),
 	}
 	// cxi0: occupied by zeta and alpha (sorted output expected)
 	// cxi1: occupied by mu only
@@ -483,7 +500,7 @@ func TestRemoveOccupancyForClaim(t *testing.T) {
 	if got := d.nsDeviceOccupancy["ns2"]["cxi1"]; got != "c2" {
 		t.Errorf("ns2/cxi1 slot = %q after RemoveOccupancyForClaim(c1), want %q", got, "c2")
 	}
-	if got := d.claimToOccupancy["c2"]; got.namespace != "ns2" || got.deviceName != "cxi1" {
+	if got := occSlot(t, d, "c2"); got.namespace != "ns2" || got.deviceName != "cxi1" {
 		t.Errorf("claimToOccupancy[c2] = %+v after RemoveOccupancyForClaim(c1), want {ns2, cxi1}", got)
 	}
 }
@@ -536,13 +553,15 @@ func TestRemoveOccupancyForClaim_UnblocksSameNamespace(t *testing.T) {
 	}
 }
 
-// Atomic reallocation: the scheduler can move a claim from cxi0 to cxi1
+// Subset reallocation: the scheduler can move a claim from cxi0 to cxi1
 // without the binder observing Status.Allocation=nil in between (one watch
-// event carries both writes). The defensive prior-release in
-// checkAndAddPending must release the old slot, otherwise the namespace
-// would be pinned to BOTH devices in active_namespaces and the CEL selector
-// would exclude both for any other claim in the namespace.
-func TestCheckAndAddPending_AtomicReallocationReleasesPriorSlot(t *testing.T) {
+// event carries both writes). reconcileClaimDevices — which the binder calls
+// with the claim's current device set before granting — must release the slot
+// for the dropped device, otherwise the namespace would be pinned to BOTH
+// devices in active_namespaces and the CEL selector would exclude both for any
+// other claim in the namespace. (checkAndAddPending itself no longer does
+// cross-device release; per-device grants are independent.)
+func TestReconcileClaimDevices_ReleasesDroppedDeviceSlot(t *testing.T) {
 	d := newDriverForTest()
 
 	// First grant: c1 on cxi0.
@@ -551,8 +570,9 @@ func TestCheckAndAddPending_AtomicReallocationReleasesPriorSlot(t *testing.T) {
 		t.Fatalf("setup: ns1/cxi0 = %q, want %q", got, "c1")
 	}
 
-	// Same claim reallocated to cxi1 — the prior slot on cxi0 must be
-	// released as part of the new grant.
+	// Binder observes c1 now allocated to cxi1 only: reconcile to {cxi1}
+	// releases the stale cxi0 slot, then the new device is granted.
+	d.reconcileClaimDevices("c1", map[string]bool{"cxi1": true})
 	granted, occupied := d.checkAndAddPending("c1", "ns1", "cxi1", fits, hwAvailPlenty)
 	if !granted || occupied {
 		t.Fatalf("reallocation grant: got (granted=%v,occupied=%v), want (true,false)", granted, occupied)
@@ -564,14 +584,17 @@ func TestCheckAndAddPending_AtomicReallocationReleasesPriorSlot(t *testing.T) {
 	if got := d.nsDeviceOccupancy["ns1"]["cxi1"]; got != "c1" {
 		t.Errorf("ns1/cxi1 slot = %q after reallocation, want %q", got, "c1")
 	}
-	if got := d.claimToOccupancy["c1"]; got.namespace != "ns1" || got.deviceName != "cxi1" {
+	if got := occSlot(t, d, "c1"); got.namespace != "ns1" || got.deviceName != "cxi1" {
 		t.Errorf("claimToOccupancy[c1] = %+v after reallocation, want {ns1, cxi1}", got)
 	}
 	// Pending must also have followed the move — no stale entry on cxi0.
-	if e, ok := d.pending["c1"]; !ok {
-		t.Errorf("pending[c1] not recorded after reallocation grant")
+	if hasPend(d, "c1", "cxi0") {
+		t.Errorf("stale pending[c1, cxi0] still present after reallocation to cxi1")
+	}
+	if e, ok := d.pending[pendingKey{claimUID: "c1", deviceName: "cxi1"}]; !ok {
+		t.Errorf("pending[c1, cxi1] not recorded after reallocation grant")
 	} else if e.deviceName != "cxi1" {
-		t.Errorf("pending[c1].deviceName = %q after reallocation, want %q", e.deviceName, "cxi1")
+		t.Errorf("pending[c1, cxi1].deviceName = %q, want %q", e.deviceName, "cxi1")
 	}
 }
 
