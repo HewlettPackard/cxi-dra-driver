@@ -1,0 +1,130 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cxi-dra-driver-test
+  namespace: kube-system
+  labels:
+    app: cxi-dra-driver
+spec:
+  replicas: 10
+  selector:
+    matchLabels:
+      app: cxi-dra-driver
+  strategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: cxi-dra-driver
+    spec:
+      serviceAccountName: cxi-dra-driver
+      hostPID: true  # required for future netns inode querying
+      priorityClassName: system-node-critical
+      # Baseline seccomp profile. The driver container is privileged (it needs
+      # raw access to /dev/cxi* and sysfs) so it runs unconfined at runtime, but
+      # declaring the pod baseline satisfies Pod Security Standards and tooling.
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      # Only schedule on nodes with CXI hardware.
+      # Label nodes with: kubectl label node <node> feature.node.kubernetes.io/cxi=true
+      nodeSelector:
+        feature.node.kubernetes.io/cxi: "true"
+      # Spread the 10 replicas across distinct nodes. Required (not preferred)
+      # because the driver opens /dev/cxi* and binds a kubelet plugin socket at
+      # a fixed host path; two replicas on the same node would race for the
+      # socket and double-register the plugin with the kubelet.
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: cxi-dra-driver
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: driver
+          image: docker.io/pirese/cxi-dra-driver:dev
+          imagePullPolicy: Always
+          command:
+            - /cxi-dra-driver
+          args:
+            - --driver-name=cxi.slingshot.hpe.com.test
+            - --cdi-root=/var/run/cdi
+            - --plugin-dir=/var/lib/kubelet/plugins/cxi.slingshot.hpe.com
+            - --registrar-dir=/var/lib/kubelet/plugins_registry
+            - --vni-range-start=100
+            - --vni-range-end=300
+            - --enable-cdi-env=true
+            - --containerd-config-path=/etc/containerd/conf.d/50-cxi-cdi.toml
+            - --env-config=/etc/cxi-dra/env.json
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: POD_UID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          securityContext:
+            privileged: true  # required to access /dev/cxi* and sysfs
+            runAsUser: 0
+          volumeMounts:
+            - name: sys
+              mountPath: /sys
+              readOnly: true
+            - name: dev
+              mountPath: /dev
+            - name: kubelet-plugins
+              mountPath: /var/lib/kubelet/plugins/cxi.slingshot.hpe.com
+            - name: kubelet-registry
+              mountPath: /var/lib/kubelet/plugins_registry
+            - name: containerd-conf
+              mountPath: /etc/containerd/conf.d
+            - name: cdi
+              mountPath: /var/run/cdi
+            - name: nri
+              mountPath: /var/run/nri
+            - name: netns
+              mountPath: /var/run/netns
+              readOnly: true
+            - name: env-config
+              mountPath: /etc/cxi-dra
+              readOnly: true
+      volumes:
+        - name: sys
+          hostPath:
+            path: /sys
+        - name: dev
+          hostPath:
+            path: /dev
+        - name: kubelet-plugins
+          hostPath:
+            path: /var/lib/kubelet/plugins/cxi.slingshot.hpe.com
+            type: DirectoryOrCreate
+        - name: kubelet-registry
+          hostPath:
+            path: /var/lib/kubelet/plugins_registry
+        - name: containerd-conf
+          hostPath:
+            path: /etc/containerd/conf.d
+            type: DirectoryOrCreate
+        - name: cdi
+          hostPath:
+            path: /var/run/cdi
+            type: DirectoryOrCreate
+        - name: nri
+          hostPath:
+            path: /var/run/nri
+            type: DirectoryOrCreate
+        - name: netns
+          hostPath:
+            path: /var/run/netns
+            type: DirectoryOrCreate
+        - name: env-config
+          configMap:
+            name: cxi-dra-driver-env
