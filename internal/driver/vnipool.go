@@ -12,7 +12,12 @@ import (
 	"k8s.io/client-go/tools/leaderelection/resourcelock"
 )
 
-const vniAllocatorLeaseName = "cxi-vni-allocator-leader"
+// vniAllocatorLeaseName is the name of the Lease used for leader election of
+// the namespace VNI allocator. The driver-name prefix is derived from
+// --driver-name so a fork under a different identifier does not collide with
+// another driver's lease. Set once from main() via SetVNIAllocatorLeaseDriver
+// before StartNamespaceVNIAllocator runs.
+var vniAllocatorLeaseName = DefaultDriverName + "-vni-allocator-leader"
 
 // NamespaceVNIConfig configures the cluster-wide namespace→VNI allocator.
 type NamespaceVNIConfig struct {

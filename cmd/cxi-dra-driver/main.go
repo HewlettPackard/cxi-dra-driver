@@ -60,6 +60,8 @@ func main() {
 	)
 	flag.Parse()
 
+	driver.SetDriverName(*driverName)
+
 	kubeClient, err := buildKubeClient(*kubeconfig)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: failed to build kube client: %v\n", err)

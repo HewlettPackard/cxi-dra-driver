@@ -17,7 +17,23 @@ import (
 	"k8s.io/client-go/util/workqueue"
 )
 
-const vniAnnotationKey = "cxi.slingshot.hpe.com/vni"
+// DefaultDriverName is the DRA driver identifier used when --driver-name is not
+// supplied. Also forms the prefix of vniAnnotationKey and vniAllocatorLeaseName
+// until SetDriverName overrides them.
+const DefaultDriverName = "cxi.slingshot.hpe.com"
+// vniAnnotationKey is the namespace annotation that stores the VNI assigned by
+// the allocator. The DNS-subdomain prefix is derived from --driver-name via
+// SetDriverName so a fork under a different identifier does not collide with
+// another driver's annotations.
+var vniAnnotationKey = DefaultDriverName + "/vni"
+// SetDriverName derives all package-level identifiers that depend on the DRA
+// driver name supplied via --driver-name: vniAnnotationKey and
+// vniAllocatorLeaseName. Must be called exactly once at startup, before any
+// goroutine reads or writes these values; there is no locking.
+func SetDriverName(driverName string) {
+    vniAnnotationKey = driverName + "/vni"
+    vniAllocatorLeaseName = driverName + "-vni-allocator-leader"
+}
 
 // nextFreeVNI returns the lowest VNI in [start, end] that is not present in
 // assigned, or (0, false) if the range is exhausted.
