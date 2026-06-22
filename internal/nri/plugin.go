@@ -40,10 +40,11 @@ type Plugin struct {
 	stub             stub.Stub
 	store            *driver.AllocationStore
 	svcMgr           cxi.ServiceManager
-	republish        func()                            // triggers immediate ResourceSlice update
-	onServiceCreated func(types.UID)                   // called with claimUID after service creation
-	onServiceDeleted func()                            // called after any service is deleted, triggers binder retry
+	republish        func()                             // triggers immediate ResourceSlice update
+	onServiceCreated func(types.UID)                    // called with claimUID after service creation
+	onServiceDeleted func()                             // called after any service is deleted, triggers binder retry
 	onOccupancyFreed func(namespace, deviceName string) // called per-(ns,dev) after DestroyService to release per-namespace occupancy
+	recordSvcID      func(ctx context.Context, claimUID types.UID, claimNs, claimName, deviceName string, vni, svcID int)
 	mu               sync.Mutex
 	podStates        map[types.UID]*podState
 	deviceMu         sync.Map // map[string]*sync.Mutex — one mutex per device name
@@ -66,6 +67,10 @@ type Plugin struct {
 // enforce SHS14's per-device VNI uniqueness constraint: two claims from
 // the same namespace cannot co-locate on the same device. See the
 // nsDeviceOccupancy field on Driver for details.
+//
+// recordSvcID is called per (claim, device) after CreateService succeeds, to
+// publish the VNI and svc_id on the claim's status for operator introspection
+// (`kubectl describe resourceclaim`). Best-effort; informational only.
 func New(
 	store *driver.AllocationStore,
 	mock bool,
@@ -73,6 +78,7 @@ func New(
 	onServiceCreated func(types.UID),
 	onServiceDeleted func(),
 	onOccupancyFreed func(namespace, deviceName string),
+	recordSvcID func(ctx context.Context, claimUID types.UID, claimNs, claimName, deviceName string, vni, svcID int),
 ) (*Plugin, error) {
 	var svcMgr cxi.ServiceManager
 	if mock {
@@ -87,6 +93,7 @@ func New(
 		onServiceCreated: onServiceCreated,
 		onServiceDeleted: onServiceDeleted,
 		onOccupancyFreed: onOccupancyFreed,
+		recordSvcID:      recordSvcID,
 		podStates:        make(map[types.UID]*podState),
 	}
 	var err error
@@ -143,7 +150,7 @@ func (p *Plugin) getDeviceLock(name string) *sync.Mutex {
 // The per-device fit-check here is a secondary safety net for the narrow
 // window between Ready=True being granted and the service being created.
 // On failure the pod sandbox creation is retried by the kubelet.
-func (p *Plugin) RunPodSandbox(_ context.Context, pod *api.PodSandbox) error {
+func (p *Plugin) RunPodSandbox(ctx context.Context, pod *api.PodSandbox) error {
 	podUID := types.UID(pod.GetUid())
 	allocs := p.store.Get(podUID)
 	if len(allocs) == 0 {
@@ -208,6 +215,12 @@ func (p *Plugin) RunPodSandbox(_ context.Context, pod *api.PodSandbox) error {
 		}
 		createdDevices = append(createdDevices, alloc.DeviceName)
 		state.svcIDs[alloc.DeviceName] = svcID
+
+		// Publish VNI + svc_id on the claim's status for operator introspection.
+		if alloc.ClaimUID != "" {
+			p.recordSvcID(ctx, alloc.ClaimUID, alloc.ClaimNamespace, alloc.ClaimName,
+				alloc.DeviceName, alloc.VNI, svcID)
+		}
 	}
 
 	p.mu.Lock()

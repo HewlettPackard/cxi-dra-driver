@@ -110,6 +110,9 @@ func (d *Driver) prepareClaim(ctx context.Context, claim *resourceapi.ResourceCl
 
 		pa := d.podAllocationBase(alloc.Device)
 		pa.Resources = requested
+		pa.ClaimUID = claim.UID
+		pa.ClaimNamespace = claim.Namespace
+		pa.ClaimName = claim.Name
 		podAllocs = append(podAllocs, pa)
 	}
 

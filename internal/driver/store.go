@@ -9,12 +9,18 @@ import (
 )
 
 // PodAllocation records which CXI devices were allocated to a pod.
+// ClaimUID/ClaimNamespace/ClaimName attribute each device back to its
+// source claim so the NRI plugin can publish the assigned svc_id to
+// the right RC.Status.Devices[] entry after CreateService.
 type PodAllocation struct {
-	DeviceName string          // e.g. "cxi0"
-	DevPath    string          // e.g. "/dev/cxi0" — host path of the character device
-	HSNIface   string          // e.g. "hsn2"
-	VNI        int             // Virtual Network Identifier for the Slingshot fabric service
-	Resources  cxi.ResourceSet // negotiated per-service resource limits
+	DeviceName     string          // e.g. "cxi0"
+	DevPath        string          // e.g. "/dev/cxi0" — host path of the character device
+	HSNIface       string          // e.g. "hsn2"
+	VNI            int             // Virtual Network Identifier for the Slingshot fabric service
+	Resources      cxi.ResourceSet // negotiated per-service resource limits
+	ClaimUID       types.UID
+	ClaimNamespace string
+	ClaimName      string
 }
 
 // AllocationStore is a concurrency-safe map of pod UID → allocated CXI devices.
