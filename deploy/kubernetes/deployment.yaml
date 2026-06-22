@@ -1,7 +1,7 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: cxi-dra-driver-test
+  name: cxi-dra-driver
   namespace: kube-system
   labels:
     app: cxi-dra-driver
@@ -43,12 +43,12 @@ spec:
               topologyKey: kubernetes.io/hostname
       containers:
         - name: driver
-          image: docker.io/pirese/cxi-dra-driver:dev
+          image: docker.io/pirese/cxi-dra-driver:stable
           imagePullPolicy: Always
           command:
             - /cxi-dra-driver
           args:
-            - --driver-name=cxi.slingshot.hpe.com.test
+            - --driver-name=cxi.slingshot.hpe.com
             - --cdi-root=/var/run/cdi
             - --plugin-dir=/var/lib/kubelet/plugins/cxi.slingshot.hpe.com
             - --registrar-dir=/var/lib/kubelet/plugins_registry
