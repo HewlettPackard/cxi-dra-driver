@@ -9,8 +9,7 @@ type ServiceManager interface {
 	// limits. It returns the allocated service ID (svc_id) on success.
 	CreateService(deviceName string, netnsInode uint64, vni int, resources ResourceSet) (int, error)
 
-	// DeleteService destroys the CXI service on deviceName associated with
-	// netnsInode. It locates the service by scanning the live service list for
-	// a matching netns inode (mirrors the caps-tum delete path).
-	DeleteService(deviceName string, netnsInode uint64) error
+	// DeleteService destroys the CXI service on deviceName identified by the
+	// kernel-allocated svcID returned from CreateService.
+	DeleteService(deviceName string, svcID int) error
 }

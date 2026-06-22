@@ -23,8 +23,8 @@ import (
 // created exactly once per pod (in RunPodSandbox) and torn down when the pod
 // sandbox stops (in StopPodSandbox).
 type podState struct {
-	netnsInode uint64
-	// svcIDs maps deviceName -> allocated svc_id, injected as SLINGSHOT_SVC_IDS
+	// svcIDs maps deviceName -> allocated svc_id. Used to tear the service
+	// down in StopPodSandbox and injected as SLINGSHOT_SVC_IDS.
 	svcIDs map[string]int
 }
 
@@ -167,13 +167,13 @@ func (p *Plugin) RunPodSandbox(ctx context.Context, pod *api.PodSandbox) error {
 	}
 
 	netnsPath := netnsFromPod(pod)
-	state := &podState{netnsInode: inode, svcIDs: make(map[string]int)}
+	state := &podState{svcIDs: make(map[string]int)}
 
-	// Track services created so far for rollback on partial failure.
-	createdDevices := make([]string, 0, len(allocs))
+	// Roll back any services already created if a later device fails. svcIDs
+	// holds exactly the services created so far, keyed by device name.
 	rollback := func() {
-		for _, devName := range createdDevices {
-			if err := p.svcMgr.DeleteService(devName, inode); err != nil {
+		for devName, svcID := range state.svcIDs {
+			if err := p.svcMgr.DeleteService(devName, svcID); err != nil {
 				fmt.Printf("cxi-nri: warning: rollback delete service %s: %v\n", devName, err)
 			}
 		}
@@ -213,7 +213,6 @@ func (p *Plugin) RunPodSandbox(ctx context.Context, pod *api.PodSandbox) error {
 			rollback()
 			return fmt.Errorf("creating CXI service for %s: %w", alloc.DeviceName, err)
 		}
-		createdDevices = append(createdDevices, alloc.DeviceName)
 		state.svcIDs[alloc.DeviceName] = svcID
 
 		// Publish VNI + svc_id on the claim's status for operator introspection.
@@ -258,7 +257,6 @@ func (p *Plugin) CreateContainer(_ context.Context, pod *api.PodSandbox, contain
 	p.mu.Lock()
 	svcIDs := make(map[string]int, len(state.svcIDs))
 	maps.Copy(svcIDs, state.svcIDs)
-	inode := state.netnsInode
 	p.mu.Unlock()
 
 	// Build aligned comma-separated lists. Position N in SLINGSHOT_DEVICES,
@@ -279,7 +277,7 @@ func (p *Plugin) CreateContainer(_ context.Context, pod *api.PodSandbox, contain
 
 	if isMockManager(p.svcMgr) {
 		for _, alloc := range allocs {
-			hostPath := cxi.MockServicePath(alloc.DeviceName, inode)
+			hostPath := cxi.MockServicePath(alloc.DeviceName, svcIDs[alloc.DeviceName])
 			containerPath := fmt.Sprintf("/run/cxi/%s-service.yaml", alloc.DeviceName)
 			adj.AddMount(&api.Mount{
 				Source:      hostPath,
@@ -308,14 +306,16 @@ func (p *Plugin) StopPodSandbox(_ context.Context, pod *api.PodSandbox) error {
 		return nil
 	}
 	delete(p.podStates, podUID)
-	inode := state.netnsInode
+	svcIDs := state.svcIDs
 	p.mu.Unlock()
 
 	for _, alloc := range allocs {
-		fmt.Printf("cxi-nri: deleting service: pod=%s device=%s inode=%d\n",
-			podUID, alloc.DeviceName, inode)
-		if err := p.svcMgr.DeleteService(alloc.DeviceName, inode); err != nil {
-			fmt.Printf("cxi-nri: warning: deleting service for %s: %v\n", alloc.DeviceName, err)
+		if svcID, ok := svcIDs[alloc.DeviceName]; ok {
+			fmt.Printf("cxi-nri: deleting service: pod=%s device=%s svc_id=%d\n",
+				podUID, alloc.DeviceName, svcID)
+			if err := p.svcMgr.DeleteService(alloc.DeviceName, svcID); err != nil {
+				fmt.Printf("cxi-nri: warning: deleting service for %s: %v\n", alloc.DeviceName, err)
+			}
 		}
 		// Release the per-namespace occupancy slot for this device. We do
 		// this even if DeleteService returned an error: an undeletable

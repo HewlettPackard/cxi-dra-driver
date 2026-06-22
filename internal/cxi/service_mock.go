@@ -3,6 +3,7 @@ package cxi
 import (
 	"fmt"
 	"os"
+	"sync/atomic"
 )
 
 type MockServiceManager struct{}
@@ -10,6 +11,12 @@ type MockServiceManager struct{}
 var _ ServiceManager = MockServiceManager{}
 
 const mockServiceDir = "/tmp/cxi-services"
+
+// mockSvcIDCounter hands out unique svc_ids so mock mode mirrors the kernel's
+// per-service id allocation. MockServiceManager is a stateless value type, so
+// the counter lives at package scope. First CreateService returns 1.
+var mockSvcIDCounter int64
+
 func (MockServiceManager) CreateService(deviceName string, netnsInode uint64, vni int, resources ResourceSet) (int, error) {
 	if err := os.MkdirAll(mockServiceDir, 0o755); err != nil {
 		return 0, fmt.Errorf("creating mock service dir: %w", err)
@@ -62,21 +69,22 @@ members:
 		resources.TXQs, resources.TXQs,
 		resources.TLEs, resources.TLEs,
 		vni, netnsInode)
-	path := MockServicePath(deviceName, netnsInode)
+	svcID := int(atomic.AddInt64(&mockSvcIDCounter, 1))
+	path := MockServicePath(deviceName, svcID)
 	if err := os.WriteFile(path, []byte(yaml), 0o644); err != nil {
 		return 0, fmt.Errorf("writing mock service file %s: %w", path, err)
 	}
 	fmt.Printf("cxi-mock: wrote CXI service file: %s\n", path)
-	return 1, nil
+	return svcID, nil
 }
-func (MockServiceManager) DeleteService(deviceName string, netnsInode uint64) error {
-	path := MockServicePath(deviceName, netnsInode)
+func (MockServiceManager) DeleteService(deviceName string, svcID int) error {
+	path := MockServicePath(deviceName, svcID)
 	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("removing mock service file %s: %w", path, err)
 	}
 	fmt.Printf("cxi-mock: removed CXI service file: %s\n", path)
 	return nil
 }
-func MockServicePath(deviceName string, netnsInode uint64) string {
-	return fmt.Sprintf("%s/%s-%d.yaml", mockServiceDir, deviceName, netnsInode)
+func MockServicePath(deviceName string, svcID int) string {
+	return fmt.Sprintf("%s/%s-%d.yaml", mockServiceDir, deviceName, svcID)
 }

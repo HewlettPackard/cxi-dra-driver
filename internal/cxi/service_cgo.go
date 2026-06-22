@@ -215,11 +215,11 @@ static int cxi_create_service(const char *device, uint64_t netns_inode, int vni,
     return svc_id;
 }
 
-// cxi_delete_service finds the service associated with the given netns inode
-// and destroys it. SHS14 stores the netns association out-of-band (via
-// cxil_svc_set_netns), so we probe each service with cxil_svc_get_netns
-// rather than scanning the members[] array that existed in SHS12.
-static int cxi_delete_service(const char *device, uint64_t netns_inode)
+// cxi_destroy_service destroys the service identified by svc_id directly via
+// cxil_destroy_svc. The svc_id is the kernel-allocated id returned from
+// cxi_create_service (cxil_alloc_svc) and tracked per device by the NRI
+// plugin, so no service-list scan is required.
+static int cxi_destroy_service(const char *device, int svc_id)
 {
     struct cxil_dev *dev = NULL;
     int dev_idx = device_index(device);
@@ -230,36 +230,11 @@ static int cxi_delete_service(const char *device, uint64_t netns_inode)
         fprintf(stderr, "cxi_wrapper: cxil_open_device(%d) failed: %d\n", dev_idx, rc);
         return rc;
     }
-    struct cxil_svc_list *list = NULL;
-    rc = cxil_get_svc_list(dev, &list);
-    if (rc != 0) {
-        fprintf(stderr, "cxi_wrapper: cxil_get_svc_list failed: %d\n", rc);
-        cxil_close_device(dev);
-        return rc;
-    }
-    unsigned int target_id = 0;
-    for (unsigned int i = 0; i < list->count; i++) {
-        unsigned int svc_id = list->descs[i].svc_id;
-        unsigned int svc_netns = 0;
-        if (cxil_svc_get_netns(dev, svc_id, &svc_netns) != 0)
-            continue;
-        if (svc_netns == (unsigned int)netns_inode) {
-            target_id = svc_id;
-            break;
-        }
-    }
-    cxil_free_svc_list(list);
-    if (!target_id) {
-        fprintf(stderr, "cxi_wrapper: no service found for inode=%llu on %s\n",
-                (unsigned long long)netns_inode, device);
-        cxil_close_device(dev);
-        return -ENOENT;
-    }
-    rc = cxil_destroy_svc(dev, target_id);
+    rc = cxil_destroy_svc(dev, svc_id);
     if (rc != 0)
-        fprintf(stderr, "cxi_wrapper: cxil_destroy_svc(%u) failed: %d\n", target_id, rc);
+        fprintf(stderr, "cxi_wrapper: cxil_destroy_svc(%d) failed: %d\n", svc_id, rc);
     else
-        fprintf(stderr, "cxi_wrapper: destroyed service id=%u on %s\n", target_id, device);
+        fprintf(stderr, "cxi_wrapper: destroyed service id=%d on %s\n", svc_id, device);
     cxil_close_device(dev);
     return rc;
 }
@@ -408,13 +383,13 @@ func (CXIServiceManager) CreateService(deviceName string, netnsInode uint64, vni
 	return int(rc), nil
 }
 
-func (CXIServiceManager) DeleteService(deviceName string, netnsInode uint64) error {
+func (CXIServiceManager) DeleteService(deviceName string, svcID int) error {
 	cDev := C.CString(deviceName)
 	defer C.free(unsafe.Pointer(cDev))
-	rc := C.cxi_delete_service(cDev, C.uint64_t(netnsInode))
+	rc := C.cxi_destroy_service(cDev, C.int(svcID))
 	if rc != 0 {
-		return fmt.Errorf("cxi_delete_service(%s, inode=%d) returned %d",
-			deviceName, netnsInode, int(rc))
+		return fmt.Errorf("cxi_destroy_service(%s, svc_id=%d) returned %d",
+			deviceName, svcID, int(rc))
 	}
 	return nil
 }
