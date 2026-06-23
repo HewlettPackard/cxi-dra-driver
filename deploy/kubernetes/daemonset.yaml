@@ -53,6 +53,10 @@ spec:
             - --enable-cdi-env=true
             - --containerd-config-path=/etc/containerd/conf.d/50-cxi-cdi.toml
             - --env-config=/etc/cxi-dra/env.json
+            # Per-pod synthetic /sys/class/net trees (HSN sysfs injection for
+            # stock libfabric) are built under this host path; it must be mounted
+            # writable at the same path below.
+            - --netns-sysfs-root=/var/run/cxi/netns
           env:
             - name: NODE_NAME
               valueFrom:
@@ -85,6 +89,8 @@ spec:
               mountPath: /var/run/cdi
             - name: nri
               mountPath: /var/run/nri
+            - name: cxi-state
+              mountPath: /var/run/cxi
             - name: netns
               mountPath: /var/run/netns
               readOnly: true
@@ -117,6 +123,10 @@ spec:
         - name: nri
           hostPath:
             path: /var/run/nri
+            type: DirectoryOrCreate
+        - name: cxi-state
+          hostPath:
+            path: /var/run/cxi
             type: DirectoryOrCreate
         - name: netns
           hostPath:

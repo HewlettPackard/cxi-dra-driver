@@ -38,6 +38,13 @@ func main() {
 		vniRangeStart = flag.Int("vni-range-start", 0, "First VNI in the cluster-wide pool used by the namespace VNI allocator (0 disables the allocator)")
 		vniRangeEnd   = flag.Int("vni-range-end", 0, "Last VNI in the cluster-wide pool (inclusive)")
 
+		// Root directory for the per-pod synthetic /sys/class/net trees the NRI
+		// plugin bind-mounts into pods so stock libfabric can discover the HSN
+		// device. Must be a host path mounted writable at the same path in this
+		// container so containerd can resolve it as a bind-mount source.
+		netnsSysfsRoot = flag.String("netns-sysfs-root", "/var/run/cxi/netns",
+			"Host directory for per-pod synthetic /sys/class/net trees (empty disables HSN sysfs injection)")
+
 		refreshInterval = flag.Duration("resource-refresh-interval", 10*time.Second,
 			"How often to republish the ResourceSlice with refreshed available-capacity attributes")
 
@@ -139,7 +146,7 @@ func main() {
 
 	binder := driver.NewClaimBinder(d, kubeClient, *driverName, *nodeName)
 
-	nriPlugin, err := nri.New(d.Store(), mock, d.TriggerRepublish, d.RemovePending, binder.TriggerRetry, d.RemoveOccupancy, d.RecordSvcID, sysSvcIDs)
+	nriPlugin, err := nri.New(d.Store(), mock, d.TriggerRepublish, d.RemovePending, binder.TriggerRetry, d.RemoveOccupancy, d.RecordSvcID, sysSvcIDs, *netnsSysfsRoot)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: failed to create NRI plugin: %v\n", err)
 		os.Exit(1)

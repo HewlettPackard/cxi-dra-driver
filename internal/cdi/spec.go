@@ -24,7 +24,9 @@ func DeviceID(driverName, devName string) string {
 // DeviceNodes tells containerd to add the device to the container's cgroup
 // BPF allowlist at container creation time (before the process starts), which
 // is necessary for unprivileged containers to open /dev/cxiN. The sysfs
-// bind-mount lets libfabric discover the HSN path.
+// bind-mount exposes the CXI device's own sysfs node (read by libcxi) at
+// /run/cxi/<name>. The paired HSN netdev metadata that stock libfabric needs is
+// injected separately, by overmounting /sys/class/net — see internal/netsysfs.
 func WriteSpec(cdiRoot, driverName string, dev *cxi.Device) error {
 	if err := os.MkdirAll(cdiRoot, 0o755); err != nil {
 		return err

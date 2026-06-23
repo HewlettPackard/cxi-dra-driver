@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"maps"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/slingshot/cxi-dra-driver/internal/cxi"
 	"github.com/slingshot/cxi-dra-driver/internal/driver"
+	"github.com/slingshot/cxi-dra-driver/internal/netsysfs"
 )
 
 // podState tracks per-pod service creation state so that the CXI service is
@@ -26,6 +28,12 @@ type podState struct {
 	// svcIDs maps deviceName -> allocated svc_id. Used to tear the service
 	// down in StopPodSandbox and injected as SLINGSHOT_SVC_IDS.
 	svcIDs map[string]int
+
+	// netSysfsDir is the host path of the per-pod synthetic /sys/class/net tree
+	// (see internal/netsysfs). It is bind-mounted over the container's
+	// /sys/class/net in CreateContainer and removed in StopPodSandbox. Empty
+	// when HSN sysfs injection is disabled or no device has a paired HSN.
+	netSysfsDir string
 }
 
 // Plugin is an NRI plugin that creates CXI services when pod sandboxes start.
@@ -46,6 +54,7 @@ type Plugin struct {
 	onServiceDeleted func()                             // called after any service is deleted, triggers binder retry
 	onOccupancyFreed func(namespace, deviceName string) // called per-(ns,dev) after DestroyService to release per-namespace occupancy
 	recordSvcID      func(ctx context.Context, claimUID types.UID, claimNs, claimName, deviceName string, vni, svcID int)
+	netSysfsRoot     string // root dir for per-pod synthetic /sys/class/net trees; "" disables HSN sysfs injection
 	mu               sync.Mutex
 	podStates        map[types.UID]*podState
 	deviceMu         sync.Map // map[string]*sync.Mutex — one mutex per device name
@@ -77,6 +86,10 @@ type Plugin struct {
 // plugin never deletes a service whose id is in this set — see destroyService.
 // In mock mode the mock svc_id counter is seeded past the highest blessed id so
 // generated ids never collide with the reserved system services.
+//
+// netSysfsRoot is the host directory under which per-pod synthetic
+// /sys/class/net trees are built (see internal/netsysfs). When empty — or in
+// mock mode — HSN sysfs injection is disabled.
 func New(
 	store *driver.AllocationStore,
 	mock bool,
@@ -86,6 +99,7 @@ func New(
 	onOccupancyFreed func(namespace, deviceName string),
 	recordSvcID func(ctx context.Context, claimUID types.UID, claimNs, claimName, deviceName string, vni, svcID int),
 	systemSvcIDs []int,
+	netSysfsRoot string,
 ) (*Plugin, error) {
 	var svcMgr cxi.ServiceManager
 	if mock {
@@ -115,6 +129,7 @@ func New(
 		onServiceDeleted: onServiceDeleted,
 		onOccupancyFreed: onOccupancyFreed,
 		recordSvcID:      recordSvcID,
+		netSysfsRoot:     netSysfsRoot,
 		podStates:        make(map[types.UID]*podState),
 	}
 	var err error
@@ -284,6 +299,18 @@ func (p *Plugin) RunPodSandbox(ctx context.Context, pod *api.PodSandbox) error {
 		}
 	}
 
+	// Build the per-pod synthetic /sys/class/net tree so stock libfabric can
+	// discover the allocated HSN device(s). It is bind-mounted into each
+	// container in CreateContainer. A hard error here means the HSN metadata
+	// libfabric needs is unavailable, so roll the services back and let the
+	// kubelet retry rather than start a pod where libfabric cannot bootstrap.
+	netDir, err := p.buildNetSysfs(podUID, pid, allocs)
+	if err != nil {
+		rollback()
+		return fmt.Errorf("pod %s: preparing HSN sysfs: %w", podUID, err)
+	}
+	state.netSysfsDir = netDir
+
 	p.mu.Lock()
 	p.podStates[podUID] = state
 	p.mu.Unlock()
@@ -319,6 +346,7 @@ func (p *Plugin) CreateContainer(_ context.Context, pod *api.PodSandbox, contain
 	p.mu.Lock()
 	svcIDs := make(map[string]int, len(state.svcIDs))
 	maps.Copy(svcIDs, state.svcIDs)
+	netSysfsDir := state.netSysfsDir
 	p.mu.Unlock()
 
 	// Build aligned comma-separated lists. Position N in SLINGSHOT_DEVICES,
@@ -336,6 +364,21 @@ func (p *Plugin) CreateContainer(_ context.Context, pod *api.PodSandbox, contain
 	adj.AddEnv("SLINGSHOT_DEVICES", strings.Join(devNames, ","))
 	adj.AddEnv("SLINGSHOT_VNIS", strings.Join(vnis, ","))
 	adj.AddEnv("SLINGSHOT_SVC_IDS", strings.Join(svcIDList, ","))
+
+	// Overmount the container's /sys/class/net with the per-pod synthetic tree
+	// so stock libfabric discovers the HSN device(s), and skip the AMA check it
+	// applies to the synthetic netdev. libfabric's link gate (cxip_if.c:142) has
+	// no env bypass and is satisfied by operstate=up in the tree; the AMA gate
+	// (addr_assign_type/address) is bypassed by CXIP_SKIP_AMA_CHECK so we need
+	// not synthesize a MAC.
+	if netSysfsDir != "" {
+		adj.AddMount(&api.Mount{
+			Source:      netSysfsDir,
+			Destination: "/sys/class/net",
+			Options:     []string{"bind", "ro"},
+		})
+		adj.AddEnv("CXIP_SKIP_AMA_CHECK", "1")
+	}
 
 	if isMockManager(p.svcMgr) {
 		for _, alloc := range allocs {
@@ -372,6 +415,7 @@ func (p *Plugin) StopPodSandbox(_ context.Context, pod *api.PodSandbox) error {
 	}
 	delete(p.podStates, podUID)
 	svcIDs := state.svcIDs
+	netSysfsDir := state.netSysfsDir
 	p.mu.Unlock()
 
 	// podStates[podUID] is set only after RunPodSandbox created a service for
@@ -396,6 +440,14 @@ func (p *Plugin) StopPodSandbox(_ context.Context, pod *api.PodSandbox) error {
 		p.onOccupancyFreed(pod.GetNamespace(), deviceName)
 	}
 
+	// Remove the per-pod synthetic /sys/class/net tree. netSysfsDir is
+	// <root>/<podUID>/net, so drop the whole <podUID> directory.
+	if netSysfsDir != "" {
+		if err := os.RemoveAll(filepath.Dir(netSysfsDir)); err != nil {
+			fmt.Printf("cxi-nri: warning: removing net sysfs dir for pod %s: %v\n", podUID, err)
+		}
+	}
+
 	// Best-effort store cleanup: UnprepareResourceClaims may have already
 	// removed this entry. Delete is idempotent.
 	p.store.Delete(podUID)
@@ -405,6 +457,58 @@ func (p *Plugin) StopPodSandbox(_ context.Context, pod *api.PodSandbox) error {
 	// Update ResourceSlice immediately so avail_* reflects freed capacity.
 	p.republish()
 	return nil
+}
+
+// buildNetSysfs constructs the per-pod synthetic /sys/class/net tree that lets
+// stock libfabric discover the allocated HSN device(s), returning the host path
+// to bind-mount over the container's /sys/class/net (or "" when injection is
+// disabled or no allocated device has a paired HSN interface).
+//
+// HSN metadata (the device's PCI BDF and link speed) is read from the host's own
+// /sys/class/net/<hsn>; a failure there is fatal because libfabric cannot
+// bootstrap without it. Replicating the pod's real interfaces is best-effort: if
+// the netns enumeration fails the tree is built from the HSN entries alone (the
+// pod loses visibility of its own NICs under /sys/class/net but libfabric still
+// works), and the failure is logged rather than aborting the sandbox.
+//
+// Injection is skipped entirely in mock mode (the mock HSN interfaces have no
+// host sysfs) and when no root directory is configured.
+func (p *Plugin) buildNetSysfs(podUID types.UID, pid uint32, allocs []driver.PodAllocation) (string, error) {
+	if p.netSysfsRoot == "" || isMockManager(p.svcMgr) {
+		return "", nil
+	}
+
+	var hsns []netsysfs.HSN
+	for _, alloc := range allocs {
+		if alloc.HSNIface == "" {
+			fmt.Printf("cxi-nri: warning: pod %s device %s has no paired HSN interface; skipping its sysfs injection\n",
+				podUID, alloc.DeviceName)
+			continue
+		}
+		hsn, err := netsysfs.HostHSN(alloc.HSNIface)
+		if err != nil {
+			return "", fmt.Errorf("reading host HSN %s for device %s: %w", alloc.HSNIface, alloc.DeviceName, err)
+		}
+		hsns = append(hsns, hsn)
+	}
+	if len(hsns) == 0 {
+		return "", nil
+	}
+
+	netnsPath := fmt.Sprintf("/proc/%d/ns/net", pid)
+	ifaces, err := netsysfs.PodInterfaces(netnsPath)
+	if err != nil {
+		fmt.Printf("cxi-nri: warning: enumerating pod %s interfaces via %s: %v; building HSN-only sysfs tree\n",
+			podUID, netnsPath, err)
+	}
+
+	dir := filepath.Join(p.netSysfsRoot, string(podUID), "net")
+	if err := netsysfs.Build(dir, ifaces, hsns); err != nil {
+		return "", fmt.Errorf("building net sysfs tree at %s: %w", dir, err)
+	}
+	fmt.Printf("cxi-nri: built net sysfs for pod %s at %s (%d hsn, %d replicated ifaces)\n",
+		podUID, dir, len(hsns), len(ifaces))
+	return dir, nil
 }
 
 // netnsFromPod extracts the network namespace path from the pod sandbox.

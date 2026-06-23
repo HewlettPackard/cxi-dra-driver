@@ -120,6 +120,14 @@ state and live hardware state.
       │                                                                          ││
       │  per-device mutex.Unlock()                                               ││
       │                                                                          ││
+      │  buildNetSysfs: host /sys/class/net/<hsn> → per-pod synthetic tree       ││
+      │    <root>/<podUID>/net = real-iface symlinks (setns+private mountns+     ││
+      │      fresh sysfs mount in pod netns) + hsnN/{operstate=up, carrier=1,    ││
+      │      speed, device→…/<BDF>}                                              ││
+      │    ▲ stock (unpatched) libfabric reads HSN link metadata from here;      ││
+      │      a hard error rolls the services back so a pod where libfabric       ││
+      │      cannot bootstrap never starts. Skipped in mock mode.                ││
+      │                                                                          ││
       │  RemovePending(claimUID) ─── pending map entry released                 ││
       │     ▲ does NOT touch nsDeviceOccupancy — service is alive on the        ││
       │       device until DestroyService runs; the (ns,dev) slot stays held    ││
@@ -129,10 +137,16 @@ state and live hardware state.
       ▼
   NRI: CreateContainer
       │  injects SLINGSHOT_DEVICES=cxi0, SLINGSHOT_VNIS=<n>, SLINGSHOT_SVC_IDS=<n> env vars
+      │  bind-mounts <root>/<podUID>/net OVER /sys/class/net (ro)
+      │  injects CXIP_SKIP_AMA_CHECK=1  ◄── bypasses libfabric's AMA gate (no MAC synthesized)
+      │    ▲ only /sys/class/net is overmounted, so the pod keeps its own NICs:
+      │      replicated symlinks resolve through the untouched /sys/devices.
+      │      libfabric's link gate (cxip_if.c) has NO env bypass, hence operstate=up.
       │
       ▼
   Pod running ✓
-      /dev/cxiN accessible, SLINGSHOT_DEVICES/VNIS/SVC_IDS set, netns-scoped VNI bound
+      /dev/cxiN accessible, SLINGSHOT_DEVICES/VNIS/SVC_IDS set, netns-scoped VNI bound,
+      stock libfabric discovers the HSN via the injected /sys/class/net
 
 
 ══════════════════════════════════════════════════════════════════════════════════════
@@ -153,6 +167,7 @@ strictly in lockstep and only triggers a republish on real state change.
       │  per-device mutex.Lock()                                              │
       │  cxil_destroy_svc            ← hardware service torn down             │
       │  AllocationStore.Delete(podUID)                                       │
+      │  os.RemoveAll(<root>/<podUID>) ← per-pod synthetic /sys/class/net tree│
       │  per-device mutex.Unlock()                                            │
       │                                                                       │
       │  RemoveOccupancy(ns, dev) ─── releases the (ns,dev) slot             │
@@ -286,7 +301,18 @@ strictly in lockstep and only triggers a republish on real state change.
   CDI                     /dev/cxiN injection + cgroup BPF allowance
                             (pre-cgroup-lock)
   NRI RunPodSandbox       Live fit-check under per-device mutex; hardware
-                            service create; RemovePending
-  NRI CreateContainer     SLINGSHOT_DEVICES/VNIS/SVC_IDS env var injection
+                            service create; per-pod synthetic /sys/class/net
+                            build (HSN sysfs injection); RemovePending
+  NRI CreateContainer     SLINGSHOT_DEVICES/VNIS/SVC_IDS env var injection;
+                            bind-mounts the synthetic /sys/class/net over the
+                            container's + sets CXIP_SKIP_AMA_CHECK so stock
+                            libfabric discovers the HSN device
   NRI StopPodSandbox      Hardware service destroy; RemoveOccupancy(ns, dev);
+                            per-pod synthetic sysfs tree removal;
                             unblocks waiting pods via TriggerRetry
+  HSN sysfs injection     internal/netsysfs: builds <root>/<podUID>/net with a
+                            symlink per real pod NIC (read by entering the pod
+                            netns and mounting a fresh sysfs) plus an hsnN dir
+                            (operstate=up, carrier, speed, device→<BDF>). Lets
+                            UNPATCHED libfabric bootstrap the CXI device in-pod;
+                            RDMA itself is kernel-bypass and needs no netdev.
