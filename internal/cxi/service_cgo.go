@@ -334,10 +334,76 @@ static int cxi_list_service_vnis(const char *device,
             continue;
         out[written++] = d->vnis[0];
     }
+	*count = written;
+	cxil_free_svc_list(list);
+	cxil_close_device(dev);
+	return 0;
+}
+
+// cxi_list_services enumerates every service on the device, writing svc_id,
+// vni (vnis[0], or 0 when the service has no restricted VNI) and is_system_svc
+// into the caller-provided parallel arrays. Unlike cxi_list_service_vnis it
+// does NOT filter out system or VNI-less services — the orphan reaper needs to
+// see and explicitly skip them. *count receives the number written (<= max_out).
+static int cxi_list_services(const char *device,
+                             int *ids, uint16_t *vnis, uint8_t *is_system,
+                             unsigned int max_out, unsigned int *count)
+{
+    *count = 0;
+    struct cxil_dev *dev = NULL;
+    int dev_idx = device_index(device);
+    if (dev_idx < 0)
+        return -EINVAL;
+    int rc = cxil_open_device(dev_idx, &dev);
+    if (rc != 0) {
+        fprintf(stderr, "cxi_wrapper: cxil_open_device(%d) failed: %d\n", dev_idx, rc);
+        return rc;
+    }
+    struct cxil_svc_list *list = NULL;
+    rc = cxil_get_svc_list(dev, &list);
+    if (rc != 0) {
+        fprintf(stderr, "cxi_wrapper: cxil_get_svc_list failed: %d\n", rc);
+        cxil_close_device(dev);
+        return rc;
+    }
+    unsigned int written = 0;
+    for (unsigned int i = 0; i < list->count && written < max_out; i++) {
+        const struct cxi_svc_desc *d = &list->descs[i];
+        ids[written] = (int)d->svc_id;
+        vnis[written] = (d->restricted_vnis && d->num_vld_vnis > 0) ? d->vnis[0] : 0;
+        is_system[written] = d->is_system_svc ? 1 : 0;
+        written++;
+    }
     *count = written;
     cxil_free_svc_list(list);
     cxil_close_device(dev);
     return 0;
+}
+
+// cxi_service_netns reads the network-namespace id (nsfs inode) bound to svc_id
+// via cxil_svc_get_netns. The kernel stores this as an unsigned int — the low
+// 32 bits of the inode that cxil_svc_set_netns was given at creation time (see
+// cxi_create_service). *netns is left 0 on any failure.
+static int cxi_service_netns(const char *device, int svc_id, uint32_t *netns)
+{
+    *netns = 0;
+    struct cxil_dev *dev = NULL;
+    int dev_idx = device_index(device);
+    if (dev_idx < 0)
+        return -EINVAL;
+    int rc = cxil_open_device(dev_idx, &dev);
+    if (rc != 0) {
+        fprintf(stderr, "cxi_wrapper: cxil_open_device(%d) failed: %d\n", dev_idx, rc);
+        return rc;
+    }
+    unsigned int ns = 0;
+    rc = cxil_svc_get_netns(dev, (unsigned int)svc_id, &ns);
+    if (rc != 0)
+        fprintf(stderr, "cxi_wrapper: cxil_svc_get_netns(%d) failed: %d\n", svc_id, rc);
+    else
+        *netns = (uint32_t)ns;
+    cxil_close_device(dev);
+    return rc;
 }
 */
 import "C"
@@ -520,4 +586,58 @@ func readActiveServiceVNIs(deviceName string) ([]uint16, error) {
 		out[i] = uint16(buf[i])
 	}
 	return out, nil
+}
+
+// readActiveServices is the CGo-backed implementation of ReadActiveServices
+// (see capacity_cgo.go). It returns one ServiceInfo per live service on the
+// device — including system and VNI-less services, which the orphan reaper
+// must see in order to skip them.
+func readActiveServices(deviceName string) ([]ServiceInfo, error) {
+	cDev := C.CString(deviceName)
+	defer C.free(unsafe.Pointer(cDev))
+
+	ids := make([]C.int, maxServicesPerDevice)
+	vnis := make([]C.uint16_t, maxServicesPerDevice)
+	sys := make([]C.uint8_t, maxServicesPerDevice)
+	var count C.uint
+	rc := C.cxi_list_services(
+		cDev,
+		(*C.int)(unsafe.Pointer(&ids[0])),
+		(*C.uint16_t)(unsafe.Pointer(&vnis[0])),
+		(*C.uint8_t)(unsafe.Pointer(&sys[0])),
+		C.uint(maxServicesPerDevice),
+		&count,
+	)
+	if rc != 0 {
+		return nil, fmt.Errorf("cxi_list_services(%s) returned %d", deviceName, int(rc))
+	}
+	n := int(count)
+	if n > maxServicesPerDevice {
+		return nil, fmt.Errorf("cxi_list_services(%s) returned count=%d, exceeds buffer cap %d (raise maxServicesPerDevice)",
+			deviceName, n, maxServicesPerDevice)
+	}
+	out := make([]ServiceInfo, n)
+	for i := 0; i < n; i++ {
+		out[i] = ServiceInfo{
+			SvcID:    int(ids[i]),
+			VNI:      uint16(vnis[i]),
+			IsSystem: sys[i] != 0,
+		}
+	}
+	return out, nil
+}
+
+// readServiceNetns is the CGo-backed implementation of ReadServiceNetns (see
+// capacity_cgo.go). It returns the nsfs inode (low 32 bits, zero-extended)
+// bound to svc_id, or an error if the kernel has no netns for the service.
+func readServiceNetns(deviceName string, svcID int) (uint64, error) {
+	cDev := C.CString(deviceName)
+	defer C.free(unsafe.Pointer(cDev))
+
+	var ns C.uint32_t
+	rc := C.cxi_service_netns(cDev, C.int(svcID), &ns)
+	if rc != 0 {
+		return 0, fmt.Errorf("cxi_service_netns(%s, svc_id=%d) returned %d", deviceName, svcID, int(rc))
+	}
+	return uint64(ns), nil
 }

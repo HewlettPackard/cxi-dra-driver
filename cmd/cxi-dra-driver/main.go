@@ -145,6 +145,11 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Give the driver's orphan-service reaper its view of services still owned
+	// by live pods. Must happen before d.Run starts the ticker that drives the
+	// reaper; until it is wired the reaper stays inert.
+	d.SetLiveSvcIDsFunc(nriPlugin.LiveSvcIDs)
+
 	nriErrCh := make(chan error, 1)
 	go func() {
 		nriErrCh <- nriPlugin.Run(ctx)

@@ -180,6 +180,31 @@ func (p *Plugin) destroyService(devName string, svcID int) error {
 	return p.svcMgr.DeleteService(devName, svcID)
 }
 
+// LiveSvcIDs returns the svc_ids the plugin currently owns, grouped by device:
+// result[deviceName][svcID] is true for every service created for a pod sandbox
+// that has not yet stopped (i.e. still present in podStates). The driver's
+// orphan-service reaper consults this set so it never deletes a service that
+// belongs to a live pod — in particular one whose StopPodSandbox has not run
+// yet, or one created so recently that the kernel has not finished recording
+// its pod netns. The returned map is a fresh copy and safe to read without
+// holding p.mu.
+func (p *Plugin) LiveSvcIDs() map[string]map[int]bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := make(map[string]map[int]bool)
+	for _, state := range p.podStates {
+		for devName, svcID := range state.svcIDs {
+			byDev := out[devName]
+			if byDev == nil {
+				byDev = make(map[int]bool)
+				out[devName] = byDev
+			}
+			byDev[svcID] = true
+		}
+	}
+	return out
+}
+
 // RunPodSandbox is called by containerd when the pod sandbox is created and
 // the network namespace is ready — before any containers start.
 //

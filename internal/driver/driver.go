@@ -118,6 +118,29 @@ type Driver struct {
 	// slot per device, so the value is a slice. Single-device claims — the
 	// common case — hold a one-element slice.
 	claimToOccupancy map[types.UID][]occupancyKey
+
+	// Orphan-service reaper state. The reaper runs on the same Run ticker as
+	// the reconciler and destroys CXI services whose owning pod is gone — the
+	// gap the reconciler cannot close, since it only repairs in-memory
+	// occupancy and never the hardware service itself. All three fields are
+	// touched solely by reapOrphanServices, which runs only from the single
+	// Run goroutine, so they need no additional locking.
+	//
+	// reapSvcMgr issues the DeleteService calls: the driver's own stateless
+	// ServiceManager (CGo-backed in production), independent of the NRI
+	// plugin's manager so the reaper stays self-contained.
+	//
+	// liveSvcIDs returns the svc_ids the NRI plugin still owns for live pods,
+	// grouped by device, so the reaper never deletes a service backing a
+	// running pod. nil until main wires plugin.LiveSvcIDs via
+	// SetLiveSvcIDsFunc; while nil the reaper is inert.
+	//
+	// reaperMisses counts the consecutive cycles each (device, svc_id) has
+	// looked orphaned; a service is destroyed only after reapGraceCycles
+	// confirmations so a pod mid-start is never reaped.
+	reapSvcMgr   cxi.ServiceManager
+	liveSvcIDs   func() map[string]map[int]bool
+	reaperMisses map[reapKey]int
 }
 
 // occupancyKey identifies one namespace's hold on one device. Used as the
@@ -148,12 +171,24 @@ func New(cfg Config) *Driver {
 		pending:              make(map[pendingKey]pendingEntry),
 		nsDeviceOccupancy:    make(map[string]map[string]types.UID),
 		claimToOccupancy:     make(map[types.UID][]occupancyKey),
+		reapSvcMgr:           cxi.NewServiceManager(),
+		reaperMisses:         make(map[reapKey]int),
 	}
 }
 
 // Store returns the allocation store, so it can be passed to the NRI plugin.
 func (d *Driver) Store() *AllocationStore {
 	return d.store
+}
+
+// SetLiveSvcIDsFunc injects the source of currently-live svc_ids — the NRI
+// plugin's LiveSvcIDs — consulted by the orphan-service reaper so it never
+// destroys a service backing a running pod. Must be called before Run; until
+// it is, the reaper does nothing. Wired in main after the NRI plugin is
+// constructed, which breaks the construction cycle: the plugin needs the
+// driver's store, and the driver needs the plugin's live-svc-id view.
+func (d *Driver) SetLiveSvcIDsFunc(fn func() map[string]map[int]bool) {
+	d.liveSvcIDs = fn
 }
 
 // TriggerRepublish schedules an immediate ResourceSlice republish. If one is
@@ -599,6 +634,15 @@ func (d *Driver) Run(ctx context.Context) error {
 	// makes is reflected in the same ResourceSlice update — and if it
 	// triggers an extra republish via the notify channel, the next loop
 	// iteration absorbs it harmlessly.
+	//
+	// reapOrphanServices runs right after the reconciler. Where the
+	// reconciler only repairs in-memory occupancy, the reaper destroys the
+	// underlying CXI services whose owning pod is gone — leaks the event
+	// path (NRI StopPodSandbox) never cleaned up because the pod was
+	// force-deleted, the driver restarted, or a service was created out of
+	// band. It deletes only after several consecutive cycles confirm the
+	// service's pod netns is gone, and never touches blessed, kernel-system,
+	// or NRI-tracked services.
 	if d.refreshInterval <= 0 {
 		return fmt.Errorf("--resource-refresh-interval must be > 0 (got %s)", d.refreshInterval)
 	}
@@ -610,6 +654,7 @@ func (d *Driver) Run(ctx context.Context) error {
 			return nil
 		case <-ticker.C:
 			d.reconcileOccupancyFromHardware(ctx)
+			d.reapOrphanServices()
 			if err := publish(); err != nil {
 				d.logf("warning: refreshing resource slice: %v", err)
 			}

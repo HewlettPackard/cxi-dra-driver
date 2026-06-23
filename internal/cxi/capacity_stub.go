@@ -31,3 +31,18 @@ func ReadAvailableCapacity(_ string) (ResourceSet, error) {
 func ReadActiveServiceVNIs(_ string) ([]uint16, error) {
 	return nil, nil
 }
+
+// ReadActiveServices returns an empty slice in non-cxi builds — there are no
+// live CXI services in mock mode, so the orphan-service reaper has nothing to
+// scan and short-circuits. Production builds enumerate cxil_get_svc_list via
+// libcxi — see capacity_cgo.go.
+func ReadActiveServices(_ string) ([]ServiceInfo, error) {
+	return nil, nil
+}
+
+// ReadServiceNetns returns 0 in non-cxi builds — there are no live CXI
+// services in mock mode, so the reaper never reaches this path. Production
+// builds read cxil_svc_get_netns via libcxi — see capacity_cgo.go.
+func ReadServiceNetns(_ string, _ int) (uint64, error) {
+	return 0, nil
+}
