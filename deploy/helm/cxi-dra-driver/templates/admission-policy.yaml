@@ -1,0 +1,125 @@
+{{- if .Values.admissionPolicy.enabled }}
+{{- $driver := include "cxi-dra.driverName" . }}
+---
+# MutatingAdmissionPolicy: inject CEL selectors into ResourceClaims that have
+# an explicit CXI opaque config, so the scheduler only places them on devices
+# with sufficient available capacity AND no co-tenant from the claim's own
+# namespace.
+#
+# This runs in-process in the API server — no webhook, no TLS, no network routing.
+#
+# Logic:
+#   - Intercept ResourceClaim CREATE in any namespace except the excluded ones
+#   - Match only claims with exactly one request that has our driver's opaque config
+#   - Inject TWO CEL selectors:
+#       1. avail_* >= N capacity checks derived from the opaque parameters
+#       2. namespace exclusion: !active_namespaces.contains(",<claim-ns>,")
+#   - Skip if selectors are already set (user-specified)
+#   - Skip if no opaque config (claim will be rejected at prepare time)
+#
+# LE/TLE pool conversion (must match LEPoolSize/TLEPoolSize in internal/cxi/resources.go):
+#   le_pools  * 1024 = LEs   (LEPoolSize)
+#   tle_pools * 512  = TLEs  (TLEPoolSize)
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingAdmissionPolicy
+metadata:
+  name: {{ include "cxi-dra.fullname" . }}-selector-injection
+  labels:
+    {{- include "cxi-dra.labels" . | nindent 4 }}
+spec:
+  failurePolicy: Ignore  # never block scheduling if policy errors
+  reinvocationPolicy: Never
+  matchConstraints:
+    resourceRules:
+      - apiGroups:   ["resource.k8s.io"]
+        apiVersions: ["v1"]
+        operations:  ["CREATE"]
+        resources:   ["resourceclaims"]
+  matchConditions:
+    # Only process claims with at least one device request.
+    - name: has-requests
+      expression: >
+        object.spec.devices.requests.size() >= 1
+
+    # Only process claims whose first request has exactly set but no selectors yet.
+    - name: no-existing-selectors
+      expression: >
+        has(object.spec.devices.requests[0].exactly) &&
+        (
+          !has(object.spec.devices.requests[0].exactly.selectors) ||
+          object.spec.devices.requests[0].exactly.selectors.size() == 0
+        )
+
+    # Only process claims where config[0] is our driver's opaque config.
+    - name: has-cxi-config
+      expression: >
+        has(object.spec.devices.config) &&
+        object.spec.devices.config.size() > 0 &&
+        has(object.spec.devices.config[0].opaque) &&
+        object.spec.devices.config[0].opaque.driver == "{{ $driver }}"
+
+  mutations:
+    - patchType: JSONPatch
+      jsonPatch:
+        expression: >
+          [JSONPatch{
+            op: "add",
+            path: "/spec/devices/requests/0/exactly/selectors",
+            value: [
+              {
+                "cel": {
+                  "expression":
+                    (has(object.spec.devices.config[0].opaque.parameters.txqs)
+                      ? "device.attributes[\"{{ $driver }}\"][\"avail_txqs\"] >= " + string(int(object.spec.devices.config[0].opaque.parameters.txqs)) + " && "
+                      : "") +
+                    (has(object.spec.devices.config[0].opaque.parameters.tgqs)
+                      ? "device.attributes[\"{{ $driver }}\"][\"avail_tgqs\"] >= " + string(int(object.spec.devices.config[0].opaque.parameters.tgqs)) + " && "
+                      : "") +
+                    (has(object.spec.devices.config[0].opaque.parameters.eqs)
+                      ? "device.attributes[\"{{ $driver }}\"][\"avail_eqs\"] >= " + string(int(object.spec.devices.config[0].opaque.parameters.eqs)) + " && "
+                      : "") +
+                    (has(object.spec.devices.config[0].opaque.parameters.cts)
+                      ? "device.attributes[\"{{ $driver }}\"][\"avail_cts\"] >= " + string(int(object.spec.devices.config[0].opaque.parameters.cts)) + " && "
+                      : "") +
+                    (has(object.spec.devices.config[0].opaque.parameters.ptes)
+                      ? "device.attributes[\"{{ $driver }}\"][\"avail_ptes\"] >= " + string(int(object.spec.devices.config[0].opaque.parameters.ptes)) + " && "
+                      : "") +
+                    (has(object.spec.devices.config[0].opaque.parameters.acs)
+                      ? "device.attributes[\"{{ $driver }}\"][\"avail_acs\"] >= " + string(int(object.spec.devices.config[0].opaque.parameters.acs)) + " && "
+                      : "") +
+                    (has(object.spec.devices.config[0].opaque.parameters.le_pools)
+                      ? "device.attributes[\"{{ $driver }}\"][\"avail_les\"] >= " + string(int(object.spec.devices.config[0].opaque.parameters.le_pools) * 1024) + " && "
+                      : "") +
+                    (has(object.spec.devices.config[0].opaque.parameters.tle_pools)
+                      ? "device.attributes[\"{{ $driver }}\"][\"avail_tles\"] >= " + string(int(object.spec.devices.config[0].opaque.parameters.tle_pools) * 512) + " && "
+                      : "") +
+                    "true"
+                }
+              },
+              {
+                "cel": {
+                  "expression":
+                    "!device.attributes[\"{{ $driver }}\"][\"active_namespaces\"].contains(\","
+                    + object.metadata.namespace
+                    + ",\")"
+                }
+              }
+            ]
+          }]
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingAdmissionPolicyBinding
+metadata:
+  name: {{ include "cxi-dra.fullname" . }}-selector-injection-binding
+  labels:
+    {{- include "cxi-dra.labels" . | nindent 4 }}
+spec:
+  policyName: {{ include "cxi-dra.fullname" . }}-selector-injection
+  matchResources:
+    namespaceSelector:
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: NotIn
+          values:
+            {{- toYaml .Values.admissionPolicy.excludedNamespaces | nindent 12 }}
+{{- end }}

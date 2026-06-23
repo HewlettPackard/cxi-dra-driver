@@ -1,0 +1,225 @@
+# Default values for the CXI DRA driver chart.
+
+# -- DRA driver name (DNS subdomain). Every cluster/API object this chart creates
+# keys off this value, so installing the chart twice with different driverName
+# values produces two fully isolated installs. The sanitized form of this name
+# (e.g. cxi.slingshot.hpe.com -> cxi-slingshot-hpe-com) is used as the object
+# name prefix.
+driverName: cxi.slingshot.hpe.com
+
+# -- Override the generated object-name prefix (defaults to the sanitized driverName).
+nameOverride: ""
+# -- Override the full object name entirely.
+fullnameOverride: ""
+
+# -- Namespace for the driver components (workload, ServiceAccount, RBAC, ConfigMap).
+# Must be kube-system for the default priorityClassName (system priority classes
+# are only usable there).
+namespace: kube-system
+
+# -- Pod priority class. system-node-critical keeps the driver running under
+# pressure but is only valid in kube-system. Set to "" if installing elsewhere.
+priorityClassName: system-node-critical
+
+image:
+  repository: docker.io/pirese/cxi-dra-driver
+  tag: dev
+  pullPolicy: Always
+
+workload:
+  # -- DaemonSet (one pod per CXI node) or Deployment (replicas + anti-affinity spread).
+  kind: DaemonSet
+  # -- Replica count (Deployment only).
+  replicas: 10
+  antiAffinity:
+    # -- Spread pods across distinct nodes. Required to coexist with other installs
+    # and to keep two replicas off the same node (fixed kubelet-plugin socket path).
+    enabled: true
+    # -- Constant label value shared by EVERY install. The anti-affinity selector
+    # matches this, so different driver versions never schedule onto the same node.
+    # Do not make this unique per release.
+    label: cxi-dra-driver
+
+# -- Only schedule on nodes with CXI hardware. Label nodes with:
+#    kubectl label node <node> feature.node.kubernetes.io/cxi=true
+nodeSelector:
+  feature.node.kubernetes.io/cxi: "true"
+
+tolerations: []
+
+# -- Container resource requests/limits.
+resources: {}
+
+driver:
+  # -- CDI spec output directory (host path). Spec files are named <driverName>-*.json
+  # by the driver, so they never collide between installs.
+  cdiRoot: /var/run/cdi
+  # -- Kubelet plugin socket directory. FIXED / version-independent: anti-affinity
+  # guarantees one driver pod per node, and a stable path lets `helm upgrade`
+  # cleanly replace the previous version's socket rather than orphan it.
+  pluginDir: /var/lib/kubelet/plugins/cxi-dra-driver
+  # -- Kubelet plugin registration directory (standard, shared).
+  registrarDir: /var/lib/kubelet/plugins_registry
+  # -- containerd CDI drop-in path. FIXED for the same reason as pluginDir.
+  containerdConfigPath: /etc/containerd/conf.d/50-cxi-cdi.toml
+  # -- Inject the env.json runtime-library CDI spec into claimed pods.
+  enableCdiEnv: true
+  # -- Per-namespace VNI pool.
+  vniRange:
+    start: 100
+    end: 300
+  # -- Blessed system services present on every node — typically the default
+  # service (svc_id 1) and the Ethernet service(s). These are never torn down by
+  # the driver, and their actual reserved resources are deducted from each
+  # device's usable ceiling. Populate from `cxi_service list` on a node. An empty
+  # list blesses nothing: the driver reserves no capacity and may reap
+  # pre-existing services.
+  systemSvcIDs: [1, 2, 3, 4]
+  # -- Extra raw args appended to the driver command.
+  extraArgs: []
+
+deviceClass:
+  # -- Render the DeviceClass that selects this install's ResourceSlices.
+  enabled: true
+
+admissionPolicy:
+  # -- Render the MutatingAdmissionPolicy + Binding that injects capacity/namespace
+  # selectors into claims carrying this install's opaque driver.
+  enabled: true
+  # -- Namespaces the policy does NOT mutate.
+  excludedNamespaces:
+    - kube-system
+
+envConfig:
+  # -- Render the env.json ConfigMap (runtime library mounts for the "env"/"nccl"/
+  # "aws-ofi-nccl" CDI profiles). Host paths are site-specific — override below.
+  enabled: true
+  json:
+    envMounts:
+      - { hostPath: "/home/vendor/pirese.vendor/source/libfabric/install/lib/libfabric.so.1", containerPath: "/usr/lib64/libfabric.so.1" }
+      - { hostPath: "/usr/lib64/libcxi.so.1", containerPath: "/usr/lib64/libcxi.so.1" }
+      - { hostPath: "/usr/lib64/libcurl.so.4", containerPath: "/usr/lib64/libcurl.so.4" }
+      - { hostPath: "/usr/lib64/libjson-c.so.5", containerPath: "/usr/lib64/libjson-c.so.5" }
+      - { hostPath: "/usr/lib64/libatomic.so.1", containerPath: "/usr/lib64/libatomic.so.1" }
+      - { hostPath: "/usr/lib64/libnl-3.so.200", containerPath: "/usr/lib64/libnl-3.so.200" }
+      - { hostPath: "/usr/lib64/libnghttp2.so.14", containerPath: "/usr/lib64/libnghttp2.so.14" }
+      - { hostPath: "/usr/lib64/libidn2.so.0", containerPath: "/usr/lib64/libidn2.so.0" }
+      - { hostPath: "/usr/lib64/libssh.so.4", containerPath: "/usr/lib64/libssh.so.4" }
+      - { hostPath: "/usr/lib64/libpsl.so.5", containerPath: "/usr/lib64/libpsl.so.5" }
+      - { hostPath: "/usr/lib64/libssl.so.3", containerPath: "/usr/lib64/libssl.so.1.1" }
+      - { hostPath: "/usr/lib64/libcrypto.so.3", containerPath: "/usr/lib64/libcrypto.so.1.1" }
+      - { hostPath: "/usr/lib64/libgssapi_krb5.so.2", containerPath: "/usr/lib64/libgssapi_krb5.so.2" }
+      - { hostPath: "/usr/lib64/libldap_r-2.4.so.2", containerPath: "/usr/lib64/libldap_r-2.4.so.2" }
+      - { hostPath: "/usr/lib64/liblber-2.4.so.2", containerPath: "/usr/lib64/liblber-2.4.so.2" }
+      - { hostPath: "/usr/lib64/libzstd.so.1", containerPath: "/usr/lib64/libzstd.so.1" }
+      - { hostPath: "/usr/lib64/libbrotlidec.so.1", containerPath: "/usr/lib64/libbrotlidec.so.1" }
+      - { hostPath: "/usr/lib64/libz.so.1", containerPath: "/usr/lib64/libz.so.1" }
+      - { hostPath: "/usr/lib64/libunistring.so.2", containerPath: "/usr/lib64/libunistring.so.2" }
+      - { hostPath: "/usr/lib64/libjitterentropy.so.3", containerPath: "/usr/lib64/libjitterentropy.so.3" }
+      - { hostPath: "/usr/lib64/libkrb5.so.3", containerPath: "/usr/lib64/libkrb5.so.3" }
+      - { hostPath: "/usr/lib64/libk5crypto.so.3", containerPath: "/usr/lib64/libk5crypto.so.3" }
+      - { hostPath: "/lib64/libcom_err.so.2", containerPath: "/lib64/libcom_err.so.2" }
+      - { hostPath: "/usr/lib64/libkrb5support.so.0", containerPath: "/usr/lib64/libkrb5support.so.0" }
+      - { hostPath: "/usr/lib64/libsasl2.so.3", containerPath: "/usr/lib64/libsasl2.so.3" }
+      - { hostPath: "/usr/lib64/libbrotlicommon.so.1", containerPath: "/usr/lib64/libbrotlicommon.so.1" }
+      - { hostPath: "/usr/lib64/libkeyutils.so.1", containerPath: "/usr/lib64/libkeyutils.so.1" }
+      - { hostPath: "/usr/lib64/libpcre.so.1", containerPath: "/usr/lib64/libpcre.so.1" }
+      - { hostPath: "/opt/xpmem/lib64/libxpmem.so.0", containerPath: "/usr/lib64/libxpmem.so.0" }
+    ncclPrefix: "/projects/public/brics/dev/apps/linux-neoverse_v2/nccl-2.29.2-1-yjntbzz5uuuashekge53wqizfqum6swy"
+    awsOfiMounts:
+      - { hostPath: "/projects/public/brics/dev/apps/linux-neoverse_v2/aws-ofi-nccl-1.18.0-6pbztrbjhvrmtu5r6nq2silgputmmcyk/lib/libnccl-net.so", containerPath: "/usr/lib/libnccl-net.so" }
+      - { hostPath: "/usr/lib64/libgdrapi.so.2.5", containerPath: "/usr/lib/libgdrapi.so" }
+      - { hostPath: "/projects/public/brics/dev/apps/linux-neoverse_v2/hwloc-2.12.2-xbbx7czzg3oczc3trftvj2dat3t6qj3o/lib/libhwloc.so.15", containerPath: "/usr/lib/libhwloc.so.15" }
+      - { hostPath: "/projects/public/brics/dev/apps/linux-neoverse_v2/libpciaccess-0.17-yisowb26ojigtiis73t5dukyrvx7r6rk/lib/libpciaccess.so.0", containerPath: "/usr/lib/libpciaccess.so.0" }
+      - { hostPath: "/projects/public/brics/dev/apps/linux-neoverse_v2/libxml2-2.13.5-xr3mgbb5y3midpndczeurgot35yosxkd/lib/libxml2.so.2", containerPath: "/usr/lib/libxml2.so.2" }
+      - { hostPath: "/projects/public/brics/dev/apps/linux-neoverse_v2/gcc-runtime-14.3.0-4aynqrbkrzeranfuqhyfg7wktmszdenq/lib/libatomic.so.1", containerPath: "/usr/lib/libatomic.so.1" }
+      - { hostPath: "/projects/public/brics/dev/apps/linux-neoverse_v2/xz-5.6.3-iqien4jp4hkpdks2rzyflpvgw3b72zqc/lib/liblzma.so.5", containerPath: "/usr/lib/liblzma.so.5" }
+      - { hostPath: "/projects/public/brics/dev/apps/linux-neoverse_v2/libiconv-1.18-4ok6y76vboaxcwzvxwnwhc6uaxzookdp/lib/libiconv.so.2", containerPath: "/usr/lib/libiconv.so.2" }
+    awsOfiEnv:
+      - "NCCL_NET=AWS Libfabric"
+      - "NCCL_CROSS_NIC=1"
+      - "NCCL_NET_GDR_LEVEL=PHB"
+      - "NCCL_SOCKET_IFNAME=eth0"
+      - "NCCL_MIN_NCHANNELS=4"
+      - "NCCL_GDRCOPY_ENABLE=1"
+      - "NCCL_NET_FORCE_FLUSH=0"
+      - "FI_MR_CACHE_MONITOR=userfaultfd"
+      - "FI_CXI_DISABLE_HOST_REGISTER=1"
+      - "FI_HMEM_CUDA_USE_GDRCOPY=1"
+      - "FI_CXI_DEFAULT_CQ_SIZE=131072"
+      - "FI_CXI_DEFAULT_TX_SIZE=2048"
+      - "FI_CXI_RDZV_PROTO=alt_read"
+      - "FI_CXI_RDZV_THRESHOLD=0"
+      - "FI_CXI_RDZV_GET_MIN=0"
+      - "FI_CXI_RDZV_EAGER_SIZE=0"
+      - "FI_CXI_DISABLE_NON_INJECT_MSG_IDC=1"
+      - "FI_CXI_RX_MATCH_MODE=hybrid"
+
+resourceClaimTemplates:
+  # -- Render the ResourceClaimTemplates. Each is named <name-prefix>-<template name>
+  # (e.g. cxi-slingshot-hpe-com-small) and points at this install's DeviceClass.
+  enabled: true
+  # -- Namespace the templates live in (workload-facing).
+  namespace: default
+  templates:
+    # cxi-small — benchmarks, fi_pingpong, development, simple single-threaded tools.
+    - name: small
+      params:
+        txqs: 4
+        tgqs: 2
+        eqs: 8
+        cts: 4
+        ptes: 4
+        acs: 2
+        le_pools: 1
+        tle_pools: 1
+        cdi_profiles: ["env"]
+    # cxi-medium — standard MPI jobs, NCCL at moderate scale, typical HPC workloads.
+    - name: medium
+      params:
+        txqs: 16
+        tgqs: 8
+        eqs: 32
+        cts: 32
+        ptes: 16
+        acs: 8
+        le_pools: 2
+        tle_pools: 1
+        cdi_profiles: ["env", "nccl", "aws-ofi-nccl"]
+    # cxi-large — multi-threaded MPI, NCCL at scale, collectives-heavy workloads.
+    - name: large
+      params:
+        txqs: 64
+        tgqs: 32
+        eqs: 128
+        cts: 256
+        ptes: 64
+        acs: 32
+        le_pools: 4
+        tle_pools: 2
+        cdi_profiles: ["env", "nccl", "aws-ofi-nccl"]
+    # cxi-whole — exclusive device access; full NIC after the system-svc reservation.
+    - name: whole
+      params:
+        txqs: 1019
+        tgqs: 507
+        eqs: 2037
+        cts: 2047
+        ptes: 2036
+        acs: 1018
+        le_pools: 14
+        tle_pools: 3
+        cdi_profiles: ["env", "nccl", "aws-ofi-nccl"]
+    # cxi-2-small — two devices (ExactCount) with the small profile.
+    - name: 2-small
+      count: 2
+      params:
+        txqs: 4
+        tgqs: 2
+        eqs: 8
+        cts: 4
+        ptes: 4
+        acs: 2
+        le_pools: 1
+        tle_pools: 1
+        cdi_profiles: ["env"]

@@ -1,0 +1,12 @@
+{{- if .Values.envConfig.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "cxi-dra.fullname" . }}-env
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "cxi-dra.labels" . | nindent 4 }}
+data:
+  env.json: |
+    {{- .Values.envConfig.json | toPrettyJson | nindent 4 }}
+{{- end }}

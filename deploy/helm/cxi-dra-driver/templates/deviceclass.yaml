@@ -1,0 +1,14 @@
+{{- if .Values.deviceClass.enabled }}
+apiVersion: resource.k8s.io/v1
+kind: DeviceClass
+metadata:
+  name: {{ include "cxi-dra.deviceClassName" . }}
+  labels:
+    {{- include "cxi-dra.labels" . | nindent 4 }}
+spec:
+  selectors:
+    - cel:
+        expression: >-
+          device.driver == "{{ include "cxi-dra.driverName" . }}" &&
+          device.attributes["{{ include "cxi-dra.driverName" . }}"].type == "device"
+{{- end }}

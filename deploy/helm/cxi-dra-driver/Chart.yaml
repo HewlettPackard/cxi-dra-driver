@@ -1,0 +1,18 @@
+apiVersion: v2
+name: cxi-dra-driver
+description: >-
+  HPE Slingshot CXI Dynamic Resource Allocation (DRA) driver. Installs the
+  node driver (DaemonSet or Deployment), its DeviceClass, RBAC, an optional
+  MutatingAdmissionPolicy, ResourceClaimTemplates and the env.json ConfigMap.
+  The driver name is parameterized so multiple versions can be installed
+  side-by-side: pod anti-affinity keeps each install's pods on distinct nodes.
+type: application
+version: 0.1.0
+appVersion: "dev"
+keywords:
+  - dra
+  - cxi
+  - slingshot
+  - rdma
+  - hpe
+home: https://github.com/slingshot/cxi-dra-driver

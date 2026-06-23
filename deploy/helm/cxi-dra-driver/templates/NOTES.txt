@@ -1,0 +1,37 @@
+CXI DRA driver "{{ .Release.Name }}" installed.
+
+  Driver name : {{ include "cxi-dra.driverName" . }}
+  Workload    : {{ .Values.workload.kind }} {{ include "cxi-dra.fullname" . }} (namespace {{ .Values.namespace }})
+{{- if .Values.deviceClass.enabled }}
+  DeviceClass : {{ include "cxi-dra.deviceClassName" . }}
+{{- end }}
+{{- if .Values.admissionPolicy.enabled }}
+  Policy      : {{ include "cxi-dra.fullname" . }}-selector-injection
+{{- end }}
+
+The driver publishes ResourceSlices under driver name
+"{{ include "cxi-dra.driverName" . }}". Verify the pods are up and slices exist:
+
+  kubectl -n {{ .Values.namespace }} rollout status {{ .Values.workload.kind | lower }}/{{ include "cxi-dra.fullname" . }}
+  kubectl get resourceslices -o wide | grep {{ include "cxi-dra.driverName" . }}
+
+{{- if .Values.resourceClaimTemplates.enabled }}
+
+ResourceClaimTemplates (namespace {{ .Values.resourceClaimTemplates.namespace }}):
+{{- range .Values.resourceClaimTemplates.templates }}
+  - {{ include "cxi-dra.fullname" $ }}-{{ .name }}
+{{- end }}
+
+Reference one from a pod with:
+
+  resourceClaims:
+    - name: cxi
+      resourceClaimTemplateName: {{ include "cxi-dra.fullname" . }}-small
+{{- end }}
+
+{{- if .Values.workload.antiAffinity.enabled }}
+
+Anti-affinity is ON: every install's pods carry the constant label
+`app: {{ .Values.workload.antiAffinity.label }}`, so this install's pods will not
+share a node with any other CXI DRA install — ideal for side-by-side version testing.
+{{- end }}
