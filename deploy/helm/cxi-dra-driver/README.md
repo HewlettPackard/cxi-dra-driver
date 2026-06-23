@@ -59,7 +59,7 @@ See [values.yaml](values.yaml) for the full set. Most-used:
 | `namespace` | `kube-system` | driver components namespace |
 | `priorityClassName` | `system-node-critical` | set `""` if installing outside kube-system |
 | `driver.vniRange.start/end` | `100`/`300` | per-namespace VNI pool |
-| `driver.reserved.*` | see values | hardware capacity reserved for node system services |
+| `driver.systemSvcIDs` | `[1,2,3,4]` | blessed system service svc_ids (never reaped; their usage is reserved) |
 | `resourceClaimTemplates.namespace` | `default` | where the claim templates live |
 | `admissionPolicy.excludedNamespaces` | `[kube-system]` | namespaces the policy ignores |
 

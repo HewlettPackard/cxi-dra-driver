@@ -68,18 +68,13 @@ driver:
   vniRange:
     start: 100
     end: 300
-  # -- Hardware capacity to reserve for pre-existing node system services
-  # (subtracted from what claims can request). Set to null to omit these flags
-  # and use the driver's built-in defaults.
-  reserved:
-    txqs: 5
-    tgqs: 5
-    eqs: 10
-    cts: 0
-    ptes: 12
-    acs: 4
-    lePools: 2
-    tlePools: 1
+  # -- Blessed system services present on every node — typically the default
+  # service (svc_id 1) and the Ethernet service(s). These are never torn down by
+  # the driver, and their actual reserved resources are deducted from each
+  # device's usable ceiling. Populate from `cxi_service list` on a node. An empty
+  # list blesses nothing: the driver reserves no capacity and may reap
+  # pre-existing services.
+  systemSvcIDs: [1, 2, 3, 4]
   # -- Extra raw args appended to the driver command.
   extraArgs: []
 
@@ -203,7 +198,7 @@ resourceClaimTemplates:
         le_pools: 4
         tle_pools: 2
         cdi_profiles: ["env", "nccl", "aws-ofi-nccl"]
-    # cxi-whole — exclusive device access; full NIC after the --reserved-* policy.
+    # cxi-whole — exclusive device access; full NIC after the system-svc reservation.
     - name: whole
       params:
         txqs: 1019

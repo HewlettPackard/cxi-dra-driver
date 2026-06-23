@@ -56,15 +56,8 @@ spec:
         - --cdi-root={{ .Values.driver.cdiRoot }}
         - --plugin-dir={{ .Values.driver.pluginDir }}
         - --registrar-dir={{ .Values.driver.registrarDir }}
-        {{- with .Values.driver.reserved }}
-        - --reserved-txqs={{ .txqs }}
-        - --reserved-tgqs={{ .tgqs }}
-        - --reserved-eqs={{ .eqs }}
-        - --reserved-cts={{ .cts }}
-        - --reserved-ptes={{ .ptes }}
-        - --reserved-acs={{ .acs }}
-        - --reserved-le-pools={{ .lePools }}
-        - --reserved-tle-pools={{ .tlePools }}
+        {{- with .Values.driver.systemSvcIDs }}
+        - --system-svc-ids={{ join "," . }}
         {{- end }}
         - --vni-range-start={{ .Values.driver.vniRange.start }}
         - --vni-range-end={{ .Values.driver.vniRange.end }}
