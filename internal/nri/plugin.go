@@ -331,11 +331,14 @@ func (p *Plugin) CreateContainer(_ context.Context, pod *api.PodSandbox, contain
 // capacity has been freed.
 func (p *Plugin) StopPodSandbox(_ context.Context, pod *api.PodSandbox) error {
 	podUID := types.UID(pod.GetUid())
-	allocs := p.store.Get(podUID)
-	if len(allocs) == 0 {
-		return nil
-	}
 
+	// Gate teardown on podStates, NOT the AllocationStore. The DRA
+	// UnprepareResourceClaims hook also deletes this pod's store entry, and
+	// the two hooks have no ordering guarantee: if Unprepare runs first,
+	// p.store.Get(podUID) would be empty here and we would skip DeleteService,
+	// leaking the CXI service (and its VNI) on the device. podStates is owned
+	// solely by this plugin and is the authoritative record of the svc_ids
+	// created for the pod, keyed by device name.
 	p.mu.Lock()
 	state, exists := p.podStates[podUID]
 	if !exists {
@@ -346,13 +349,14 @@ func (p *Plugin) StopPodSandbox(_ context.Context, pod *api.PodSandbox) error {
 	svcIDs := state.svcIDs
 	p.mu.Unlock()
 
-	for _, alloc := range allocs {
-		if svcID, ok := svcIDs[alloc.DeviceName]; ok {
-			fmt.Printf("cxi-nri: deleting service: pod=%s device=%s svc_id=%d\n",
-				podUID, alloc.DeviceName, svcID)
-			if err := p.destroyService(alloc.DeviceName, svcID); err != nil {
-				fmt.Printf("cxi-nri: warning: deleting service for %s: %v\n", alloc.DeviceName, err)
-			}
+	// podStates[podUID] is set only after RunPodSandbox created a service for
+	// every allocated device, so svcIDs covers exactly the pod's devices —
+	// no need to consult the store for the device list or namespace.
+	for deviceName, svcID := range svcIDs {
+		fmt.Printf("cxi-nri: deleting service: pod=%s device=%s svc_id=%d\n",
+			podUID, deviceName, svcID)
+		if err := p.destroyService(deviceName, svcID); err != nil {
+			fmt.Printf("cxi-nri: warning: deleting service for %s: %v\n", deviceName, err)
 		}
 		// Release the per-namespace occupancy slot for this device. We do
 		// this even if DeleteService returned an error: an undeletable
@@ -364,9 +368,11 @@ func (p *Plugin) StopPodSandbox(_ context.Context, pod *api.PodSandbox) error {
 		// scheduler-side and hardware-drift cases respectively — see
 		// Driver.RemoveOccupancy, RemoveOccupancyForClaim, and
 		// reconcileOccupancyFromHardware.
-		p.onOccupancyFreed(pod.GetNamespace(), alloc.DeviceName)
+		p.onOccupancyFreed(pod.GetNamespace(), deviceName)
 	}
 
+	// Best-effort store cleanup: UnprepareResourceClaims may have already
+	// removed this entry. Delete is idempotent.
 	p.store.Delete(podUID)
 
 	// Tell the binder to re-evaluate Ready=False claims — capacity just freed.
