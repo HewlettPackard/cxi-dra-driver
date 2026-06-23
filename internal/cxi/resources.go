@@ -95,8 +95,9 @@ func (r ResourceSet) Fits(available ResourceSet) bool {
 }
 
 // ClampToZero returns a copy of r with any negative fields set to zero.
-// Used when subtracting overhead from available capacity to avoid publishing
-// negative attribute values if overhead exceeds what the hardware reports.
+// Used when subtracting pending grants or the reserved set from available
+// capacity to avoid publishing negative attribute values if the subtrahend
+// exceeds what the hardware reports.
 func (r ResourceSet) ClampToZero() ResourceSet {
 	clamp := func(v int64) int64 {
 		if v < 0 {

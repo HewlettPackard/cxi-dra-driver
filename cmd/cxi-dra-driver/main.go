@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -39,17 +41,13 @@ func main() {
 		refreshInterval = flag.Duration("resource-refresh-interval", 10*time.Second,
 			"How often to republish the ResourceSlice with refreshed available-capacity attributes")
 
-		// Admin overhead: resources to deduct from hardware totals when computing
-		// the usable ceiling for outright rejection. Applied uniformly to all
-		// devices on this node. Set these to cover pre-existing system services.
-		reservedTXQs     = flag.Int64("reserved-txqs", 0, "TXQs reserved by pre-existing system services (deducted from usable ceiling)")
-		reservedTGQs     = flag.Int64("reserved-tgqs", 0, "TGQs reserved by pre-existing system services")
-		reservedEQs      = flag.Int64("reserved-eqs", 0, "EQs reserved by pre-existing system services")
-		reservedCTs      = flag.Int64("reserved-cts", 0, "CTs reserved by pre-existing system services")
-		reservedPTEs     = flag.Int64("reserved-ptes", 0, "PTEs reserved by pre-existing system services")
-		reservedACs      = flag.Int64("reserved-acs", 0, "ACs reserved by pre-existing system services")
-		reservedLEPools  = flag.Int64("reserved-le-pools", 0, "LE pools reserved by pre-existing system services (1 pool = 1024 LEs)")
-		reservedTLEPools = flag.Int64("reserved-tle-pools", 0, "TLE pools reserved by pre-existing system services (1 pool = 512 TLEs)")
+		// Blessed system services: svc_ids the driver must never delete, and
+		// whose reserved resources are deducted from each device's usable
+		// ceiling. Comma-separated, applied uniformly to all devices on this
+		// node. Set from `cxi_service list` to cover pre-existing system
+		// services (e.g. the default service and the Ethernet service).
+		systemSvcIDs = flag.String("system-svc-ids", "",
+			"Comma-separated svc_ids of blessed system services: never deleted, and their reserved resources are deducted from the per-device usable ceiling")
 
 		// CDI env spec configuration. When --enable-cdi-env is true, --env-config
 		// must point to a JSON file (typically mounted from a ConfigMap) that
@@ -78,21 +76,10 @@ func main() {
 
 	mock := *mockDevices > 0
 
-	if *reservedTXQs < 0 || *reservedTGQs < 0 || *reservedEQs < 0 || *reservedCTs < 0 ||
-		*reservedPTEs < 0 || *reservedACs < 0 || *reservedLEPools < 0 || *reservedTLEPools < 0 {
-		fmt.Fprintln(os.Stderr, "error: --reserved-* values must be non-negative")
+	sysSvcIDs, err := parseSvcIDs(*systemSvcIDs)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: --system-svc-ids: %v\n", err)
 		os.Exit(1)
-	}
-
-	overhead := cxi.ResourceSet{
-		TXQs: *reservedTXQs,
-		TGQs: *reservedTGQs,
-		EQs:  *reservedEQs,
-		CTs:  *reservedCTs,
-		PTEs: *reservedPTEs,
-		ACs:  *reservedACs,
-		LEs:  *reservedLEPools * cxi.LEPoolSize,
-		TLEs: *reservedTLEPools * cxi.TLEPoolSize,
 	}
 
 	var mockDevList []*cxi.Device
@@ -122,7 +109,7 @@ func main() {
 		RegistrarDir:         *registrarDir,
 		KubeClient:           kubeClient,
 		MockDevices:          mockDevList,
-		Overhead:             overhead,
+		SystemSvcIDs:         sysSvcIDs,
 		RefreshInterval:      *refreshInterval,
 		EnableCDIEnv:         *enableCDIEnv,
 		ContainerdConfigPath: *containerdConfigPath,
@@ -152,7 +139,7 @@ func main() {
 
 	binder := driver.NewClaimBinder(d, kubeClient, *driverName, *nodeName)
 
-	nriPlugin, err := nri.New(d.Store(), mock, d.TriggerRepublish, d.RemovePending, binder.TriggerRetry, d.RemoveOccupancy, d.RecordSvcID)
+	nriPlugin, err := nri.New(d.Store(), mock, d.TriggerRepublish, d.RemovePending, binder.TriggerRetry, d.RemoveOccupancy, d.RecordSvcID, sysSvcIDs)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: failed to create NRI plugin: %v\n", err)
 		os.Exit(1)
@@ -182,6 +169,32 @@ func main() {
 		fmt.Fprintf(os.Stderr, "error: claim binder exited: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+// parseSvcIDs parses a comma-separated list of non-negative svc_ids. An empty
+// or whitespace-only string yields a nil slice (no blessed services).
+func parseSvcIDs(s string) ([]int, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil, nil
+	}
+	parts := strings.Split(s, ",")
+	ids := make([]int, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		id, err := strconv.Atoi(p)
+		if err != nil {
+			return nil, fmt.Errorf("invalid svc_id %q: %w", p, err)
+		}
+		if id < 0 {
+			return nil, fmt.Errorf("svc_id must be non-negative, got %d", id)
+		}
+		ids = append(ids, id)
+	}
+	return ids, nil
 }
 
 func buildKubeClient(kubeconfig string) (kubernetes.Interface, error) {

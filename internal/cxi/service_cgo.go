@@ -104,7 +104,58 @@ static int cxi_sum_reserved(const char *device, resource_args *out)
     return 0;
 }
 
-// cxi_create_service allocates a CXI service with the VNI and network
+// cxi_reserved_for_svcs sums the reserved values across only the services whose
+// svc_id appears in ids[0..n). Used to compute the reserved resources held by
+// the operator-declared blessed system services (--system-svc-ids). LE/TLE pool
+// rounding is applied in Go.
+static int cxi_reserved_for_svcs(const char *device, const int *ids, int n,
+                                 resource_args *out)
+{
+    struct cxil_dev *dev = NULL;
+    int dev_idx = device_index(device);
+    if (dev_idx < 0)
+        return -EINVAL;
+    int rc = cxil_open_device(dev_idx, &dev);
+    if (rc != 0)
+        return rc;
+
+    struct cxil_svc_list *list = NULL;
+    rc = cxil_get_svc_list(dev, &list);
+    if (rc != 0) {
+        cxil_close_device(dev);
+        return rc;
+    }
+
+    memset(out, 0, sizeof(*out));
+    for (unsigned int i = 0; i < list->count; i++) {
+        const struct cxi_svc_desc *d = &list->descs[i];
+        if (!d->resource_limits)
+            continue;
+        int match = 0;
+        for (int j = 0; j < n; j++) {
+            if ((int)d->svc_id == ids[j]) {
+                match = 1;
+                break;
+            }
+        }
+        if (!match)
+            continue;
+        out->txqs += d->limits.txqs.res;
+        out->tgqs += d->limits.tgqs.res;
+        out->eqs  += d->limits.eqs.res;
+        out->cts  += d->limits.cts.res;
+        out->tles += d->limits.tles.res;
+        out->ptes += d->limits.ptes.res;
+        out->les  += d->limits.les.res;
+        out->acs  += d->limits.acs.res;
+    }
+
+    cxil_free_svc_list(list);
+    cxil_close_device(dev);
+    return 0;
+}
+
+
 // namespace bound at creation time via cxi_svc_desc fields and the
 // cxil_svc_set_netns post-creation ioctl respectively.
 //
@@ -359,6 +410,42 @@ func readAvailableCapacity(deviceName string) (ResourceSet, error) {
 	}
 
 	return total.Sub(reserved), nil
+}
+
+// readReservedForSvcs sums the reserved resources of the services whose svc_id
+// is in svcIDs (the operator-declared blessed system services). Used to compute
+// each device's usable ceiling as Capacity - Reserved. LEs and TLEs are rounded
+// up to pool boundaries to reflect true pool consumption. Returns the zero
+// ResourceSet (no CGo call) when svcIDs is empty.
+func readReservedForSvcs(deviceName string, svcIDs []int) (ResourceSet, error) {
+	if len(svcIDs) == 0 {
+		return ResourceSet{}, nil
+	}
+
+	cDev := C.CString(deviceName)
+	defer C.free(unsafe.Pointer(cDev))
+
+	cIDs := make([]C.int, len(svcIDs))
+	for i, id := range svcIDs {
+		cIDs[i] = C.int(id)
+	}
+
+	var raw C.resource_args
+	rc := C.cxi_reserved_for_svcs(cDev, &cIDs[0], C.int(len(cIDs)), &raw)
+	if rc != 0 {
+		return ResourceSet{}, fmt.Errorf("cxi_reserved_for_svcs(%s) returned %d", deviceName, int(rc))
+	}
+
+	return ResourceSet{
+		TXQs: int64(raw.txqs),
+		TGQs: int64(raw.tgqs),
+		EQs:  int64(raw.eqs),
+		CTs:  int64(raw.cts),
+		TLEs: RoundUpToTLEPool(int64(raw.tles)),
+		PTEs: int64(raw.ptes),
+		LEs:  RoundUpToLEPool(int64(raw.les)),
+		ACs:  int64(raw.acs),
+	}, nil
 }
 
 func (CXIServiceManager) CreateService(deviceName string, netnsInode uint64, vni int, resources ResourceSet) (int, error) {

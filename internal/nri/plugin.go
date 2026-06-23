@@ -40,6 +40,7 @@ type Plugin struct {
 	stub             stub.Stub
 	store            *driver.AllocationStore
 	svcMgr           cxi.ServiceManager
+	systemSvcIDs     map[int]bool                       // blessed system-service svc_ids (--system-svc-ids); destroyService refuses to delete these
 	republish        func()                             // triggers immediate ResourceSlice update
 	onServiceCreated func(types.UID)                    // called with claimUID after service creation
 	onServiceDeleted func()                             // called after any service is deleted, triggers binder retry
@@ -71,6 +72,11 @@ type Plugin struct {
 // recordSvcID is called per (claim, device) after CreateService succeeds, to
 // publish the VNI and svc_id on the claim's status for operator introspection
 // (`kubectl describe resourceclaim`). Best-effort; informational only.
+//
+// systemSvcIDs are the blessed system-service svc_ids (--system-svc-ids). The
+// plugin never deletes a service whose id is in this set — see destroyService.
+// In mock mode the mock svc_id counter is seeded past the highest blessed id so
+// generated ids never collide with the reserved system services.
 func New(
 	store *driver.AllocationStore,
 	mock bool,
@@ -79,16 +85,31 @@ func New(
 	onServiceDeleted func(),
 	onOccupancyFreed func(namespace, deviceName string),
 	recordSvcID func(ctx context.Context, claimUID types.UID, claimNs, claimName, deviceName string, vni, svcID int),
+	systemSvcIDs []int,
 ) (*Plugin, error) {
 	var svcMgr cxi.ServiceManager
 	if mock {
 		svcMgr = cxi.MockServiceManager{}
+		// Seed the mock counter past the highest blessed id so mock-created
+		// services never reuse a reserved system-service svc_id.
+		var maxID int
+		for _, id := range systemSvcIDs {
+			if id > maxID {
+				maxID = id
+			}
+		}
+		cxi.SeedMockSvcIDCounter(int64(maxID))
 	} else {
 		svcMgr = cxi.NewServiceManager()
+	}
+	blessed := make(map[int]bool, len(systemSvcIDs))
+	for _, id := range systemSvcIDs {
+		blessed[id] = true
 	}
 	p := &Plugin{
 		store:            store,
 		svcMgr:           svcMgr,
+		systemSvcIDs:     blessed,
 		republish:        republish,
 		onServiceCreated: onServiceCreated,
 		onServiceDeleted: onServiceDeleted,
@@ -143,6 +164,22 @@ func (p *Plugin) getDeviceLock(name string) *sync.Mutex {
 	return v.(*sync.Mutex)
 }
 
+// destroyService deletes the service identified by (devName, svcID), unless
+// svcID is a blessed system service (--system-svc-ids), in which case it logs
+// and returns nil without touching the kernel. The blessed services are owned
+// by the system and never created by this driver, so a stale in-memory svc_id
+// mapping must never tear one down. DRA-pod svc_ids never collide with blessed
+// ids in normal operation (the kernel assigns fresh ids in production; mock
+// seeds its counter past the blessed set), so this guard only fires on genuine
+// state corruption.
+func (p *Plugin) destroyService(devName string, svcID int) error {
+	if p.systemSvcIDs[svcID] {
+		fmt.Printf("cxi-nri: refusing to delete blessed system service svc_id=%d on %s\n", svcID, devName)
+		return nil
+	}
+	return p.svcMgr.DeleteService(devName, svcID)
+}
+
 // RunPodSandbox is called by containerd when the pod sandbox is created and
 // the network namespace is ready — before any containers start.
 //
@@ -173,7 +210,7 @@ func (p *Plugin) RunPodSandbox(ctx context.Context, pod *api.PodSandbox) error {
 	// holds exactly the services created so far, keyed by device name.
 	rollback := func() {
 		for devName, svcID := range state.svcIDs {
-			if err := p.svcMgr.DeleteService(devName, svcID); err != nil {
+			if err := p.destroyService(devName, svcID); err != nil {
 				fmt.Printf("cxi-nri: warning: rollback delete service %s: %v\n", devName, err)
 			}
 		}
@@ -313,7 +350,7 @@ func (p *Plugin) StopPodSandbox(_ context.Context, pod *api.PodSandbox) error {
 		if svcID, ok := svcIDs[alloc.DeviceName]; ok {
 			fmt.Printf("cxi-nri: deleting service: pod=%s device=%s svc_id=%d\n",
 				podUID, alloc.DeviceName, svcID)
-			if err := p.svcMgr.DeleteService(alloc.DeviceName, svcID); err != nil {
+			if err := p.destroyService(alloc.DeviceName, svcID); err != nil {
 				fmt.Printf("cxi-nri: warning: deleting service for %s: %v\n", alloc.DeviceName, err)
 			}
 		}

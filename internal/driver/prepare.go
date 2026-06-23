@@ -20,8 +20,9 @@ import (
 // using CXI claims is scheduled to this node. For each allocated device we:
 //  1. Resolve the requested ResourceSet from the claim's opaque config
 //     (all fields required — claims without config are rejected)
-//  2. Check the request against the usable ceiling (hardware - admin overhead)
-//     as a fast-fail for requests that can never succeed on this hardware
+//  2. Check the request against the usable ceiling (hardware - blessed
+//     system-service reserved) as a fast-fail for requests that can never
+//     succeed on this hardware
 //  3. Record the allocation in the store for the NRI plugin
 //
 // The live capacity fit-check is NOT performed here. It is owned by two
@@ -330,10 +331,11 @@ func parseResourceConfig(raw []byte) (cxi.ResourceSet, []string, error) {
 }
 
 // usableCeiling returns the maximum resources a service can ever request on
-// a device: hardware total minus the admin-configured overhead.
+// a device: hardware total minus the resources reserved by the blessed system
+// services (--system-svc-ids), summed once at discovery time.
 func (d *Driver) usableCeiling(deviceName string) cxi.ResourceSet {
 	total := d.deviceCapacity(deviceName)
-	return total.Sub(d.overhead)
+	return total.Sub(d.deviceReserved(deviceName))
 }
 
 // podAllocationBase builds a PodAllocation skeleton for a device name.
@@ -354,4 +356,16 @@ func (d *Driver) deviceCapacity(deviceName string) cxi.ResourceSet {
 		}
 	}
 	return cxi.DeviceCapacity()
+}
+
+// deviceReserved returns the resources held by the blessed system services
+// (--system-svc-ids) on a device by name, summed at discovery time. Zero in
+// mock/non-cxi builds, where no live services exist.
+func (d *Driver) deviceReserved(deviceName string) cxi.ResourceSet {
+	for _, dev := range d.devices {
+		if dev.Name == deviceName {
+			return dev.Reserved
+		}
+	}
+	return cxi.ResourceSet{}
 }

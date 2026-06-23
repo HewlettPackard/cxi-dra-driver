@@ -17,6 +17,14 @@ const mockServiceDir = "/tmp/cxi-services"
 // the counter lives at package scope. First CreateService returns 1.
 var mockSvcIDCounter int64
 
+// SeedMockSvcIDCounter sets the mock svc_id counter so the next CreateService
+// returns base+1. The NRI plugin seeds it past the highest blessed
+// --system-svc-id in mock mode so generated service ids never collide with the
+// reserved system services. No-op equivalent to the default when base is 0.
+func SeedMockSvcIDCounter(base int64) {
+	atomic.StoreInt64(&mockSvcIDCounter, base)
+}
+
 func (MockServiceManager) CreateService(deviceName string, netnsInode uint64, vni int, resources ResourceSet) (int, error) {
 	if err := os.MkdirAll(mockServiceDir, 0o755); err != nil {
 		return 0, fmt.Errorf("creating mock service dir: %w", err)

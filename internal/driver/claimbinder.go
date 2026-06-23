@@ -223,8 +223,9 @@ func (b *ClaimBinder) evaluateClaim(ctx context.Context, claim *resourceapi.Reso
 		}
 
 		// Read hardware capacity outside the lock to avoid blocking the mutex
-		// during I/O. Do NOT subtract overhead — ReadAvailableCapacity already
-		// reflects all running service consumption including system services.
+		// during I/O. Do NOT subtract the device's reserved set —
+		// ReadAvailableCapacity already reflects all running service consumption
+		// including the blessed system services (--system-svc-ids).
 		hwAvail, readErr := cxi.ReadAvailableCapacity(result.Device)
 		if readErr != nil {
 			// Skip this device this cycle; using zero capacity would

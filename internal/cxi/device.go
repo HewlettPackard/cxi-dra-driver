@@ -26,10 +26,18 @@ type Device struct {
 	// In non-cxi builds DeviceCapacity() is used. Discovery hard-fails if
 	// capacity cannot be read in production.
 	Capacity ResourceSet
+
+	// Reserved holds the resources consumed by the blessed system services
+	// (--system-svc-ids) on this device, summed at discovery time. Subtracted
+	// from Capacity to form the usable ceiling used by the prepare-time
+	// fast-fail. Zero in non-cxi/mock builds.
+	Reserved ResourceSet
 }
 
 // Discover walks /sys/class/cxi_user and returns one Device per cxi* entry.
-func Discover() ([]*Device, error) {
+// systemSvcIDs are the blessed system service svc_ids whose reserved resources
+// are summed into each device's Reserved field.
+func Discover(systemSvcIDs []int) ([]*Device, error) {
 	entries, err := os.ReadDir(sysfsClassPath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -55,6 +63,10 @@ func Discover() ([]*Device, error) {
 		if err != nil {
 			return nil, fmt.Errorf("reading capacity for device %s: %w", name, err)
 		}
+		reserved, err := readReservedForSvcs(name, systemSvcIDs)
+		if err != nil {
+			return nil, fmt.Errorf("reading reserved capacity for device %s: %w", name, err)
+		}
 		dev := &Device{
 			Name:      name,
 			Index:     idx,
@@ -63,6 +75,7 @@ func Discover() ([]*Device, error) {
 			NUMANode:  readIntFile(filepath.Join(sysfsPath, "device", "numa_node"), -1),
 			PCIeRoot:  readPCISlot(filepath.Join(sysfsPath, "device", "uevent")),
 			Capacity:  capacity,
+			Reserved:  reserved,
 		}
 
 		if err := PairDevice(dev); err != nil {

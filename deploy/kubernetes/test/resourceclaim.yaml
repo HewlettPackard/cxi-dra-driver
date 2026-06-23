@@ -47,12 +47,12 @@
 #                    carries libfabric/libcxi (BYO runtime)
 #
 # Per-device resources visible to claims under the daemonset's current
-# --reserved-* policy (see deploy/kubernetes/daemonset.yaml):
+# --system-svc-ids policy (see deploy/kubernetes/daemonset.yaml):
 #   TXQs 1019 · TGQs 507 · EQs 2037 · CTs 2047 · PTEs 2036 · ACs 1018
 #   le_pools 14 (14336 LEs) · tle_pools 3 (1536 TLEs)
-# The --reserved-* flags are an operator policy intended to leave headroom
-# for pre-existing system services on the node. Adjust them in daemonset.yaml
-# if your node's actual system consumption differs.
+# --system-svc-ids names the blessed system services already running on the
+# node; their reserved resources are deducted from the usable ceiling. Adjust
+# the list in daemonset.yaml if your node's actual system services differ.
 #
 ---
 # cxi-small — benchmarks, fi_pingpong, development, simple single-threaded tools.
@@ -143,7 +143,7 @@ spec:
 ---
 # cxi-whole — exclusive device access; for a single demanding workload that
 #             needs the full NIC (all resources remaining after the daemonset's
-#             --reserved-* policy).
+#             --system-svc-ids reservation).
 apiVersion: resource.k8s.io/v1
 kind: ResourceClaimTemplate
 metadata:

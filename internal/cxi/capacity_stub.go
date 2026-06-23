@@ -9,6 +9,14 @@ func readDeviceCapacity(_ string) (ResourceSet, error) {
 	return DeviceCapacity(), nil
 }
 
+// readReservedForSvcs returns the zero ResourceSet in non-cxi builds — there
+// are no live CXI services in mock mode, so the blessed system services
+// (--system-svc-ids) reserve nothing. Production builds sum the
+// cxil_get_svc_list entries whose svc_id matches — see service_cgo.go.
+func readReservedForSvcs(_ string, _ []int) (ResourceSet, error) {
+	return ResourceSet{}, nil
+}
+
 // ReadAvailableCapacity returns the full device capacity as available in
 // non-cxi builds — there are no live services to subtract. Production builds
 // poll cxil_get_svc_list via libcxi — see capacity_cgo.go.
