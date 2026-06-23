@@ -39,16 +39,16 @@ type pendingKey struct {
 
 // Config holds all configuration for a Driver instance.
 type Config struct {
-	NodeName        string
-	PodUID          string
-	DriverName      string
-	CDIRoot         string
-	PluginDir       string
-	RegistrarDir    string
-	KubeClient      kubernetes.Interface
-	MockDevices     []*cxi.Device
-	Overhead        cxi.ResourceSet
-	RefreshInterval time.Duration
+	NodeName             string
+	PodUID               string
+	DriverName           string
+	CDIRoot              string
+	PluginDir            string
+	RegistrarDir         string
+	KubeClient           kubernetes.Interface
+	MockDevices          []*cxi.Device
+	SystemSvcIDs         []int // blessed system-service svc_ids; their reserved resources are excluded from each device's usable ceiling
+	RefreshInterval      time.Duration
 	CDIEnvConfig         cdi.CDIEnvConfig
 	EnableCDIEnv         bool   // if false, env/nccl/ofi CDI specs are not written and not injected into pods
 	ContainerdConfigPath string // path for the containerd CDI config drop-in; empty = skip
@@ -56,21 +56,21 @@ type Config struct {
 
 // Driver implements kubeletplugin.DRAPlugin for CXI devices.
 type Driver struct {
-	nodeName        string
-	podUID          string
-	driverName      string
-	cdiRoot         string
-	pluginDir       string
-	registrarDir    string
-	kubeClient      kubernetes.Interface
-	mockDevices     []*cxi.Device
-	devices         []*cxi.Device
-	store           *AllocationStore
-	overhead        cxi.ResourceSet // admin-configured per-device reserved overhead
-	refreshInterval time.Duration   // how often to republish ResourceSlice with fresh avail attrs
+	nodeName             string
+	podUID               string
+	driverName           string
+	cdiRoot              string
+	pluginDir            string
+	registrarDir         string
+	kubeClient           kubernetes.Interface
+	mockDevices          []*cxi.Device
+	devices              []*cxi.Device
+	store                *AllocationStore
+	systemSvcIDs         []int         // blessed system-service svc_ids passed to cxi.Discover; reserved resources excluded from each device's usable ceiling
+	refreshInterval      time.Duration // how often to republish ResourceSlice with fresh avail attrs
 	cdiEnvConfig         cdi.CDIEnvConfig
-	enableCDIEnv         bool   // if false, env/nccl/ofi CDI specs are not written and not injected into pods
-	containerdConfigPath string // path for the containerd CDI config drop-in; empty = skip
+	enableCDIEnv         bool          // if false, env/nccl/ofi CDI specs are not written and not injected into pods
+	containerdConfigPath string        // path for the containerd CDI config drop-in; empty = skip
 	notify               chan struct{} // signals an immediate ResourceSlice republish
 
 	pendingMu sync.Mutex
@@ -118,6 +118,29 @@ type Driver struct {
 	// slot per device, so the value is a slice. Single-device claims — the
 	// common case — hold a one-element slice.
 	claimToOccupancy map[types.UID][]occupancyKey
+
+	// Orphan-service reaper state. The reaper runs on the same Run ticker as
+	// the reconciler and destroys CXI services whose owning pod is gone — the
+	// gap the reconciler cannot close, since it only repairs in-memory
+	// occupancy and never the hardware service itself. All three fields are
+	// touched solely by reapOrphanServices, which runs only from the single
+	// Run goroutine, so they need no additional locking.
+	//
+	// reapSvcMgr issues the DeleteService calls: the driver's own stateless
+	// ServiceManager (CGo-backed in production), independent of the NRI
+	// plugin's manager so the reaper stays self-contained.
+	//
+	// liveSvcIDs returns the svc_ids the NRI plugin still owns for live pods,
+	// grouped by device, so the reaper never deletes a service backing a
+	// running pod. nil until main wires plugin.LiveSvcIDs via
+	// SetLiveSvcIDsFunc; while nil the reaper is inert.
+	//
+	// reaperMisses counts the consecutive cycles each (device, svc_id) has
+	// looked orphaned; a service is destroyed only after reapGraceCycles
+	// confirmations so a pod mid-start is never reaped.
+	reapSvcMgr   cxi.ServiceManager
+	liveSvcIDs   func() map[string]map[int]bool
+	reaperMisses map[reapKey]int
 }
 
 // occupancyKey identifies one namespace's hold on one device. Used as the
@@ -130,30 +153,42 @@ type occupancyKey struct {
 
 func New(cfg Config) *Driver {
 	return &Driver{
-		nodeName:          cfg.NodeName,
-		podUID:            cfg.PodUID,
-		driverName:        cfg.DriverName,
-		cdiRoot:           cfg.CDIRoot,
-		pluginDir:         cfg.PluginDir,
-		registrarDir:      cfg.RegistrarDir,
-		kubeClient:        cfg.KubeClient,
-		mockDevices:       cfg.MockDevices,
-		store:             NewAllocationStore(),
-		overhead:          cfg.Overhead,
-		refreshInterval:   cfg.RefreshInterval,
+		nodeName:             cfg.NodeName,
+		podUID:               cfg.PodUID,
+		driverName:           cfg.DriverName,
+		cdiRoot:              cfg.CDIRoot,
+		pluginDir:            cfg.PluginDir,
+		registrarDir:         cfg.RegistrarDir,
+		kubeClient:           cfg.KubeClient,
+		mockDevices:          cfg.MockDevices,
+		store:                NewAllocationStore(),
+		systemSvcIDs:         cfg.SystemSvcIDs,
+		refreshInterval:      cfg.RefreshInterval,
 		cdiEnvConfig:         cfg.CDIEnvConfig,
 		enableCDIEnv:         cfg.EnableCDIEnv,
 		containerdConfigPath: cfg.ContainerdConfigPath,
-		notify:            make(chan struct{}, 1),
-		pending:           make(map[pendingKey]pendingEntry),
-		nsDeviceOccupancy: make(map[string]map[string]types.UID),
-		claimToOccupancy:  make(map[types.UID][]occupancyKey),
+		notify:               make(chan struct{}, 1),
+		pending:              make(map[pendingKey]pendingEntry),
+		nsDeviceOccupancy:    make(map[string]map[string]types.UID),
+		claimToOccupancy:     make(map[types.UID][]occupancyKey),
+		reapSvcMgr:           cxi.NewServiceManager(),
+		reaperMisses:         make(map[reapKey]int),
 	}
 }
 
 // Store returns the allocation store, so it can be passed to the NRI plugin.
 func (d *Driver) Store() *AllocationStore {
 	return d.store
+}
+
+// SetLiveSvcIDsFunc injects the source of currently-live svc_ids — the NRI
+// plugin's LiveSvcIDs — consulted by the orphan-service reaper so it never
+// destroys a service backing a running pod. Must be called before Run; until
+// it is, the reaper does nothing. Wired in main after the NRI plugin is
+// constructed, which breaks the construction cycle: the plugin needs the
+// driver's store, and the driver needs the plugin's live-svc-id view.
+func (d *Driver) SetLiveSvcIDsFunc(fn func() map[string]map[int]bool) {
+	d.liveSvcIDs = fn
 }
 
 // TriggerRepublish schedules an immediate ResourceSlice republish. If one is
@@ -309,8 +344,9 @@ func (d *Driver) RemoveOccupancyForClaim(claimUID types.UID) {
 // different claim on the same device.
 //
 // hwAvail must be the raw value from ReadAvailableCapacity — do NOT subtract
-// overhead before calling, as ReadAvailableCapacity already reflects all
-// running service consumption including system services.
+// the device's reserved set before calling, as ReadAvailableCapacity already
+// reflects all running service consumption including the blessed system
+// services (--system-svc-ids).
 //
 // Idempotent: if THIS claim already holds (namespace, deviceName), the call is
 // a no-op grant — re-evaluation does not double-count or churn the slice.
@@ -438,9 +474,10 @@ func (d *Driver) hasPending(claimUID types.UID, deviceName string) bool {
 //
 //	ReadAvailableCapacity(deviceName) − pending grants
 //
-// Note: overhead is NOT subtracted here. ReadAvailableCapacity already
-// reflects the actual consumption of all running services (including the
-// pre-configured system services that --reserved-*-pools represents).
+// Note: the device's reserved set is NOT subtracted here. ReadAvailableCapacity
+// already reflects the actual consumption of all running services (including
+// the blessed system services named by --system-svc-ids). The reserved set is
+// only used to form the prepare-time usable ceiling — see usableCeiling.
 // Used by buildDevices to publish accurate avail_* attributes in the
 // ResourceSlice so the scheduler can make informed placement decisions.
 func (d *Driver) effectiveAvail(deviceName string) cxi.ResourceSet {
@@ -508,7 +545,7 @@ func (d *Driver) Run(ctx context.Context) error {
 	if d.mockDevices != nil {
 		d.devices = d.mockDevices
 	} else {
-		devices, err := cxi.Discover()
+		devices, err := cxi.Discover(d.systemSvcIDs)
 		if err != nil {
 			return fmt.Errorf("discovering CXI devices: %w", err)
 		}
@@ -597,6 +634,15 @@ func (d *Driver) Run(ctx context.Context) error {
 	// makes is reflected in the same ResourceSlice update — and if it
 	// triggers an extra republish via the notify channel, the next loop
 	// iteration absorbs it harmlessly.
+	//
+	// reapOrphanServices runs right after the reconciler. Where the
+	// reconciler only repairs in-memory occupancy, the reaper destroys the
+	// underlying CXI services whose owning pod is gone — leaks the event
+	// path (NRI StopPodSandbox) never cleaned up because the pod was
+	// force-deleted, the driver restarted, or a service was created out of
+	// band. It deletes only after several consecutive cycles confirm the
+	// service's pod netns is gone, and never touches blessed, kernel-system,
+	// or NRI-tracked services.
 	if d.refreshInterval <= 0 {
 		return fmt.Errorf("--resource-refresh-interval must be > 0 (got %s)", d.refreshInterval)
 	}
@@ -608,6 +654,7 @@ func (d *Driver) Run(ctx context.Context) error {
 			return nil
 		case <-ticker.C:
 			d.reconcileOccupancyFromHardware(ctx)
+			d.reapOrphanServices()
 			if err := publish(); err != nil {
 				d.logf("warning: refreshing resource slice: %v", err)
 			}

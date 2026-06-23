@@ -43,14 +43,11 @@ spec:
             - --cdi-root=/var/run/cdi
             - --plugin-dir=/var/lib/kubelet/plugins/cxi.slingshot.hpe.com
             - --registrar-dir=/var/lib/kubelet/plugins_registry
-            - --reserved-txqs=5
-            - --reserved-tgqs=5
-            - --reserved-eqs=10
-            - --reserved-cts=0
-            - --reserved-ptes=12
-            - --reserved-acs=4
-            - --reserved-le-pools=2
-            - --reserved-tle-pools=1
+            # Blessed system services present on every node: the default service
+            # (svc_id 1) and the Ethernet service(s). Never torn down by the
+            # driver, and their reserved resources are deducted from each
+            # device's usable ceiling. Populate from `cxi_service list`.
+            - --system-svc-ids=1,2,3,4
             - --vni-range-start=100
             - --vni-range-end=300
             - --enable-cdi-env=true

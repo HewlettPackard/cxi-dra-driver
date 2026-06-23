@@ -23,8 +23,8 @@ import (
 // created exactly once per pod (in RunPodSandbox) and torn down when the pod
 // sandbox stops (in StopPodSandbox).
 type podState struct {
-	netnsInode uint64
-	// svcIDs maps deviceName -> allocated svc_id, injected as SLINGSHOT_SVC_IDS
+	// svcIDs maps deviceName -> allocated svc_id. Used to tear the service
+	// down in StopPodSandbox and injected as SLINGSHOT_SVC_IDS.
 	svcIDs map[string]int
 }
 
@@ -40,10 +40,12 @@ type Plugin struct {
 	stub             stub.Stub
 	store            *driver.AllocationStore
 	svcMgr           cxi.ServiceManager
-	republish        func()                            // triggers immediate ResourceSlice update
-	onServiceCreated func(types.UID)                   // called with claimUID after service creation
-	onServiceDeleted func()                            // called after any service is deleted, triggers binder retry
+	systemSvcIDs     map[int]bool                       // blessed system-service svc_ids (--system-svc-ids); destroyService refuses to delete these
+	republish        func()                             // triggers immediate ResourceSlice update
+	onServiceCreated func(types.UID)                    // called with claimUID after service creation
+	onServiceDeleted func()                             // called after any service is deleted, triggers binder retry
 	onOccupancyFreed func(namespace, deviceName string) // called per-(ns,dev) after DestroyService to release per-namespace occupancy
+	recordSvcID      func(ctx context.Context, claimUID types.UID, claimNs, claimName, deviceName string, vni, svcID int)
 	mu               sync.Mutex
 	podStates        map[types.UID]*podState
 	deviceMu         sync.Map // map[string]*sync.Mutex — one mutex per device name
@@ -66,6 +68,15 @@ type Plugin struct {
 // enforce SHS14's per-device VNI uniqueness constraint: two claims from
 // the same namespace cannot co-locate on the same device. See the
 // nsDeviceOccupancy field on Driver for details.
+//
+// recordSvcID is called per (claim, device) after CreateService succeeds, to
+// publish the VNI and svc_id on the claim's status for operator introspection
+// (`kubectl describe resourceclaim`). Best-effort; informational only.
+//
+// systemSvcIDs are the blessed system-service svc_ids (--system-svc-ids). The
+// plugin never deletes a service whose id is in this set — see destroyService.
+// In mock mode the mock svc_id counter is seeded past the highest blessed id so
+// generated ids never collide with the reserved system services.
 func New(
 	store *driver.AllocationStore,
 	mock bool,
@@ -73,20 +84,37 @@ func New(
 	onServiceCreated func(types.UID),
 	onServiceDeleted func(),
 	onOccupancyFreed func(namespace, deviceName string),
+	recordSvcID func(ctx context.Context, claimUID types.UID, claimNs, claimName, deviceName string, vni, svcID int),
+	systemSvcIDs []int,
 ) (*Plugin, error) {
 	var svcMgr cxi.ServiceManager
 	if mock {
 		svcMgr = cxi.MockServiceManager{}
+		// Seed the mock counter past the highest blessed id so mock-created
+		// services never reuse a reserved system-service svc_id.
+		var maxID int
+		for _, id := range systemSvcIDs {
+			if id > maxID {
+				maxID = id
+			}
+		}
+		cxi.SeedMockSvcIDCounter(int64(maxID))
 	} else {
 		svcMgr = cxi.NewServiceManager()
+	}
+	blessed := make(map[int]bool, len(systemSvcIDs))
+	for _, id := range systemSvcIDs {
+		blessed[id] = true
 	}
 	p := &Plugin{
 		store:            store,
 		svcMgr:           svcMgr,
+		systemSvcIDs:     blessed,
 		republish:        republish,
 		onServiceCreated: onServiceCreated,
 		onServiceDeleted: onServiceDeleted,
 		onOccupancyFreed: onOccupancyFreed,
+		recordSvcID:      recordSvcID,
 		podStates:        make(map[types.UID]*podState),
 	}
 	var err error
@@ -136,6 +164,47 @@ func (p *Plugin) getDeviceLock(name string) *sync.Mutex {
 	return v.(*sync.Mutex)
 }
 
+// destroyService deletes the service identified by (devName, svcID), unless
+// svcID is a blessed system service (--system-svc-ids), in which case it logs
+// and returns nil without touching the kernel. The blessed services are owned
+// by the system and never created by this driver, so a stale in-memory svc_id
+// mapping must never tear one down. DRA-pod svc_ids never collide with blessed
+// ids in normal operation (the kernel assigns fresh ids in production; mock
+// seeds its counter past the blessed set), so this guard only fires on genuine
+// state corruption.
+func (p *Plugin) destroyService(devName string, svcID int) error {
+	if p.systemSvcIDs[svcID] {
+		fmt.Printf("cxi-nri: refusing to delete blessed system service svc_id=%d on %s\n", svcID, devName)
+		return nil
+	}
+	return p.svcMgr.DeleteService(devName, svcID)
+}
+
+// LiveSvcIDs returns the svc_ids the plugin currently owns, grouped by device:
+// result[deviceName][svcID] is true for every service created for a pod sandbox
+// that has not yet stopped (i.e. still present in podStates). The driver's
+// orphan-service reaper consults this set so it never deletes a service that
+// belongs to a live pod — in particular one whose StopPodSandbox has not run
+// yet, or one created so recently that the kernel has not finished recording
+// its pod netns. The returned map is a fresh copy and safe to read without
+// holding p.mu.
+func (p *Plugin) LiveSvcIDs() map[string]map[int]bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := make(map[string]map[int]bool)
+	for _, state := range p.podStates {
+		for devName, svcID := range state.svcIDs {
+			byDev := out[devName]
+			if byDev == nil {
+				byDev = make(map[int]bool)
+				out[devName] = byDev
+			}
+			byDev[svcID] = true
+		}
+	}
+	return out
+}
+
 // RunPodSandbox is called by containerd when the pod sandbox is created and
 // the network namespace is ready — before any containers start.
 //
@@ -143,7 +212,7 @@ func (p *Plugin) getDeviceLock(name string) *sync.Mutex {
 // The per-device fit-check here is a secondary safety net for the narrow
 // window between Ready=True being granted and the service being created.
 // On failure the pod sandbox creation is retried by the kubelet.
-func (p *Plugin) RunPodSandbox(_ context.Context, pod *api.PodSandbox) error {
+func (p *Plugin) RunPodSandbox(ctx context.Context, pod *api.PodSandbox) error {
 	podUID := types.UID(pod.GetUid())
 	allocs := p.store.Get(podUID)
 	if len(allocs) == 0 {
@@ -160,13 +229,13 @@ func (p *Plugin) RunPodSandbox(_ context.Context, pod *api.PodSandbox) error {
 	}
 
 	netnsPath := netnsFromPod(pod)
-	state := &podState{netnsInode: inode, svcIDs: make(map[string]int)}
+	state := &podState{svcIDs: make(map[string]int)}
 
-	// Track services created so far for rollback on partial failure.
-	createdDevices := make([]string, 0, len(allocs))
+	// Roll back any services already created if a later device fails. svcIDs
+	// holds exactly the services created so far, keyed by device name.
 	rollback := func() {
-		for _, devName := range createdDevices {
-			if err := p.svcMgr.DeleteService(devName, inode); err != nil {
+		for devName, svcID := range state.svcIDs {
+			if err := p.destroyService(devName, svcID); err != nil {
 				fmt.Printf("cxi-nri: warning: rollback delete service %s: %v\n", devName, err)
 			}
 		}
@@ -206,8 +275,13 @@ func (p *Plugin) RunPodSandbox(_ context.Context, pod *api.PodSandbox) error {
 			rollback()
 			return fmt.Errorf("creating CXI service for %s: %w", alloc.DeviceName, err)
 		}
-		createdDevices = append(createdDevices, alloc.DeviceName)
 		state.svcIDs[alloc.DeviceName] = svcID
+
+		// Publish VNI + svc_id on the claim's status for operator introspection.
+		if alloc.ClaimUID != "" {
+			p.recordSvcID(ctx, alloc.ClaimUID, alloc.ClaimNamespace, alloc.ClaimName,
+				alloc.DeviceName, alloc.VNI, svcID)
+		}
 	}
 
 	p.mu.Lock()
@@ -245,7 +319,6 @@ func (p *Plugin) CreateContainer(_ context.Context, pod *api.PodSandbox, contain
 	p.mu.Lock()
 	svcIDs := make(map[string]int, len(state.svcIDs))
 	maps.Copy(svcIDs, state.svcIDs)
-	inode := state.netnsInode
 	p.mu.Unlock()
 
 	// Build aligned comma-separated lists. Position N in SLINGSHOT_DEVICES,
@@ -266,7 +339,7 @@ func (p *Plugin) CreateContainer(_ context.Context, pod *api.PodSandbox, contain
 
 	if isMockManager(p.svcMgr) {
 		for _, alloc := range allocs {
-			hostPath := cxi.MockServicePath(alloc.DeviceName, inode)
+			hostPath := cxi.MockServicePath(alloc.DeviceName, svcIDs[alloc.DeviceName])
 			containerPath := fmt.Sprintf("/run/cxi/%s-service.yaml", alloc.DeviceName)
 			adj.AddMount(&api.Mount{
 				Source:      hostPath,
@@ -283,11 +356,14 @@ func (p *Plugin) CreateContainer(_ context.Context, pod *api.PodSandbox, contain
 // capacity has been freed.
 func (p *Plugin) StopPodSandbox(_ context.Context, pod *api.PodSandbox) error {
 	podUID := types.UID(pod.GetUid())
-	allocs := p.store.Get(podUID)
-	if len(allocs) == 0 {
-		return nil
-	}
 
+	// Gate teardown on podStates, NOT the AllocationStore. The DRA
+	// UnprepareResourceClaims hook also deletes this pod's store entry, and
+	// the two hooks have no ordering guarantee: if Unprepare runs first,
+	// p.store.Get(podUID) would be empty here and we would skip DeleteService,
+	// leaking the CXI service (and its VNI) on the device. podStates is owned
+	// solely by this plugin and is the authoritative record of the svc_ids
+	// created for the pod, keyed by device name.
 	p.mu.Lock()
 	state, exists := p.podStates[podUID]
 	if !exists {
@@ -295,14 +371,17 @@ func (p *Plugin) StopPodSandbox(_ context.Context, pod *api.PodSandbox) error {
 		return nil
 	}
 	delete(p.podStates, podUID)
-	inode := state.netnsInode
+	svcIDs := state.svcIDs
 	p.mu.Unlock()
 
-	for _, alloc := range allocs {
-		fmt.Printf("cxi-nri: deleting service: pod=%s device=%s inode=%d\n",
-			podUID, alloc.DeviceName, inode)
-		if err := p.svcMgr.DeleteService(alloc.DeviceName, inode); err != nil {
-			fmt.Printf("cxi-nri: warning: deleting service for %s: %v\n", alloc.DeviceName, err)
+	// podStates[podUID] is set only after RunPodSandbox created a service for
+	// every allocated device, so svcIDs covers exactly the pod's devices —
+	// no need to consult the store for the device list or namespace.
+	for deviceName, svcID := range svcIDs {
+		fmt.Printf("cxi-nri: deleting service: pod=%s device=%s svc_id=%d\n",
+			podUID, deviceName, svcID)
+		if err := p.destroyService(deviceName, svcID); err != nil {
+			fmt.Printf("cxi-nri: warning: deleting service for %s: %v\n", deviceName, err)
 		}
 		// Release the per-namespace occupancy slot for this device. We do
 		// this even if DeleteService returned an error: an undeletable
@@ -314,9 +393,11 @@ func (p *Plugin) StopPodSandbox(_ context.Context, pod *api.PodSandbox) error {
 		// scheduler-side and hardware-drift cases respectively — see
 		// Driver.RemoveOccupancy, RemoveOccupancyForClaim, and
 		// reconcileOccupancyFromHardware.
-		p.onOccupancyFreed(pod.GetNamespace(), alloc.DeviceName)
+		p.onOccupancyFreed(pod.GetNamespace(), deviceName)
 	}
 
+	// Best-effort store cleanup: UnprepareResourceClaims may have already
+	// removed this entry. Delete is idempotent.
 	p.store.Delete(podUID)
 
 	// Tell the binder to re-evaluate Ready=False claims — capacity just freed.

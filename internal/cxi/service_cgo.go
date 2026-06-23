@@ -104,7 +104,58 @@ static int cxi_sum_reserved(const char *device, resource_args *out)
     return 0;
 }
 
-// cxi_create_service allocates a CXI service with the VNI and network
+// cxi_reserved_for_svcs sums the reserved values across only the services whose
+// svc_id appears in ids[0..n). Used to compute the reserved resources held by
+// the operator-declared blessed system services (--system-svc-ids). LE/TLE pool
+// rounding is applied in Go.
+static int cxi_reserved_for_svcs(const char *device, const int *ids, int n,
+                                 resource_args *out)
+{
+    struct cxil_dev *dev = NULL;
+    int dev_idx = device_index(device);
+    if (dev_idx < 0)
+        return -EINVAL;
+    int rc = cxil_open_device(dev_idx, &dev);
+    if (rc != 0)
+        return rc;
+
+    struct cxil_svc_list *list = NULL;
+    rc = cxil_get_svc_list(dev, &list);
+    if (rc != 0) {
+        cxil_close_device(dev);
+        return rc;
+    }
+
+    memset(out, 0, sizeof(*out));
+    for (unsigned int i = 0; i < list->count; i++) {
+        const struct cxi_svc_desc *d = &list->descs[i];
+        if (!d->resource_limits)
+            continue;
+        int match = 0;
+        for (int j = 0; j < n; j++) {
+            if ((int)d->svc_id == ids[j]) {
+                match = 1;
+                break;
+            }
+        }
+        if (!match)
+            continue;
+        out->txqs += d->limits.txqs.res;
+        out->tgqs += d->limits.tgqs.res;
+        out->eqs  += d->limits.eqs.res;
+        out->cts  += d->limits.cts.res;
+        out->tles += d->limits.tles.res;
+        out->ptes += d->limits.ptes.res;
+        out->les  += d->limits.les.res;
+        out->acs  += d->limits.acs.res;
+    }
+
+    cxil_free_svc_list(list);
+    cxil_close_device(dev);
+    return 0;
+}
+
+
 // namespace bound at creation time via cxi_svc_desc fields and the
 // cxil_svc_set_netns post-creation ioctl respectively.
 //
@@ -215,11 +266,11 @@ static int cxi_create_service(const char *device, uint64_t netns_inode, int vni,
     return svc_id;
 }
 
-// cxi_delete_service finds the service associated with the given netns inode
-// and destroys it. SHS14 stores the netns association out-of-band (via
-// cxil_svc_set_netns), so we probe each service with cxil_svc_get_netns
-// rather than scanning the members[] array that existed in SHS12.
-static int cxi_delete_service(const char *device, uint64_t netns_inode)
+// cxi_destroy_service destroys the service identified by svc_id directly via
+// cxil_destroy_svc. The svc_id is the kernel-allocated id returned from
+// cxi_create_service (cxil_alloc_svc) and tracked per device by the NRI
+// plugin, so no service-list scan is required.
+static int cxi_destroy_service(const char *device, int svc_id)
 {
     struct cxil_dev *dev = NULL;
     int dev_idx = device_index(device);
@@ -230,36 +281,11 @@ static int cxi_delete_service(const char *device, uint64_t netns_inode)
         fprintf(stderr, "cxi_wrapper: cxil_open_device(%d) failed: %d\n", dev_idx, rc);
         return rc;
     }
-    struct cxil_svc_list *list = NULL;
-    rc = cxil_get_svc_list(dev, &list);
-    if (rc != 0) {
-        fprintf(stderr, "cxi_wrapper: cxil_get_svc_list failed: %d\n", rc);
-        cxil_close_device(dev);
-        return rc;
-    }
-    unsigned int target_id = 0;
-    for (unsigned int i = 0; i < list->count; i++) {
-        unsigned int svc_id = list->descs[i].svc_id;
-        unsigned int svc_netns = 0;
-        if (cxil_svc_get_netns(dev, svc_id, &svc_netns) != 0)
-            continue;
-        if (svc_netns == (unsigned int)netns_inode) {
-            target_id = svc_id;
-            break;
-        }
-    }
-    cxil_free_svc_list(list);
-    if (!target_id) {
-        fprintf(stderr, "cxi_wrapper: no service found for inode=%llu on %s\n",
-                (unsigned long long)netns_inode, device);
-        cxil_close_device(dev);
-        return -ENOENT;
-    }
-    rc = cxil_destroy_svc(dev, target_id);
+    rc = cxil_destroy_svc(dev, svc_id);
     if (rc != 0)
-        fprintf(stderr, "cxi_wrapper: cxil_destroy_svc(%u) failed: %d\n", target_id, rc);
+        fprintf(stderr, "cxi_wrapper: cxil_destroy_svc(%d) failed: %d\n", svc_id, rc);
     else
-        fprintf(stderr, "cxi_wrapper: destroyed service id=%u on %s\n", target_id, device);
+        fprintf(stderr, "cxi_wrapper: destroyed service id=%d on %s\n", svc_id, device);
     cxil_close_device(dev);
     return rc;
 }
@@ -308,10 +334,76 @@ static int cxi_list_service_vnis(const char *device,
             continue;
         out[written++] = d->vnis[0];
     }
+	*count = written;
+	cxil_free_svc_list(list);
+	cxil_close_device(dev);
+	return 0;
+}
+
+// cxi_list_services enumerates every service on the device, writing svc_id,
+// vni (vnis[0], or 0 when the service has no restricted VNI) and is_system_svc
+// into the caller-provided parallel arrays. Unlike cxi_list_service_vnis it
+// does NOT filter out system or VNI-less services — the orphan reaper needs to
+// see and explicitly skip them. *count receives the number written (<= max_out).
+static int cxi_list_services(const char *device,
+                             int *ids, uint16_t *vnis, uint8_t *is_system,
+                             unsigned int max_out, unsigned int *count)
+{
+    *count = 0;
+    struct cxil_dev *dev = NULL;
+    int dev_idx = device_index(device);
+    if (dev_idx < 0)
+        return -EINVAL;
+    int rc = cxil_open_device(dev_idx, &dev);
+    if (rc != 0) {
+        fprintf(stderr, "cxi_wrapper: cxil_open_device(%d) failed: %d\n", dev_idx, rc);
+        return rc;
+    }
+    struct cxil_svc_list *list = NULL;
+    rc = cxil_get_svc_list(dev, &list);
+    if (rc != 0) {
+        fprintf(stderr, "cxi_wrapper: cxil_get_svc_list failed: %d\n", rc);
+        cxil_close_device(dev);
+        return rc;
+    }
+    unsigned int written = 0;
+    for (unsigned int i = 0; i < list->count && written < max_out; i++) {
+        const struct cxi_svc_desc *d = &list->descs[i];
+        ids[written] = (int)d->svc_id;
+        vnis[written] = (d->restricted_vnis && d->num_vld_vnis > 0) ? d->vnis[0] : 0;
+        is_system[written] = d->is_system_svc ? 1 : 0;
+        written++;
+    }
     *count = written;
     cxil_free_svc_list(list);
     cxil_close_device(dev);
     return 0;
+}
+
+// cxi_service_netns reads the network-namespace id (nsfs inode) bound to svc_id
+// via cxil_svc_get_netns. The kernel stores this as an unsigned int — the low
+// 32 bits of the inode that cxil_svc_set_netns was given at creation time (see
+// cxi_create_service). *netns is left 0 on any failure.
+static int cxi_service_netns(const char *device, int svc_id, uint32_t *netns)
+{
+    *netns = 0;
+    struct cxil_dev *dev = NULL;
+    int dev_idx = device_index(device);
+    if (dev_idx < 0)
+        return -EINVAL;
+    int rc = cxil_open_device(dev_idx, &dev);
+    if (rc != 0) {
+        fprintf(stderr, "cxi_wrapper: cxil_open_device(%d) failed: %d\n", dev_idx, rc);
+        return rc;
+    }
+    unsigned int ns = 0;
+    rc = cxil_svc_get_netns(dev, (unsigned int)svc_id, &ns);
+    if (rc != 0)
+        fprintf(stderr, "cxi_wrapper: cxil_svc_get_netns(%d) failed: %d\n", svc_id, rc);
+    else
+        *netns = (uint32_t)ns;
+    cxil_close_device(dev);
+    return rc;
 }
 */
 import "C"
@@ -386,6 +478,42 @@ func readAvailableCapacity(deviceName string) (ResourceSet, error) {
 	return total.Sub(reserved), nil
 }
 
+// readReservedForSvcs sums the reserved resources of the services whose svc_id
+// is in svcIDs (the operator-declared blessed system services). Used to compute
+// each device's usable ceiling as Capacity - Reserved. LEs and TLEs are rounded
+// up to pool boundaries to reflect true pool consumption. Returns the zero
+// ResourceSet (no CGo call) when svcIDs is empty.
+func readReservedForSvcs(deviceName string, svcIDs []int) (ResourceSet, error) {
+	if len(svcIDs) == 0 {
+		return ResourceSet{}, nil
+	}
+
+	cDev := C.CString(deviceName)
+	defer C.free(unsafe.Pointer(cDev))
+
+	cIDs := make([]C.int, len(svcIDs))
+	for i, id := range svcIDs {
+		cIDs[i] = C.int(id)
+	}
+
+	var raw C.resource_args
+	rc := C.cxi_reserved_for_svcs(cDev, &cIDs[0], C.int(len(cIDs)), &raw)
+	if rc != 0 {
+		return ResourceSet{}, fmt.Errorf("cxi_reserved_for_svcs(%s) returned %d", deviceName, int(rc))
+	}
+
+	return ResourceSet{
+		TXQs: int64(raw.txqs),
+		TGQs: int64(raw.tgqs),
+		EQs:  int64(raw.eqs),
+		CTs:  int64(raw.cts),
+		TLEs: RoundUpToTLEPool(int64(raw.tles)),
+		PTEs: int64(raw.ptes),
+		LEs:  RoundUpToLEPool(int64(raw.les)),
+		ACs:  int64(raw.acs),
+	}, nil
+}
+
 func (CXIServiceManager) CreateService(deviceName string, netnsInode uint64, vni int, resources ResourceSet) (int, error) {
 	cDev := C.CString(deviceName)
 	defer C.free(unsafe.Pointer(cDev))
@@ -408,13 +536,13 @@ func (CXIServiceManager) CreateService(deviceName string, netnsInode uint64, vni
 	return int(rc), nil
 }
 
-func (CXIServiceManager) DeleteService(deviceName string, netnsInode uint64) error {
+func (CXIServiceManager) DeleteService(deviceName string, svcID int) error {
 	cDev := C.CString(deviceName)
 	defer C.free(unsafe.Pointer(cDev))
-	rc := C.cxi_delete_service(cDev, C.uint64_t(netnsInode))
+	rc := C.cxi_destroy_service(cDev, C.int(svcID))
 	if rc != 0 {
-		return fmt.Errorf("cxi_delete_service(%s, inode=%d) returned %d",
-			deviceName, netnsInode, int(rc))
+		return fmt.Errorf("cxi_destroy_service(%s, svc_id=%d) returned %d",
+			deviceName, svcID, int(rc))
 	}
 	return nil
 }
@@ -458,4 +586,58 @@ func readActiveServiceVNIs(deviceName string) ([]uint16, error) {
 		out[i] = uint16(buf[i])
 	}
 	return out, nil
+}
+
+// readActiveServices is the CGo-backed implementation of ReadActiveServices
+// (see capacity_cgo.go). It returns one ServiceInfo per live service on the
+// device — including system and VNI-less services, which the orphan reaper
+// must see in order to skip them.
+func readActiveServices(deviceName string) ([]ServiceInfo, error) {
+	cDev := C.CString(deviceName)
+	defer C.free(unsafe.Pointer(cDev))
+
+	ids := make([]C.int, maxServicesPerDevice)
+	vnis := make([]C.uint16_t, maxServicesPerDevice)
+	sys := make([]C.uint8_t, maxServicesPerDevice)
+	var count C.uint
+	rc := C.cxi_list_services(
+		cDev,
+		(*C.int)(unsafe.Pointer(&ids[0])),
+		(*C.uint16_t)(unsafe.Pointer(&vnis[0])),
+		(*C.uint8_t)(unsafe.Pointer(&sys[0])),
+		C.uint(maxServicesPerDevice),
+		&count,
+	)
+	if rc != 0 {
+		return nil, fmt.Errorf("cxi_list_services(%s) returned %d", deviceName, int(rc))
+	}
+	n := int(count)
+	if n > maxServicesPerDevice {
+		return nil, fmt.Errorf("cxi_list_services(%s) returned count=%d, exceeds buffer cap %d (raise maxServicesPerDevice)",
+			deviceName, n, maxServicesPerDevice)
+	}
+	out := make([]ServiceInfo, n)
+	for i := 0; i < n; i++ {
+		out[i] = ServiceInfo{
+			SvcID:    int(ids[i]),
+			VNI:      uint16(vnis[i]),
+			IsSystem: sys[i] != 0,
+		}
+	}
+	return out, nil
+}
+
+// readServiceNetns is the CGo-backed implementation of ReadServiceNetns (see
+// capacity_cgo.go). It returns the nsfs inode (low 32 bits, zero-extended)
+// bound to svc_id, or an error if the kernel has no netns for the service.
+func readServiceNetns(deviceName string, svcID int) (uint64, error) {
+	cDev := C.CString(deviceName)
+	defer C.free(unsafe.Pointer(cDev))
+
+	var ns C.uint32_t
+	rc := C.cxi_service_netns(cDev, C.int(svcID), &ns)
+	if rc != 0 {
+		return 0, fmt.Errorf("cxi_service_netns(%s, svc_id=%d) returned %d", deviceName, svcID, int(rc))
+	}
+	return uint64(ns), nil
 }
