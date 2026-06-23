@@ -1,0 +1,194 @@
+{{/*
+Shared pod template for both the DaemonSet and the Deployment. Rendered with the
+root context. Pod labels carry BOTH:
+  - the release-scoped selector labels (app.kubernetes.io/instance) used by the
+    workload .spec.selector so each workload owns only its own pods, and
+  - the constant anti-affinity label (app: <antiAffinity.label>) which is shared
+    across ALL installs so the anti-affinity rule spreads every install's pods
+    onto distinct nodes.
+*/}}
+{{- define "cxi-dra.podTemplate" -}}
+metadata:
+  labels:
+    {{- include "cxi-dra.selectorLabels" . | nindent 4 }}
+    app: {{ .Values.workload.antiAffinity.label }}
+spec:
+  serviceAccountName: {{ include "cxi-dra.fullname" . }}
+  hostPID: true  # required for netns inode querying
+  {{- with .Values.priorityClassName }}
+  priorityClassName: {{ . }}
+  {{- end }}
+  # Baseline seccomp profile. The driver container is privileged (it needs raw
+  # access to /dev/cxi* and sysfs) so it runs unconfined at runtime, but
+  # declaring the pod baseline satisfies Pod Security Standards and tooling.
+  securityContext:
+    seccompProfile:
+      type: RuntimeDefault
+  {{- with .Values.nodeSelector }}
+  nodeSelector:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with .Values.tolerations }}
+  tolerations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- if .Values.workload.antiAffinity.enabled }}
+  # Spread pods across distinct nodes. The selector matches the CONSTANT
+  # `app` label shared by every install, so two driver versions never land on
+  # the same node — and two replicas of one Deployment never collide on the
+  # fixed kubelet-plugin socket path either.
+  affinity:
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        - labelSelector:
+            matchLabels:
+              app: {{ .Values.workload.antiAffinity.label }}
+          topologyKey: kubernetes.io/hostname
+  {{- end }}
+  containers:
+    - name: driver
+      image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+      imagePullPolicy: {{ .Values.image.pullPolicy }}
+      command:
+        - /cxi-dra-driver
+      args:
+        - --driver-name={{ include "cxi-dra.driverName" . }}
+        - --cdi-root={{ .Values.driver.cdiRoot }}
+        - --plugin-dir={{ .Values.driver.pluginDir }}
+        - --registrar-dir={{ .Values.driver.registrarDir }}
+        {{- with .Values.driver.reserved }}
+        - --reserved-txqs={{ .txqs }}
+        - --reserved-tgqs={{ .tgqs }}
+        - --reserved-eqs={{ .eqs }}
+        - --reserved-cts={{ .cts }}
+        - --reserved-ptes={{ .ptes }}
+        - --reserved-acs={{ .acs }}
+        - --reserved-le-pools={{ .lePools }}
+        - --reserved-tle-pools={{ .tlePools }}
+        {{- end }}
+        - --vni-range-start={{ .Values.driver.vniRange.start }}
+        - --vni-range-end={{ .Values.driver.vniRange.end }}
+        - --enable-cdi-env={{ .Values.driver.enableCdiEnv }}
+        - --containerd-config-path={{ .Values.driver.containerdConfigPath }}
+        {{- if .Values.envConfig.enabled }}
+        - --env-config=/etc/cxi-dra/env.json
+        {{- end }}
+        {{- with .Values.driver.extraArgs }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      env:
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        - name: POD_UID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.uid
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+      securityContext:
+        privileged: true  # required to access /dev/cxi* and sysfs
+        runAsUser: 0
+      {{- with .Values.resources }}
+      resources:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      volumeMounts:
+        - name: sys
+          mountPath: /sys
+          readOnly: true
+        - name: dev
+          mountPath: /dev
+        - name: kubelet-plugins
+          mountPath: {{ .Values.driver.pluginDir }}
+        - name: kubelet-registry
+          mountPath: {{ .Values.driver.registrarDir }}
+        - name: containerd-conf
+          mountPath: {{ dir .Values.driver.containerdConfigPath }}
+        - name: cdi
+          mountPath: {{ .Values.driver.cdiRoot }}
+        - name: nri
+          mountPath: /var/run/nri
+        - name: netns
+          mountPath: /var/run/netns
+          readOnly: true
+        {{- if .Values.envConfig.enabled }}
+        - name: env-config
+          mountPath: /etc/cxi-dra
+          readOnly: true
+        {{- end }}
+  volumes:
+    - name: sys
+      hostPath:
+        path: /sys
+    - name: dev
+      hostPath:
+        path: /dev
+    - name: kubelet-plugins
+      hostPath:
+        path: {{ .Values.driver.pluginDir }}
+        type: DirectoryOrCreate
+    - name: kubelet-registry
+      hostPath:
+        path: {{ .Values.driver.registrarDir }}
+    - name: containerd-conf
+      hostPath:
+        path: {{ dir .Values.driver.containerdConfigPath }}
+        type: DirectoryOrCreate
+    - name: cdi
+      hostPath:
+        path: {{ .Values.driver.cdiRoot }}
+        type: DirectoryOrCreate
+    - name: nri
+      hostPath:
+        path: /var/run/nri
+        type: DirectoryOrCreate
+    - name: netns
+      hostPath:
+        path: /var/run/netns
+        type: DirectoryOrCreate
+    {{- if .Values.envConfig.enabled }}
+    - name: env-config
+      configMap:
+        name: {{ include "cxi-dra.fullname" . }}-env
+    {{- end }}
+{{- end -}}
+{{- if eq .Values.workload.kind "Deployment" }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "cxi-dra.fullname" . }}
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "cxi-dra.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.workload.replicas }}
+  selector:
+    matchLabels:
+      {{- include "cxi-dra.selectorLabels" . | nindent 6 }}
+  strategy:
+    type: RollingUpdate
+  template:
+    {{- include "cxi-dra.podTemplate" . | nindent 4 }}
+{{- else if eq .Values.workload.kind "DaemonSet" }}
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "cxi-dra.fullname" . }}
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "cxi-dra.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "cxi-dra.selectorLabels" . | nindent 6 }}
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    {{- include "cxi-dra.podTemplate" . | nindent 4 }}
+{{- else }}
+{{- fail (printf "workload.kind must be \"DaemonSet\" or \"Deployment\", got %q" .Values.workload.kind) }}
+{{- end }}

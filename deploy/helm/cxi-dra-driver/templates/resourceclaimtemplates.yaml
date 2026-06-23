@@ -1,0 +1,38 @@
+{{- if .Values.resourceClaimTemplates.enabled }}
+{{- $root := . }}
+{{- $driver := include "cxi-dra.driverName" . }}
+{{- $deviceClass := include "cxi-dra.deviceClassName" . }}
+{{- $fullname := include "cxi-dra.fullname" . }}
+{{- $ns := .Values.resourceClaimTemplates.namespace }}
+{{- range .Values.resourceClaimTemplates.templates }}
+---
+# {{ $fullname }}-{{ .name }} — one ResourceClaim per pod allocating CXI NIC(s).
+# The fabric VNI is NOT part of the claim: it is assigned per-namespace by the
+# leader-elected allocator and read at prepare time. All resource fields PLUS
+# cdi_profiles are required — the driver has no defaults.
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata:
+  name: {{ $fullname }}-{{ .name }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "cxi-dra.labels" $root | nindent 4 }}
+spec:
+  spec:
+    devices:
+      requests:
+        - name: cxi
+          exactly:
+            deviceClassName: {{ $deviceClass }}
+            {{- if .count }}
+            allocationMode: ExactCount
+            count: {{ .count }}
+            {{- end }}
+      config:
+        - requests: ["cxi"]
+          opaque:
+            driver: {{ $driver }}
+            parameters:
+              {{- toYaml .params | nindent 14 }}
+{{- end }}
+{{- end }}

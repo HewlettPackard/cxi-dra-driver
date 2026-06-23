@@ -1,0 +1,41 @@
+{{/*
+Leader-election scaffolding for the namespace VNI allocator. Only one driver pod
+at a time assigns VNIs to namespaces; the rest wait. Scoped to a single Lease in
+.Values.namespace so the ServiceAccount cannot read or overwrite control-plane
+leases (e.g. kube-scheduler / kube-controller-manager).
+
+The Lease name is derived from the driver name to match what the driver uses at
+runtime (SetDriverName -> "<driverName>-vni-allocator-leader").
+*/}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "cxi-dra.fullname" . }}-vni-allocator-leader
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "cxi-dra.labels" . | nindent 4 }}
+rules:
+  # "create" cannot be restricted by resourceName — the object does not exist yet.
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["create"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    resourceNames: [{{ include "cxi-dra.leaseName" . | quote }}]
+    verbs: ["get", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "cxi-dra.fullname" . }}-vni-allocator-leader
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "cxi-dra.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "cxi-dra.fullname" . }}-vni-allocator-leader
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "cxi-dra.fullname" . }}
+    namespace: {{ .Values.namespace }}
