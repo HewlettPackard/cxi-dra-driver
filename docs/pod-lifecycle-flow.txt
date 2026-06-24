@@ -83,7 +83,7 @@ state and live hardware state.
       │                                                                          ││
       ▼                                                                     ResourceSlice
   Kubelet: PrepareResourceClaims                                            (re)published with
-      │  static ceiling check: requested ≤ (hardware_total − --reserved-*)   avail_* +
+      │  static ceiling check: requested ≤ (hardware_total − svc reserved)   avail_* +
       │    └─ rejects here if request can never fit regardless of load       active_namespaces
       │  reads VNI from namespace annotation cxi.slingshot.hpe.com/vni           ││
       │    (10-retry: allocator may not have annotated yet)                       ││

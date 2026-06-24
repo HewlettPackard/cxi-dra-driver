@@ -162,9 +162,9 @@ DRA Node Driver: {
     shape: sql_table
     label: "■ NRI Plugin"
     impl: "internal/nri/plugin.go"
-    RunPodSandbox: "per-device mutex; secondary fit-check; CreateService(dev, netnsInode, VNI, ResourceSet); RemovePending on success"
-    CreateContainer: "inject SLINGSHOT_DEVICES, SLINGSHOT_VNIS, SLINGSHOT_SVC_IDS (env-spec integration gated by --enable-cdi-env)"
-    StopPodSandbox: "DestroyService; RemoveOccupancy per (ns,dev) (idempotent, even on DeleteService error); TriggerRetry; TriggerRepublish"
+    RunPodSandbox: "per-device mutex; secondary fit-check; CreateService(dev, netnsInode, VNI, ResourceSet); buildNetSysfs synthetic /sys/class/net; RemovePending on success"
+    CreateContainer: "inject SLINGSHOT_DEVICES, SLINGSHOT_VNIS, SLINGSHOT_SVC_IDS; overmount synthetic /sys/class/net (HSN)"
+    StopPodSandbox: "DestroyService; RemoveOccupancy per (ns,dev) (idempotent, even on DeleteService error); remove netns sysfs tree; TriggerRetry; TriggerRepublish"
   }
 
   Namespace VNI Allocator: {
@@ -300,6 +300,7 @@ Container: {
     impl: "internal/cdi/env.go + internal/cdi/containerd.go"
     flag: "--enable-cdi-env=true (set in daemonset)"
     purpose: "injects libfabric/libcxi libs + optional NCCL/AWS-OFI-NCCL"
+    env: "CXIP_SKIP_AMA_CHECK=1 bypasses libfabric AMA gate (no patch, no real netdev)"
     opt_in: "per-claim cdi_profiles: [env, nccl, aws-ofi-nccl]"
     auto_configure: "writes /etc/containerd/conf.d/50-cxi-cdi.toml + SIGHUPs containerd at startup"
   }
@@ -310,7 +311,7 @@ Container: {
     devices: "/dev/cxiN via CDI DeviceNodes"
     no_privileged_required: "CDI grants device access without privileged"
     vni_scope: "restricted by CXI service to namespace VNI"
-    libfabric: "discovers HSN via sysfs"
+    libfabric: "stock provider discovers HSN via injected /sys/class/net"
   }
 
   CDI Spec -> Pod Container: "kubelet applies on container start"

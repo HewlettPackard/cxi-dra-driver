@@ -153,14 +153,21 @@ pod_lifecycle: {
   nri -> cxi_svc: "CreateService(cxi0, netnsInode=98765, vni=3, ResourceSet)"
   cxi_svc -> cxi_svc: "open /dev/cxi0\nlibcxi ioctl: alloc service\nscoped to (netns inode, VNI)"
   cxi_svc -> nri: "serviceID=7"
-  nri -> nri: "podStates[podUID] = {cxi0: svcID=7}"
+  nri -> nri: "buildNetSysfs: build synthetic /sys/class/net\n  (host path; HSN BDF + speed read from host /sys/class/net/hsn2)"
+  nri -> nri: "podStates[podUID] = {cxi0: svcID=7, netSysfsDir}"
   nri -> binder: "(via driver) RemovePending(uid)\n  → NOTE: does NOT touch nsDeviceOccupancy"
+
+  containerd -> nri: "NRI hook: CreateContainer(podUID, container)"
+  nri -> nri: "AddEnv SLINGSHOT_DEVICES=cxi0,\n  SLINGSHOT_VNIS=3, SLINGSHOT_SVC_IDS=7"
+  nri -> nri: "overmount /sys/class/net ← synthetic tree\n  (stock libfabric sees hsn2: operstate=up)"
+  nri -> containerd: "ContainerAdjustment"
 
   containerd -> containerd: "start container process\n(libfabric sees /dev/cxi0, opens it,\n  uses service for fabric ops)"
 
   # Teardown via NRI (normal path)
   containerd -> nri: "NRI hook: StopPodSandbox"
   nri -> cxi_svc: "DestroyService(cxi0, svcID=7)"
+  nri -> nri: "RemoveAll netns sysfs tree (<root>/<podUID>)"
   nri -> binder: "(via driver) RemoveOccupancy(ns, cxi0)\n  → removeOccupancyLocked: clears slot + reverse index\n  → unblocks future claims from same ns on cxi0"
   nri -> binder: "TriggerRetry (unblock Ready=False waiters)"
   nri -> binder: "TriggerRepublish (active_namespaces loses <NS>)"
