@@ -378,7 +378,7 @@ Each device in the `ResourceSlice` exposes the following attributes, accessible 
 | Attribute | Type | Description |
 |---|---|---|
 | `numa_node` | int | NUMA node the device is attached to |
-| `pcie_root` | string | PCIe root complex slot (e.g. `"0000:81:00.0"`) |
+| `pcie_root` | string | PCIe root complex slot of the CXI device itself (e.g. `"0000:81:00.0"`) |
 | `hsn_iface` | string | Associated HSN network interface (e.g. `"hsn2"`) |
 | `capacity_txqs` | int | Hardware total TXQs |
 | `capacity_tgqs` | int | Hardware total TGQs |
@@ -411,6 +411,80 @@ devices:
           - cel:
               expression: 'device.attributes["cxi.slingshot.hpe.com"]["numa_node"] == 1'
 ```
+
+## Co-locating CXI NICs with NVIDIA GPUs
+
+On GH200-class nodes each CXI NIC, GPU, and NUMA node map 1:1, and you usually want a
+pod's CXI NIC to sit on the same PCIe locality as its GPU. DRA expresses this with a
+[`matchAttribute`](https://kubernetes.io/docs/concepts/scheduling-eviction/dynamic-resource-allocation/)
+constraint: every device across the listed requests must share the same value for a
+*fully-qualified* attribute.
+
+For a cross-driver match the attribute name and value must be identical on both sides.
+The NVIDIA DRA driver publishes the standardized attribute
+`resource.kubernetes.io/pcieRoot` (value `pci<domain>:<bus>`, e.g. `pci0009:00`). NVIDIA
+does **not** publish `numa_node`, and the NIC and GPU sit under different PCIe roots, so
+NUMA is the only shared locality key. This driver therefore discovers, for each CXI
+device, the NVIDIA GPU on the same NUMA node and republishes that GPU's PCIe root under
+the same standardized name:
+
+| Attribute | Type | Description |
+|---|---|---|
+| `resource.kubernetes.io/pcieRoot` | string | PCIe root (`pci<domain>:<bus>`) of the NVIDIA GPU on this CXI device's NUMA node. Matches the value the NVIDIA driver publishes. Only present when a GPU is found on the device's NUMA node. |
+
+The value is computed exactly as Kubernetes' own `deviceattribute.GetPCIeRootAttributeByPCIBusID`
+helper does (resolve `/sys/bus/pci/devices/<bdf>` and take the leading `pci<domain>:<bus>`
+component), so the two drivers' values are byte-for-byte comparable.
+
+A single claim then requests one GPU and one CXI NIC and constrains them to the same root:
+
+```yaml
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaim
+metadata:
+  name: gpu-cxi
+spec:
+  devices:
+    config:
+      - requests: ["cxi"]
+        opaque:
+          driver: cxi.slingshot.hpe.com   # must match this install's driverName
+          parameters: { txqs: 19, tgqs: 57, eqs: 37, cts: 47, ptes: 36, acs: 18, le_pools: 1, tle_pools: 1, cdi_profiles: ["env", "aws-ofi-nccl"] }
+    constraints:
+      - matchAttribute: resource.kubernetes.io/pcieRoot
+        requests: ["gpu", "cxi"]
+    requests:
+      - name: gpu
+        exactly:
+          deviceClassName: gpu.nvidia.com
+          allocationMode: ExactCount
+          count: 1
+          selectors:
+            - cel: { expression: 'device.driver == "gpu.nvidia.com"' }   # keep a selector so the MutatingAdmissionPolicy does not inject CXI selectors into the GPU request
+      - name: cxi
+        exactly:
+          deviceClassName: cxi-device
+          allocationMode: ExactCount
+          count: 1
+```
+
+The scheduler allocates a GPU and the CXI NIC that share a PCIe root — e.g. `gpu-3` with
+`cxi3`, both on `pci0039:00` (NUMA node 3).
+
+Caveats:
+
+- The CXI NIC and its NUMA-local GPU must both be **free on the same node**; the constraint
+  removes the scheduler's freedom to pick an unrelated NIC, so a busy GPU or a CXI device
+  already in use by another pod **in the same namespace** (see the per-namespace-per-device
+  restriction above) can make an otherwise-valid node unschedulable.
+- `resource.kubernetes.io/pcieRoot` is only published on nodes running a driver build that
+  includes it; the constraint is unsatisfiable on nodes that predate the attribute.
+
+> **Deprecation note:** this republish-the-GPU's-root approach is a stopgap. Once the NVIDIA
+> DRA driver exposes NUMA topology through the standardized device-attributes KEP (the same
+> effort that defines `resource.kubernetes.io/pcieRoot` in `k8s.io/dynamic-resource-allocation/deviceattribute`),
+> both drivers can `matchAttribute` directly on a shared NUMA/topology attribute and this
+> NUMA→GPU-PCIe-root inference can be removed.
 
 ## Mock Mode (kind / no hardware)
 

@@ -21,6 +21,12 @@ type Device struct {
 	PCIeRoot    string // PCI slot name, e.g. "0000:81:00.0"
 	HSNIface    string // paired HSN interface, e.g. "hsn2" (set by PairDevice)
 
+	// GPUPCIeRoot is the PCIe root (e.g. "pci0009:00") of the NVIDIA GPU on
+	// this device's NUMA node, published as resource.kubernetes.io/pcieRoot so
+	// a ResourceClaim can matchAttribute a CXI NIC to its NUMA-local GPU.
+	// Empty if no NVIDIA GPU is present on the NUMA node (or NUMA is unknown).
+	GPUPCIeRoot string
+
 	// Capacity holds the total hardware resource limits for this device,
 	// read from cxil_devinfo via libcxi at discovery time (production builds).
 	// In non-cxi builds DeviceCapacity() is used. Discovery hard-fails if
@@ -45,6 +51,11 @@ func Discover(systemSvcIDs []int) ([]*Device, error) {
 		}
 		return nil, fmt.Errorf("reading %s: %w", sysfsClassPath, err)
 	}
+
+	// Map of NUMA node -> NUMA-local GPU PCIe root, used to publish
+	// resource.kubernetes.io/pcieRoot on each CXI device for matchAttribute
+	// co-location with the GPU. Scanned once; empty if no GPUs are present.
+	gpuRootByNUMA := GPUPCIeRootByNUMA()
 
 	var devices []*Device
 	for _, e := range entries {
@@ -77,6 +88,7 @@ func Discover(systemSvcIDs []int) ([]*Device, error) {
 			Capacity:  capacity,
 			Reserved:  reserved,
 		}
+		dev.GPUPCIeRoot = gpuRootByNUMA[dev.NUMANode]
 
 		if err := PairDevice(dev); err != nil {
 			// HSN pairing is best-effort; log but don't fail discovery.
