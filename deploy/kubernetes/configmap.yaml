@@ -9,7 +9,7 @@ data:
   env.json: |
     {
       "envMounts": [
-        {"hostPath": "/home/vendor/pirese.vendor/source/libfabric/install/lib/libfabric.so.1", "containerPath": "/usr/lib64/libfabric.so.1"},
+        {"hostPath": "/opt/cray/libfabric/2.3.1/lib64/libfabric.so.1", "containerPath": "/usr/lib64/libfabric.so.1"},
         {"hostPath": "/usr/lib64/libcxi.so.1",            "containerPath": "/usr/lib64/libcxi.so.1"},
         {"hostPath": "/usr/lib64/libcurl.so.4",           "containerPath": "/usr/lib64/libcurl.so.4"},
         {"hostPath": "/usr/lib64/libjson-c.so.5",         "containerPath": "/usr/lib64/libjson-c.so.5"},
@@ -38,6 +38,10 @@ data:
         {"hostPath": "/usr/lib64/libkeyutils.so.1",       "containerPath": "/usr/lib64/libkeyutils.so.1"},
         {"hostPath": "/usr/lib64/libpcre.so.1",           "containerPath": "/usr/lib64/libpcre.so.1"},
         {"hostPath": "/opt/xpmem/lib64/libxpmem.so.0",    "containerPath": "/usr/lib64/libxpmem.so.0"}
+      ],
+
+      "envVars": [
+        "CXIP_SKIP_AMA_CHECK=1"
       ],
 
       "ncclPrefix": "/projects/public/brics/dev/apps/linux-neoverse_v2/nccl-2.29.2-1-yjntbzz5uuuashekge53wqizfqum6swy",
