@@ -130,6 +130,10 @@ envConfig:
       - { hostPath: "/usr/lib64/libkeyutils.so.1", containerPath: "/usr/lib64/libkeyutils.so.1" }
       - { hostPath: "/usr/lib64/libpcre.so.1", containerPath: "/usr/lib64/libpcre.so.1" }
       - { hostPath: "/opt/xpmem/lib64/libxpmem.so.0", containerPath: "/usr/lib64/libxpmem.so.0" }
+    # -- Env vars injected into every pod that requests the "env" CDI profile.
+    # CXIP_SKIP_AMA_CHECK=1 lets stock libfabric accept the synthetic HSN netdev.
+    envVars:
+      - "CXIP_SKIP_AMA_CHECK=1"
     ncclPrefix: "/projects/public/brics/dev/apps/linux-neoverse_v2/nccl-2.29.2-1-yjntbzz5uuuashekge53wqizfqum6swy"
     awsOfiMounts:
       - { hostPath: "/projects/public/brics/dev/apps/linux-neoverse_v2/aws-ofi-nccl-1.18.0-6pbztrbjhvrmtu5r6nq2silgputmmcyk/lib/libnccl-net.so", containerPath: "/usr/lib/libnccl-net.so" }

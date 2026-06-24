@@ -366,18 +366,22 @@ func (p *Plugin) CreateContainer(_ context.Context, pod *api.PodSandbox, contain
 	adj.AddEnv("SLINGSHOT_SVC_IDS", strings.Join(svcIDList, ","))
 
 	// Overmount the container's /sys/class/net with the per-pod synthetic tree
-	// so stock libfabric discovers the HSN device(s), and skip the AMA check it
-	// applies to the synthetic netdev. libfabric's link gate (cxip_if.c:142) has
-	// no env bypass and is satisfied by operstate=up in the tree; the AMA gate
-	// (addr_assign_type/address) is bypassed by CXIP_SKIP_AMA_CHECK so we need
-	// not synthesize a MAC.
+	// so stock libfabric discovers the HSN device(s). libfabric's link gate
+	// (cxip_if.c:142) has no env bypass and is satisfied by operstate=up in the
+	// tree.
+	//
+	// libfabric also applies an AMA gate (cxip_if.c:580): it drops any device
+	// whose netdev lacks a recognized addr_assign_type/address unless
+	// CXIP_SKIP_AMA_CHECK=1 is set. This tree does not synthesize a MAC, so that
+	// bypass is required — but it is deliberately NOT injected here. Env belongs
+	// in the CDI env config (see internal/cdi/env.go), so the operator controls
+	// it declaratively rather than having NRI hardcode it.
 	if netSysfsDir != "" {
 		adj.AddMount(&api.Mount{
 			Source:      netSysfsDir,
 			Destination: "/sys/class/net",
 			Options:     []string{"bind", "ro"},
 		})
-		adj.AddEnv("CXIP_SKIP_AMA_CHECK", "1")
 	}
 
 	if isMockManager(p.svcMgr) {

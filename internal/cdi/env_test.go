@@ -43,6 +43,7 @@ func TestWriteEnvSpec(t *testing.T) {
 			{HostPath: "/usr/lib64/libcxi.so.1", ContainerPath: "/usr/lib64/libcxi.so.1"},
 			{HostPath: "/opt/xpmem/lib64/libxpmem.so.0", ContainerPath: "/usr/lib64/libxpmem.so.0"},
 		},
+		EnvVars: []string{"CXIP_SKIP_AMA_CHECK=1"},
 	}
 
 	if err := WriteEnvSpec(cdiRoot, driver, cfg); err != nil {
@@ -103,6 +104,17 @@ func TestWriteEnvSpec(t *testing.T) {
 	}
 	if len(spec.Devices[0].ContainerEdits.Hooks) == 0 {
 		t.Error("no hooks in env spec, want ldcache hook")
+	}
+	foundAMA := false
+	for _, e := range spec.Devices[0].ContainerEdits.Env {
+		if e == "CXIP_SKIP_AMA_CHECK=1" {
+			foundAMA = true
+			break
+		}
+	}
+	if !foundAMA {
+		t.Errorf("CXIP_SKIP_AMA_CHECK env var not found in env spec; env = %v",
+			spec.Devices[0].ContainerEdits.Env)
 	}
 }
 
@@ -267,6 +279,7 @@ func TestLoadConfig(t *testing.T) {
 			{"hostPath": "/opt/cray/libfabric/2.3.1/lib64/libfabric.so.1", "containerPath": "/usr/lib64/libfabric.so.1"},
 			{"hostPath": "/opt/xpmem/lib64/libxpmem.so.0",                "containerPath": "/usr/lib64/libxpmem.so.0"}
 		],
+		"envVars": ["CXIP_SKIP_AMA_CHECK=1"],
 		"ncclPrefix": "/spack/nccl",
 		"awsOfiMounts": [
 			{"hostPath": "/spack/aws-ofi-nccl/lib/libnccl-net.so", "containerPath": "/usr/lib/libnccl-net.so"}
@@ -281,6 +294,9 @@ func TestLoadConfig(t *testing.T) {
 	}
 	if len(cfg.EnvMounts) != 2 || cfg.EnvMounts[1].HostPath != "/opt/xpmem/lib64/libxpmem.so.0" {
 		t.Errorf("EnvMounts = %v", cfg.EnvMounts)
+	}
+	if len(cfg.EnvVars) != 1 || cfg.EnvVars[0] != "CXIP_SKIP_AMA_CHECK=1" {
+		t.Errorf("EnvVars = %v", cfg.EnvVars)
 	}
 	if cfg.NCCLPrefix != "/spack/nccl" {
 		t.Errorf("NCCLPrefix = %q", cfg.NCCLPrefix)

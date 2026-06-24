@@ -138,10 +138,11 @@ state and live hardware state.
   NRI: CreateContainer
       │  injects SLINGSHOT_DEVICES=cxi0, SLINGSHOT_VNIS=<n>, SLINGSHOT_SVC_IDS=<n> env vars
       │  bind-mounts <root>/<podUID>/net OVER /sys/class/net (ro)
-      │  injects CXIP_SKIP_AMA_CHECK=1  ◄── bypasses libfabric's AMA gate (no MAC synthesized)
       │    ▲ only /sys/class/net is overmounted, so the pod keeps its own NICs:
       │      replicated symlinks resolve through the untouched /sys/devices.
       │      libfabric's link gate (cxip_if.c) has NO env bypass, hence operstate=up.
+      │      its AMA gate needs CXIP_SKIP_AMA_CHECK=1, supplied via the CDI env
+      │      config (NOT injected here).
       │
       ▼
   Pod running ✓
@@ -305,8 +306,8 @@ strictly in lockstep and only triggers a republish on real state change.
                             build (HSN sysfs injection); RemovePending
   NRI CreateContainer     SLINGSHOT_DEVICES/VNIS/SVC_IDS env var injection;
                             bind-mounts the synthetic /sys/class/net over the
-                            container's + sets CXIP_SKIP_AMA_CHECK so stock
-                            libfabric discovers the HSN device
+                            container's so stock libfabric discovers the HSN
+                            device (AMA bypass supplied via the CDI env config)
   NRI StopPodSandbox      Hardware service destroy; RemoveOccupancy(ns, dev);
                             per-pod synthetic sysfs tree removal;
                             unblocks waiting pods via TriggerRetry

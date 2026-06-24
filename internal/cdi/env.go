@@ -24,6 +24,14 @@ type CDIEnvConfig struct {
 	// becomes one ro bind mount. Required when env CDI injection is enabled.
 	EnvMounts []MountSpec `json:"envMounts,omitempty"`
 
+	// EnvVars is the list of KEY=value env vars added to the env spec, so every
+	// pod that requests the "env" CDI profile receives them. This is the home
+	// for settings every libfabric/CXI container needs — notably
+	// CXIP_SKIP_AMA_CHECK=1, which makes stock libfabric accept the synthetic
+	// HSN netdev whose sysfs the driver overmounts (see internal/netsysfs);
+	// without it libfabric's AMA gate (cxip_if.c:580) drops the device.
+	EnvVars []string `json:"envVars,omitempty"`
+
 	// NCCLPrefix is the host path bind-mounted to /host/nccl in the NCCL
 	// spec. Empty disables the NCCL spec.
 	NCCLPrefix string `json:"ncclPrefix,omitempty"`
@@ -101,6 +109,7 @@ func WriteEnvSpec(cdiRoot, driverName string, cfg CDIEnvConfig) error {
 		Devices: []specs.Device{{
 			Name: "env",
 			ContainerEdits: specs.ContainerEdits{
+				Env:         append([]string(nil), cfg.EnvVars...),
 				DeviceNodes: deviceNodes,
 				Mounts:      mounts,
 				Hooks:       []*specs.Hook{ldcacheHook("/usr/lib64")},

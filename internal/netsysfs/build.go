@@ -16,9 +16,12 @@
 //     hard-fails with -FI_ENODEV when the resulting link is down — there is NO
 //     environment override for the link gate, so operstate MUST report "up".
 //   - netdev_speed() reads <iface>/speed (informational; a miss only warns).
-//   - netdev_ama_check() reads <iface>/addr_assign_type and <iface>/address. This
-//     gate is bypassed by exporting CXIP_SKIP_AMA_CHECK=1 into the container, so
-//     we do not synthesize those two files.
+//   - netdev_ama_check() reads <iface>/addr_assign_type and <iface>/address and,
+//     unless CXIP_SKIP_AMA_CHECK=1 is set, drops any device whose netdev does not
+//     present a recognized MAC. This tree does NOT synthesize those two files: the
+//     AMA gate must be bypassed out of band by setting CXIP_SKIP_AMA_CHECK=1,
+//     supplied via the CDI env config (see internal/cdi/env.go) rather than
+//     hardcoded into the NRI mount path.
 //
 // A pod's /sys/class/net is network-namespace scoped and read-only, so we cannot
 // simply add an hsnN entry to it. Instead we hand-build a replacement directory
