@@ -13,7 +13,9 @@ Scheduler ──allocates──► ResourceSlice (cxi0, cxi1, …)
                          ├── discovers /sys/class/cxi_user/*
                          ├── pairs CXI↔HSN via sysfs PCIe topology
                          ├── writes CDI specs → /var/run/cdi/
-                         │     └── DeviceNodes: /dev/cxiN  (cgroup BPF allowance)
+                         │     ├── DeviceNodes: /dev/cxiN  (cgroup BPF allowance)
+                         │     └── env/nccl/aws-ofi-nccl profile specs (libraries + env
+                         │         vars incl. CXIP_SKIP_AMA_CHECK; opt-in via cdi_profiles)
                          ├── ClaimBinder
                          │     └── gates pod binding via DRA BindingConditions
                          │         (Ready=True only when capacity is confirmed
@@ -26,11 +28,15 @@ Scheduler ──allocates──► ResourceSlice (cxi0, cxi1, …)
                          ├── Namespace VNI allocator (leader-elected)
                          │     └── assigns one VNI per namespace via annotation
                          ├── NRI plugin (RunPodSandbox)
-                         │     └── creates CXI service: namespace VNI + pod netns inode
+                         │     └── creates CXI service (namespace VNI + pod netns inode)
+                         │         and builds the per-pod synthetic /sys/class/net tree
+                         │         (HSN sysfs injection so stock libfabric finds the device)
                          ├── NRI plugin (CreateContainer)
-                         │     └── injects SLINGSHOT_DEVICES, SLINGSHOT_VNIS, SLINGSHOT_SVC_IDS env vars
+                         │     └── injects SLINGSHOT_DEVICES, SLINGSHOT_VNIS, SLINGSHOT_SVC_IDS env
+                         │         vars and bind-mounts the synthetic /sys/class/net over the
+                         │         container's own (HSN visible to stock libfabric)
                          └── NRI plugin (StopPodSandbox)
-                               └── destroys CXI service
+                               └── destroys CXI service and removes the synthetic sysfs tree
 
 MutatingAdmissionPolicy (in-process in API server)
     └── intercepts ResourceClaim CREATE
@@ -149,7 +155,7 @@ Four templates are provided in [deploy/kubernetes/test/resourceclaim.yaml](deplo
 | `cxi-large`  | 64   | 32  | 4 (4096 LEs)  | 2 (1024 TLEs) | 1 | Multi-threaded MPI, NCCL at scale, collectives-heavy workloads |
 | `cxi-whole`  | 1019 | 507 | 14 (14336 LEs) | 3 (1536 TLEs) | 1 | Exclusive device — single demanding workload taking the whole NIC |
 
-The `Pods/device` column assumes the daemonset's current `--reserved-tle-pools=1` policy (3 of the device's 4 TLE pools available to claims) and the template values shown above. For mixed-template workloads the binding constraint is whichever resource saturates first; with the current templates `tle_pools` is the first to saturate. If your workloads follow Slingshot's "don't reserve LEs/TLEs unless you need them" guidance and use templates with `tle_pools: 0`, the per-device pod ceiling is set by some other resource (typically TXQs).
+The `Pods/device` column assumes the device's blessed system services (declared via `--system-svc-ids`) reserve roughly one of its 4 TLE pools, leaving 3 available to claims, and the template values shown above. For mixed-template workloads the binding constraint is whichever resource saturates first; with the current templates `tle_pools` is the first to saturate. If your workloads follow Slingshot's "don't reserve LEs/TLEs unless you need them" guidance and use templates with `tle_pools: 0`, the per-device pod ceiling is set by some other resource (typically TXQs).
 
 All resource fields **plus `cdi_profiles`** are required — the driver has no defaults. Claims without an opaque config block (or with any field missing) will be rejected at prepare time with a clear error.
 
@@ -218,11 +224,13 @@ The per-claim resource values map directly to fields in the per-service `cxi_svc
 
 | Profile | Contents |
 |---|---|
-| `env`          | libcxi / libfabric / userspace runtime libraries (`ld.so.cache` refresh) |
+| `env`          | libcxi / libfabric / userspace runtime libraries (`ld.so.cache` refresh) plus env vars (notably `CXIP_SKIP_AMA_CHECK=1`) |
 | `nccl`         | NCCL libraries from the configured Spack prefix |
 | `aws-ofi-nccl` | AWS-OFI NCCL plugin and tuning env vars |
 
 An empty list (`cdi_profiles: []`) means **no env injection** — use this when the container image already carries libfabric/libcxi (BYO runtime). The driver itself has no defaults; the claim must declare what it needs.
+
+> **Note:** the `env` profile carries the env vars listed under `envVars` in the driver's env config (ConfigMap-driven). `CXIP_SKIP_AMA_CHECK=1` lives here so stock libfabric accepts the synthetic HSN netdev the driver injects (see [HSN Interface Injection](#hsn-interface-injection)). A pod that holds a CXI device but requests no `env` profile still gets the synthetic `/sys/class/net`, but **not** the AMA bypass — such a pod must supply its own libfabric configuration.
 
 ### Wiring the claim into a pod
 
@@ -291,25 +299,18 @@ The reconciler is the hardware-aware authority and keeps the in-memory model con
 
 ## Accounting for Pre-existing System Services
 
-If a node has CXI services created by the OS or system software before the driver starts (e.g. HSN management services), their resource consumption should be declared as overhead so the driver does not overcommit.
+If a node has CXI services created by the OS or system software before the driver starts (e.g. the default service and the Ethernet service(s)), their resource consumption must be accounted for so the driver does not overcommit a device.
 
-Set the `--reserved-*` flags in the DaemonSet to deduct a fixed amount from the usable ceiling on every device on that node:
+List their svc_ids in the `--system-svc-ids` flag on the DaemonSet (comma-separated, applied uniformly to every device on the node). Obtain them from `cxi_service list` on a node:
 
 ```yaml
 # In daemonset.yaml, under containers[0].args:
-- --reserved-txqs=64
-- --reserved-tgqs=32
-- --reserved-eqs=128
-- --reserved-cts=128
-- --reserved-ptes=64
-- --reserved-acs=32
-- --reserved-le-pools=1    # deducts 1024 LEs (1 pool)
-- --reserved-tle-pools=1   # deducts 512 TLEs (1 pool)
+- --system-svc-ids=1,2,3,4
 ```
 
-These values are subtracted from the hardware total before any fit-check. A claim requesting more than `hardware_total - overhead` will be rejected immediately with a "will never fit on this hardware" error, before any libcxi call is attempted.
+At discovery time the driver reads each blessed service's actual `resource_limits[]` from the kernel and sums them into a per-device reserved set. The usable ceiling for claims is then `hardware_total − reserved`. A claim requesting more than the usable ceiling is rejected immediately with a "request will never fit on this hardware" error, before any libcxi call is attempted.
 
-All reserved flags default to `0` (no overhead deducted).
+Blessed services are also protected from teardown: the NRI plugin and the orphan-service reaper never delete a service whose svc_id is in this set, so a stale in-memory mapping can never reap a system service. An empty list (the default) blesses nothing — the driver reserves no capacity and may reap pre-existing services it does not recognise.
 
 ## How Device Injection Works
 
@@ -321,6 +322,21 @@ Unprivileged containers require two things to open `/dev/cxiN`:
 Both are handled via CDI. The driver writes a CDI spec to `/var/run/cdi/` at startup containing a `DeviceNodes` entry for each CXI device. containerd resolves CDI devices during container spec construction — before the cgroup BPF program is compiled — so the allowance is baked in from the start. This is why NRI alone (which fires after cgroup policy is locked in) is insufficient for device access.
 
 The CXI service (VNI scoping + netns binding) is created in the NRI `RunPodSandbox` hook, which fires after the pod network namespace is ready but before any container starts. The netns inode is obtained via `/proc/<sandbox-pid>/ns/net` + `fstat`, which returns the real nsfs inode. Note: `os.Stat` on the netns bind-mount path (e.g. `/var/run/netns/cni-...`) returns the wrong inode — the underlying tmpfs inode rather than the nsfs inode that the CXI kernel driver uses to scope services.
+
+## HSN Interface Injection
+
+Stock (unpatched) libfabric's CXI provider enumerates HSN devices by reading their `/sys/class/net/<hsn>` metadata. Inside a pod the HSN interfaces (`hsn0`, `hsn1`, …) live in the host network namespace and are not visible, so libfabric warns `CXI netdev not found` and fails to bootstrap. The driver fixes this **without patching libfabric and without exposing a real netdev** — the goal is zero libfabric patches.
+
+In `RunPodSandbox` the NRI plugin builds a per-pod synthetic `/sys/class/net` tree under `--netns-sysfs-root` (`/var/run/cxi/netns/<podUID>/net`); in `CreateContainer` it bind-mounts that tree read-only over the container's `/sys/class/net`. The tree contains:
+
+- a symlink per real pod NIC, enumerated by entering the pod netns and mounting a fresh sysfs, so the pod keeps visibility of its own interfaces; and
+- one `hsnN/` directory per allocated HSN with exactly the metadata libfabric reads — `operstate=up`, `carrier=1`, `speed`, and `device → …/<BDF>` (the BDF of the paired CXI device, matched via PCIe topology).
+
+Only `/sys/class/net` is overmounted; `/sys/devices` is left untouched, so the replicated NIC symlinks still resolve. The HSN presents **only** as a sysfs directory under its host-native name — it is not a real netdev, so `ip link`, `ethtool`, netlink, and IP addressing all show nothing. This is sufficient because libfabric globs sysfs rather than using netlink, and the RDMA datapath is kernel-bypass and needs no netdev.
+
+Two libfabric gates interact with the tree. The link gate (`cxip_if.c:142`) has no env bypass and is satisfied by `operstate=up`. The AMA gate (`cxip_if.c:580`) drops any device whose netdev lacks a recognised MAC unless `CXIP_SKIP_AMA_CHECK=1` is set; the synthetic tree omits a MAC, so the `env` CDI profile supplies that env var (see [CDI Profiles](#cdi-profiles)) — it is deliberately **not** hardcoded in NRI.
+
+Injection is skipped in mock mode and when `--netns-sysfs-root` is empty. Reading the host HSN metadata is fatal (the services are rolled back and the kubelet retries the sandbox) because libfabric cannot bootstrap without it; replicating the pod's own NICs is best-effort and falls back to an HSN-only tree on failure.
 
 ## CXI Service Programming
 
@@ -341,11 +357,14 @@ Pre-existing annotations are respected: if a namespace already has a valid `cxi.
 ```
 cmd/cxi-dra-driver/      Binary entrypoint and CLI flags
 internal/cxi/            Sysfs device discovery, CXI↔HSN pairing, libcxi CGo wrapper
-internal/cdi/            CDI spec generation (DeviceNodes)
+internal/cdi/            CDI spec generation (DeviceNodes; env/nccl/ofi specs; containerd CDI config drop-in)
+internal/netsysfs/       Per-pod synthetic /sys/class/net tree builder for HSN sysfs injection
 internal/driver/         DRA kubelet plugin (ResourceSlice, Prepare/Unprepare,
                          ClaimBinder, namespace VNI allocator, store)
 internal/nri/            NRI plugin (RunPodSandbox, CreateContainer, StopPodSandbox)
-deploy/kubernetes/       DaemonSet, DeviceClass, RBAC, MutatingAdmissionPolicy, test manifests
+deploy/kubernetes/       DaemonSet, DeviceClass, RBAC, MutatingAdmissionPolicy, ConfigMap, test manifests
+deploy/helm/             Helm chart (cxi-dra-driver)
+deploy/kind/             kind mock-mode test harness (no hardware)
 ```
 
 ## Configuration Flags
@@ -355,21 +374,19 @@ deploy/kubernetes/       DaemonSet, DeviceClass, RBAC, MutatingAdmissionPolicy, 
 | `--driver-name` | `cxi.slingshot.hpe.com` | DRA driver identifier |
 | `--node-name` | `$NODE_NAME` | Kubernetes node name |
 | `--pod-uid` | `$POD_UID` | Pod UID for rolling-update socket uniqueness |
+| `--pod-namespace` | `$POD_NAMESPACE` | Namespace this pod runs in, used for the VNI-allocator leader-election lease |
 | `--cdi-root` | `/var/run/cdi` | CDI spec output directory |
 | `--plugin-dir` | `/var/lib/kubelet/plugins/cxi.slingshot.hpe.com` | Kubelet plugin socket directory |
 | `--registrar-dir` | `/var/lib/kubelet/plugins_registry` | Plugin registrar directory |
 | `--mock-devices` | `0` | Generate N synthetic devices (no hardware needed) |
-| `--resource-refresh-interval` | `30s` | How often to republish the ResourceSlice with refreshed available-capacity attributes |
+| `--resource-refresh-interval` | `10s` | How often to republish the ResourceSlice with refreshed available-capacity attributes |
 | `--vni-range-start` | `0` | First VNI in the namespace-VNI allocator's pool (0 disables the allocator) |
 | `--vni-range-end` | `0` | Last VNI in the pool (inclusive) |
-| `--reserved-txqs` | `0` | TXQs reserved by pre-existing system services |
-| `--reserved-tgqs` | `0` | TGQs reserved by pre-existing system services |
-| `--reserved-eqs` | `0` | EQs reserved by pre-existing system services |
-| `--reserved-cts` | `0` | CTs reserved by pre-existing system services |
-| `--reserved-ptes` | `0` | PTEs reserved by pre-existing system services |
-| `--reserved-acs` | `0` | ACs reserved by pre-existing system services |
-| `--reserved-le-pools` | `0` | LE pools reserved by pre-existing system services (1 pool = 1024 LEs) |
-| `--reserved-tle-pools` | `0` | TLE pools reserved by pre-existing system services (1 pool = 512 TLEs) |
+| `--system-svc-ids` | `""` | Comma-separated svc_ids of blessed system services: never deleted, and their reserved resources are deducted from each device's usable ceiling |
+| `--netns-sysfs-root` | `/var/run/cxi/netns` | Host directory for the per-pod synthetic `/sys/class/net` trees (empty disables HSN sysfs injection) |
+| `--enable-cdi-env` | `false` | Write the `env`/`nccl`/`ofi` CDI specs and inject their device IDs into pods |
+| `--env-config` | `""` | Path to the JSON CDI env config file (required when `--enable-cdi-env`) |
+| `--containerd-config-path` | `""` | Path to write the containerd CDI config drop-in (empty disables) |
 
 ## Device Attributes
 
@@ -441,7 +458,6 @@ kubectl logs cxi-test-3
 
 ## Known Limitations / Planned Work
 
-- **HSN interface injection** — libfabric warns `CXI netdev not found` because HSN interfaces (`hsn0`, `hsn1`, …) live in the host network namespace. Fix requires pre-creating the mountpoint directory on each node so the CDI spec can bind-mount over it
 - **Hot-plug** — no fsnotify watcher on `/sys/class/cxi_user`; driver restart required if devices appear/disappear
 - **VNI exhaustion handling** — if the configured `[--vni-range-start, --vni-range-end]` is exhausted, the namespace VNI allocator logs the error per reconcile attempt but does not emit an Event on the affected namespace; operators must read the DaemonSet logs to find out why new namespaces aren't getting a VNI
 - **Reconciler API-server load** — the polling reconciler calls `Namespaces().List()` once per `--resource-refresh-interval` tick to build the VNI → namespace map. This is cheap at expected scale (tens of namespaces, 10 s tick) but should be migrated to an informer-backed `NamespaceLister` if the cluster grows large
@@ -485,7 +501,7 @@ All resource fields are required. Ensure your `ResourceClaimTemplate` has an `op
 
 ### Claim rejected: "exceed usable ceiling"
 
-The requested resources exceed `hardware_total - reserved_overhead`. Either reduce the request or lower the `--reserved-*` flags if the overhead was set too conservatively.
+The requested resources exceed `hardware_total - reserved_by_blessed_services`, where the reserved amount is read from the live `resource_limits` of the services listed in `--system-svc-ids`. Either reduce the request, trim a blessed service's reservation, or drop it from `--system-svc-ids` if it should not be counted as overhead.
 
 ### EPERM opening `/dev/cxi0`
 

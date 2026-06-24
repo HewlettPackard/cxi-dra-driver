@@ -110,9 +110,9 @@ DRA Node Driver: {
   NRI Plugin: {
     shape: sql_table
     role: "container lifecycle hook"
-    RunPodSandbox: "per-device mutex; CreateService(dev, netnsInode, vni)"
-    CreateContainer: "(future) inject SLINGSHOT_DEVICES, SLINGSHOT_VNIS, SLINGSHOT_SVC_IDS env"
-    StopPodSandbox: "DestroyService; TriggerRetry"
+    RunPodSandbox: "per-device mutex; CreateService(dev, netnsInode, vni); buildNetSysfs synthetic /sys/class/net"
+    CreateContainer: "inject SLINGSHOT_DEVICES, SLINGSHOT_VNIS, SLINGSHOT_SVC_IDS env; overmount synthetic /sys/class/net (HSN)"
+    StopPodSandbox: "DestroyService; TriggerRetry; remove netns sysfs tree"
   }
 
   Namespace VNI Allocator: {
@@ -183,7 +183,7 @@ Container: {
     shape: sql_table
     devices: "/dev/cxiN via CDI DeviceNodes"
     no_privileged: "CDI lets non-root pods access device"
-    libfabric: "discovers HSN via sysfs"
+    libfabric: "stock provider discovers HSN via injected /sys/class/net"
     vni_scope: "restricted by CXI service to namespace VNI"
   }
 }
