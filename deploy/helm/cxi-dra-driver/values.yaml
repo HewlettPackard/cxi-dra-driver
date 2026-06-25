@@ -232,3 +232,15 @@ resourceClaimTemplates:
         le_pools: 1
         tle_pools: 1
         cdi_profiles: ["env"]
+    - name: 2-whole
+      count: 2
+      params:
+        txqs: 1019
+        tgqs: 507
+        eqs: 2037
+        cts: 2047
+        ptes: 2036
+        acs: 1018
+        le_pools: 14
+        tle_pools: 3
+        cdi_profiles: ["env", "aws-ofi-nccl"]
