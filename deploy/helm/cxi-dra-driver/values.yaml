@@ -168,7 +168,12 @@ resourceClaimTemplates:
   # -- Render the ResourceClaimTemplates. Each is named <name-prefix>-<template name>
   # (e.g. cxi-slingshot-hpe-com-small) and points at this install's DeviceClass.
   enabled: true
-  # -- Namespace the templates live in (workload-facing).
+  # -- Namespaces the templates live in (workload-facing). Each template is
+  # rendered once per namespace. Falls back to the singular `namespace` below
+  # when this list is empty.
+  namespaces:
+    - default
+  # -- Deprecated single-namespace setting, used only when `namespaces` is empty.
   namespace: default
   templates:
     # cxi-small — benchmarks, fi_pingpong, development, simple single-threaded tools.
