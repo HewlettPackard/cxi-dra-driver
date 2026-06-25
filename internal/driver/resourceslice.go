@@ -41,53 +41,68 @@ func (d *Driver) buildDevices() []resourceapi.Device {
 		// pending grants on top of that.
 		avail := d.effectiveAvail(dev.Name)
 
+		attrs := map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
+			"type": {StringValue: ptr.To("device")},
+			// Topology — usable in CEL placement selectors.
+			"numa_node": {IntValue: ptr.To(int64(dev.NUMANode))},
+			"pcie_root": {StringValue: ptr.To(dev.PCIeRoot)},
+			"hsn_iface": {StringValue: ptr.To(dev.HSNIface)},
+			// Hardware totals — static, from cxil_devinfo at discovery.
+			"capacity_txqs": {IntValue: ptr.To(dev.Capacity.TXQs)},
+			"capacity_tgqs": {IntValue: ptr.To(dev.Capacity.TGQs)},
+			"capacity_eqs":  {IntValue: ptr.To(dev.Capacity.EQs)},
+			"capacity_cts":  {IntValue: ptr.To(dev.Capacity.CTs)},
+			"capacity_tles": {IntValue: ptr.To(dev.Capacity.TLEs)},
+			"capacity_ptes": {IntValue: ptr.To(dev.Capacity.PTEs)},
+			"capacity_les":  {IntValue: ptr.To(dev.Capacity.LEs)},
+			"capacity_acs":  {IntValue: ptr.To(dev.Capacity.ACs)},
+			// Effective available — pending-adjusted; updated on every
+			// service create/delete and on the periodic refresh interval.
+			"avail_txqs": {IntValue: ptr.To(avail.TXQs)},
+			"avail_tgqs": {IntValue: ptr.To(avail.TGQs)},
+			"avail_eqs":  {IntValue: ptr.To(avail.EQs)},
+			"avail_cts":  {IntValue: ptr.To(avail.CTs)},
+			"avail_tles": {IntValue: ptr.To(avail.TLEs)},
+			"avail_ptes": {IntValue: ptr.To(avail.PTEs)},
+			"avail_les":  {IntValue: ptr.To(avail.LEs)},
+			"avail_acs":  {IntValue: ptr.To(avail.ACs)},
+			// Comma-padded sorted list of namespaces currently holding a
+			// pending grant or live service on this device. Consumed by
+			// the MutatingAdmissionPolicy-injected per-claim CEL selector
+			// to exclude devices already occupied by the claim's
+			// namespace — pre-filtering at scheduling time enforces
+			// SHS14's per-device VNI uniqueness without relying on a
+			// late binding-failure retry. Empty string when the device
+			// is unoccupied. Always published so the CEL selector can
+			// rely on the attribute being present.
+			"active_namespaces": {StringValue: ptr.To(d.activeNamespacesFor(dev.Name))},
+		}
+
+		// Standardized PCIe-root attribute carrying the NUMA-local GPU's root
+		// (e.g. "pci0009:00"), matching what the NVIDIA DRA driver publishes.
+		// Lets a ResourceClaim use matchAttribute on resource.kubernetes.io/pcieRoot
+		// to co-locate a CXI NIC with its NUMA-local GPU. Only published when a
+		// GPU was discovered on the device's NUMA node — omitting it (rather than
+		// publishing an empty string) keeps the match constraint unsatisfiable on
+		// nodes without GPUs instead of matching every empty value together.
+		if dev.GPUPCIeRoot != "" {
+			attrs["resource.kubernetes.io/pcieRoot"] = resourceapi.DeviceAttribute{
+				StringValue: ptr.To(dev.GPUPCIeRoot),
+			}
+		}
+
 		out = append(out, resourceapi.Device{
-			Name: dev.Name,
-			Attributes: map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
-				"type": {StringValue: ptr.To("device")},
-				// Topology — usable in CEL placement selectors.
-				"numa_node": {IntValue: ptr.To(int64(dev.NUMANode))},
-				"pcie_root": {StringValue: ptr.To(dev.PCIeRoot)},
-				"hsn_iface": {StringValue: ptr.To(dev.HSNIface)},
-				// Hardware totals — static, from cxil_devinfo at discovery.
-				"capacity_txqs": {IntValue: ptr.To(dev.Capacity.TXQs)},
-				"capacity_tgqs": {IntValue: ptr.To(dev.Capacity.TGQs)},
-				"capacity_eqs":  {IntValue: ptr.To(dev.Capacity.EQs)},
-				"capacity_cts":  {IntValue: ptr.To(dev.Capacity.CTs)},
-				"capacity_tles": {IntValue: ptr.To(dev.Capacity.TLEs)},
-				"capacity_ptes": {IntValue: ptr.To(dev.Capacity.PTEs)},
-				"capacity_les":  {IntValue: ptr.To(dev.Capacity.LEs)},
-				"capacity_acs":  {IntValue: ptr.To(dev.Capacity.ACs)},
-				// Effective available — pending-adjusted; updated on every
-				// service create/delete and on the periodic refresh interval.
-				"avail_txqs": {IntValue: ptr.To(avail.TXQs)},
-				"avail_tgqs": {IntValue: ptr.To(avail.TGQs)},
-				"avail_eqs":  {IntValue: ptr.To(avail.EQs)},
-				"avail_cts":  {IntValue: ptr.To(avail.CTs)},
-				"avail_tles": {IntValue: ptr.To(avail.TLEs)},
-				"avail_ptes": {IntValue: ptr.To(avail.PTEs)},
-				"avail_les":  {IntValue: ptr.To(avail.LEs)},
-				"avail_acs":  {IntValue: ptr.To(avail.ACs)},
-				// Comma-padded sorted list of namespaces currently holding a
-				// pending grant or live service on this device. Consumed by
-				// the MutatingAdmissionPolicy-injected per-claim CEL selector
-				// to exclude devices already occupied by the claim's
-				// namespace — pre-filtering at scheduling time enforces
-				// SHS14's per-device VNI uniqueness without relying on a
-				// late binding-failure retry. Empty string when the device
-				// is unoccupied. Always published so the CEL selector can
-				// rely on the attribute being present.
-				"active_namespaces": {StringValue: ptr.To(d.activeNamespacesFor(dev.Name))},
-			},
-		// BindingConditions: the scheduler will not bind a pod until the
-		// ClaimBinder sets Ready=True, confirming capacity is available.
-		// BindingFailureConditions: if the ClaimBinder sets Unschedulable=True
-		// (device hardware is truly full), the scheduler deallocates this single
-		// CXI claim and retries on a different device. VNIs are namespace-scoped
-		// and not part of the claim, so there is nothing else to deallocate.
-		BindingConditions:        []string{"Ready"},
-		BindingFailureConditions: []string{"Unschedulable"},
-		AllowMultipleAllocations: ptr.To(true),
+			Name:       dev.Name,
+			Attributes: attrs,
+			// BindingConditions: the scheduler will not bind a pod until the
+			// ClaimBinder sets Ready=True, confirming capacity is available.
+			// BindingFailureConditions: if the ClaimBinder sets Unschedulable=True
+			// (device hardware is truly full), the scheduler deallocates this single
+			// CXI claim and retries on a different device. VNIs are namespace-scoped
+			// and not part of the claim, so there is nothing else to deallocate.
+			BindingConditions:        []string{"Ready"},
+			BindingFailureConditions: []string{"Unschedulable"},
+			AllowMultipleAllocations: ptr.To(true),
 		})
 	}
 	return out
