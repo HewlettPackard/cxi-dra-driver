@@ -66,9 +66,7 @@ spec:
         {{- if .Values.envConfig.enabled }}
         - --env-config=/etc/cxi-dra/env.json
         {{- end }}
-        {{- with .Values.driver.netnsSysfsRoot }}
-        - --netns-sysfs-root={{ . }}
-        {{- end }}
+        - --netns-sysfs-root={{ .Values.driver.netnsSysfsRoot }}
         {{- with .Values.driver.extraArgs }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
@@ -108,10 +106,8 @@ spec:
           mountPath: {{ .Values.driver.cdiRoot }}
         - name: nri
           mountPath: /var/run/nri
-        {{- with .Values.driver.netnsSysfsRoot }}
         - name: cxi-state
-          mountPath: {{ dir . }}
-        {{- end }}
+          mountPath: {{ dir .Values.driver.netnsSysfsRoot }}
         - name: netns
           mountPath: /var/run/netns
           readOnly: true
@@ -146,12 +142,10 @@ spec:
       hostPath:
         path: /var/run/nri
         type: DirectoryOrCreate
-    {{- with .Values.driver.netnsSysfsRoot }}
     - name: cxi-state
       hostPath:
-        path: {{ dir . }}
+        path: {{ dir .Values.driver.netnsSysfsRoot }}
         type: DirectoryOrCreate
-    {{- end }}
     - name: netns
       hostPath:
         path: /var/run/netns
