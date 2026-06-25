@@ -2,7 +2,7 @@ IMAGE ?= ghcr.io/slingshot/cxi-dra-driver
 TAG   ?= latest
 KIND_CLUSTER ?= cxi-dra-dev
 KIND_IMAGE   ?= localhost/cxi-dra-driver:dev
-CONTAINER_CLI ?= $(shell command -v docker 2>/dev/null || command -v podman)
+CONTAINER_CLI ?= $(shell command -v docker 2>/dev/null || command -v podman-hpc)
 
 BINARY   = cxi-dra-driver
 CMD_PATH = ./cmd/cxi-dra-driver
