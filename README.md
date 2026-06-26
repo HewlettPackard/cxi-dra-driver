@@ -84,7 +84,7 @@ podman-hpc build -t docker.io/<your-registry>/cxi-dra-driver:dev .
 podman-hpc push docker.io/<your-registry>/cxi-dra-driver:dev
 ```
 
-Update the image reference in [deploy/kubernetes/daemonset.yaml](deploy/kubernetes/daemonset.yaml).
+Reference this image at install time — `--set image.repository=…,image.tag=…` for Helm, or the `image:` field in [deploy/kubernetes/daemonset.yaml](deploy/kubernetes/daemonset.yaml) for the kubectl path.
 
 > **Note:** The `Dockerfile` uses `FROM scratch` with a linker-based entrypoint to avoid glibc version conflicts between build and runtime environments:
 > ```
@@ -92,6 +92,15 @@ Update the image reference in [deploy/kubernetes/daemonset.yaml](deploy/kubernet
 > ```
 
 ## Deployment
+
+The [Helm chart](deploy/helm/cxi-dra-driver) is the recommended install path: it renders the
+workload (DaemonSet or Deployment), `DeviceClass`, RBAC, `MutatingAdmissionPolicy`, the
+`env.json` ConfigMap, and the ResourceClaimTemplates as one driver-name-parameterized release,
+so multiple driver versions can be installed side-by-side. The raw manifests under
+[deploy/kubernetes](deploy/kubernetes) (applied by `make deploy`) are kept as a lighter-weight
+alternative and for [mock mode](#mock-mode-kind--no-hardware).
+
+Steps 1 and 2 are node prerequisites for **either** install path.
 
 ### 1. Enable NRI in containerd
 
@@ -115,13 +124,68 @@ Restart containerd after making changes.
 kubectl label node <node-name> feature.node.kubernetes.io/cxi=true
 ```
 
-### 3. Deploy the driver
+### 3. Install the driver
+
+#### With Helm (recommended)
 
 ```bash
-make deploy
+# Default: DaemonSet, driver name cxi.slingshot.hpe.com, namespace kube-system
+helm install cxi deploy/helm/cxi-dra-driver \
+  --set image.repository=docker.io/<your-registry>/cxi-dra-driver \
+  --set image.tag=dev
 ```
 
-This applies RBAC, the `DeviceClass` for CXI devices, the `MutatingAdmissionPolicy`, and the `DaemonSet` in order.
+The runtime-library host paths under `envConfig.json` in
+[values.yaml](deploy/helm/cxi-dra-driver/values.yaml) are **site-specific** (the default
+`libfabric` path is a developer home directory). Supply your own values file before installing on
+a real cluster:
+
+```bash
+helm install cxi deploy/helm/cxi-dra-driver -f my-site-values.yaml
+```
+
+Most-used values (full list in the [chart README](deploy/helm/cxi-dra-driver/README.md)):
+
+| Value | Default | Purpose |
+|---|---|---|
+| `driverName` | `cxi.slingshot.hpe.com` | DRA driver name; drives every owned object name |
+| `workload.kind` | `DaemonSet` | `DaemonSet` (one pod per node) or `Deployment` |
+| `workload.replicas` | `10` | replica count (Deployment only) |
+| `image.repository` / `image.tag` | `docker.io/pirese/cxi-dra-driver` / `dev` | driver image |
+| `driver.vniRange.start` / `.end` | `100` / `300` | per-namespace VNI pool |
+| `driver.systemSvcIDs` | `[1,2,3,4]` | blessed system services (never reaped; their usage is reserved) |
+| `admissionPolicy.excludedNamespaces` | `[kube-system]` | namespaces the policy ignores |
+| `resourceClaimTemplates.namespaces` | `[default]` | namespaces to render the templates into (one copy each) |
+
+Because every object keys off `driverName`, a second install under a different name is fully
+isolated, and pod anti-affinity keeps the two versions on different nodes — install once more for
+A/B version testing, or switch to Deployment mode:
+
+```bash
+helm install cxi-next deploy/helm/cxi-dra-driver --set driverName=cxi.next.hpe.com --set image.tag=next
+helm install cxi      deploy/helm/cxi-dra-driver --set workload.kind=Deployment --set workload.replicas=10
+```
+
+Dry-run a render before applying to a live cluster:
+
+```bash
+helm lint deploy/helm/cxi-dra-driver
+helm template t deploy/helm/cxi-dra-driver | kubectl apply --dry-run=client -f -
+```
+
+#### With kubectl (alternative)
+
+Set the image in [deploy/kubernetes/daemonset.yaml](deploy/kubernetes/daemonset.yaml), then apply
+the env ConfigMap and the core manifests:
+
+```bash
+kubectl apply -f deploy/kubernetes/configmap.yaml   # env.json ConfigMap (cxi-dra-driver-env)
+make deploy                                          # clusterrole, deviceclass, admission-policy, daemonset
+```
+
+`make deploy` applies the `ClusterRole`/RBAC, the `DeviceClass`, the `MutatingAdmissionPolicy`, and
+the `DaemonSet` in order. It does **not** apply `configmap.yaml`, which the DaemonSet mounts as
+`cxi-dra-driver-env` for `--enable-cdi-env` — apply it first (as above) or the pods will not start.
 
 ### 4. Verify the ResourceSlice
 
@@ -131,10 +195,18 @@ kubectl get resourceslices -o wide
 
 You should see one slice per node with devices `cxi0`, `cxi1`, … and attributes including `avail_txqs`, `avail_tles`, etc. which are refreshed periodically.
 
-### 5. Run the test pod
+### 5. Run a test workload
+
+A Helm install already created the ResourceClaimTemplates — named `<prefix>-small`, `-medium`, …
+where the prefix is the sanitized driver name (e.g. `cxi-slingshot-hpe-com-small`). Each template
+is rendered once into **every** namespace in `resourceClaimTemplates.namespaces` (default
+`[default]`), so a single install can stamp the templates into all of your tenant namespaces — e.g.
+`--set 'resourceClaimTemplates.namespaces={default,team-a,team-b}'`. The singular
+`resourceClaimTemplates.namespace` remains as a fallback, used only when that list is empty. For the
+kubectl path, apply the raw templates (short names like `cxi-small`) and the example pod instead:
 
 ```bash
-kubectl apply -f deploy/kubernetes/test/resourceclaim.yaml
+kubectl apply -f deploy/kubernetes/test/resourceclaim.yaml   # kubectl path only; Helm already renders these
 kubectl apply -f deploy/kubernetes/test/pod.yaml
 kubectl get pod cxi-test-3
 kubectl exec cxi-test-3 -- fi_info --provider cxi
@@ -282,10 +354,11 @@ Because the K8s DRA scheduler evaluates claims against a static snapshot of the 
 
 1. The scheduler allocates a batch of claims, possibly concentrating multiple claims on one device.
 2. The `ClaimBinder` evaluates each allocation against real hardware capacity **and** against per-namespace device occupancy. It grants `Ready=True` to claims that fit within current capacity minus in-flight pending grants and whose `(namespace, device)` pair is not already held by another claim.
-3. Claims that exceed the device's hardware capacity receive `Unschedulable=True` with reason `DeviceAtCapacity`.
-4. Claims whose `(namespace, device)` pair is already held by another claim in the same namespace receive `Unschedulable=True` with reason `NamespaceDeviceOccupied`. This should be rare with the admission-injected CEL selector in place; it is kept as a defense against admission-policy bypass or stale `ResourceSlice` race conditions.
-5. The scheduler sees `Unschedulable=True` in the claim's `BindingFailureConditions`, deallocates the single CXI claim, and retries.
-6. At retry time, the `ResourceSlice` has been republished — `avail_*` near zero for any device that became full, `active_namespaces` updated for the same-namespace case — steering the retry allocation to an actually eligible device.
+3. Claims that **would** fit the device's raw hardware capacity but not after subtracting in-flight pending grants (grants already made on this device whose CXI service is not yet created) receive `Ready=False` with reason `InsufficientCapacity`. Unlike the Unschedulable cases below, this is a *hold*, not a deallocation: the claim stays on the device and the binder re-evaluates it on a 2-second ticker and immediately whenever a service is torn down (`TriggerRetry`), so a transient pending backlog drains without bouncing the claim to another device.
+4. Claims that exceed the device's hardware capacity even before counting pending grants receive `Unschedulable=True` with reason `DeviceAtCapacity`.
+5. Claims whose `(namespace, device)` pair is already held by another claim in the same namespace receive `Unschedulable=True` with reason `NamespaceDeviceOccupied`. This should be rare with the admission-injected CEL selector in place; it is kept as a defense against admission-policy bypass or stale `ResourceSlice` race conditions.
+6. The scheduler sees `Unschedulable=True` in the claim's `BindingFailureConditions`, deallocates the single CXI claim, and retries.
+7. At retry time, the `ResourceSlice` has been republished — `avail_*` near zero for any device that became full, `active_namespaces` updated for the same-namespace case — steering the retry allocation to an actually eligible device.
 
 The system converges to the correct distribution (≤3 `cxi-small`/`cxi-medium` pods per device, ≤1 `cxi-large`/`cxi-whole` pod per device, ≤1 claim per namespace per device on any one node) within one or two compaction cycles in the worst case, and typically zero (CEL pre-filter catches it at scheduling time).
 

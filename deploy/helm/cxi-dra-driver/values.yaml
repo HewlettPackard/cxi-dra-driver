@@ -22,8 +22,8 @@ namespace: kube-system
 priorityClassName: system-node-critical
 
 image:
-  repository: docker.io/pirese/cxi-dra-driver
-  tag: dev
+  repository: docker.io/yourandomly/cxi-dra-driver
+  tag: stable-v1.0.0
   pullPolicy: Always
 
 workload:
@@ -101,7 +101,7 @@ envConfig:
   enabled: true
   json:
     envMounts:
-      - { hostPath: "/home/vendor/pirese.vendor/source/libfabric/install/lib/libfabric.so.1", containerPath: "/usr/lib64/libfabric.so.1" }
+      - { hostPath: "/opt/cray/libfabric/2.3.1/lib64/libfabric.so.1", containerPath: "/usr/lib64/libfabric.so.1" }
       - { hostPath: "/usr/lib64/libcxi.so.1", containerPath: "/usr/lib64/libcxi.so.1" }
       - { hostPath: "/usr/lib64/libcurl.so.4", containerPath: "/usr/lib64/libcurl.so.4" }
       - { hostPath: "/usr/lib64/libjson-c.so.5", containerPath: "/usr/lib64/libjson-c.so.5" }
@@ -168,7 +168,12 @@ resourceClaimTemplates:
   # -- Render the ResourceClaimTemplates. Each is named <name-prefix>-<template name>
   # (e.g. cxi-slingshot-hpe-com-small) and points at this install's DeviceClass.
   enabled: true
-  # -- Namespace the templates live in (workload-facing).
+  # -- Namespaces the templates live in (workload-facing). Each template is
+  # rendered once per namespace. Falls back to the singular `namespace` below
+  # when this list is empty.
+  namespaces:
+    - default
+  # -- Deprecated single-namespace setting, used only when `namespaces` is empty.
   namespace: default
   templates:
     # cxi-small — benchmarks, fi_pingpong, development, simple single-threaded tools.
@@ -232,3 +237,15 @@ resourceClaimTemplates:
         le_pools: 1
         tle_pools: 1
         cdi_profiles: ["env"]
+    - name: 2-whole
+      count: 2
+      params:
+        txqs: 1019
+        tgqs: 507
+        eqs: 2037
+        cts: 2047
+        ptes: 2036
+        acs: 1018
+        le_pools: 14
+        tle_pools: 3
+        cdi_profiles: ["env", "aws-ofi-nccl"]

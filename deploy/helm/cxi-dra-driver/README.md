@@ -14,7 +14,7 @@ A/B two driver versions) and each install is fully isolated.
 | DeviceClass | `cxi-slingshot-hpe-com-device` | CEL selects this driver's ResourceSlices |
 | MutatingAdmissionPolicy + Binding | `cxi-slingshot-hpe-com-selector-injection` | only mutates claims carrying this driver |
 | ConfigMap | `cxi-slingshot-hpe-com-env` | `env.json` runtime-library mounts |
-| ResourceClaimTemplates | `cxi-slingshot-hpe-com-{small,medium,large,whole,2-small}` | point at this install's DeviceClass |
+| ResourceClaimTemplates | `cxi-slingshot-hpe-com-{small,medium,large,whole,2-small,2-whole}` | one set per `resourceClaimTemplates.namespaces` entry; point at this install's DeviceClass |
 
 ## Isolation model
 
@@ -60,7 +60,7 @@ See [values.yaml](values.yaml) for the full set. Most-used:
 | `priorityClassName` | `system-node-critical` | set `""` if installing outside kube-system |
 | `driver.vniRange.start/end` | `100`/`300` | per-namespace VNI pool |
 | `driver.systemSvcIDs` | `[1,2,3,4]` | blessed system service svc_ids (never reaped; their usage is reserved) |
-| `resourceClaimTemplates.namespace` | `default` | where the claim templates live |
+| `resourceClaimTemplates.namespaces` | `[default]` | namespaces the templates are rendered into, one copy each (falls back to singular `namespace` when empty) |
 | `admissionPolicy.excludedNamespaces` | `[kube-system]` | namespaces the policy ignores |
 
 ## Verify a render

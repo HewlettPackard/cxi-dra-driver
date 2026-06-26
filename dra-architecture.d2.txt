@@ -131,6 +131,7 @@ DRA Node Driver: {
     attributes: "numa.node, pcie.root, hsn"
     capacity: "txqs, tgqs, eqs, cts, ptes, tles, les, acs"
     avail: "live, refreshed every 10s + on events"
+    gpu_colocation: "resource.kubernetes.io/pcieRoot (NUMA-local GPU root) for NIC↔GPU matchAttribute"
   }
 
   Kubelet Plugin -> ResourceSlice CXI: "publishes + republishes"

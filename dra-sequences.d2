@@ -20,6 +20,7 @@ node_boot: {
   main -> cxi_pkg: "Discover() [mock or sysfs]"
   cxi_pkg -> cxi_pkg: "walk /sys/class/cxi_user/*\nread NUMANode, PCIeRoot per device"
   cxi_pkg -> cxi_pkg: "DiscoverHSN(): match HSN iface by PCIe root"
+  cxi_pkg -> cxi_pkg: "GPU co-location: find NUMA-local NVIDIA GPU\n→ republish its PCIe root as resource.kubernetes.io/pcieRoot"
   cxi_pkg -> cxi_pkg: "ReadAvailableCapacity (-tags cxi: libcxi ioctls)"
   cxi_pkg -> main: "[]Device{cxi0(hsn2), cxi1(hsn0), ...}"
 

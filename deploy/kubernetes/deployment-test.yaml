@@ -52,12 +52,20 @@ spec:
             - --cdi-root=/var/run/cdi
             - --plugin-dir=/var/lib/kubelet/plugins/cxi.slingshot.hpe.com
             - --registrar-dir=/var/lib/kubelet/plugins_registry
+            # Blessed system services present on every node: the default service
+            # (svc_id 1) and the Ethernet service(s). Never torn down by the
+            # driver, and their reserved resources are deducted from each
+            # device's usable ceiling. Populate from `cxi_service list`.
+            - --system-svc-ids=1,2,3,4
             - --vni-range-start=100
             - --vni-range-end=300
             - --enable-cdi-env=true
             - --containerd-config-path=/etc/containerd/conf.d/50-cxi-cdi.toml
             - --env-config=/etc/cxi-dra/env.json
-            - --system-svc-ids=1,2,3,4
+            # Per-pod synthetic /sys/class/net trees (HSN sysfs injection for
+            # stock libfabric) are built under this host path; it must be mounted
+            # writable at the same path below.
+            - --netns-sysfs-root=/var/run/cxi/netns
           env:
             - name: NODE_NAME
               valueFrom:
@@ -90,6 +98,8 @@ spec:
               mountPath: /var/run/cdi
             - name: nri
               mountPath: /var/run/nri
+            - name: cxi-state
+              mountPath: /var/run/cxi
             - name: netns
               mountPath: /var/run/netns
               readOnly: true
@@ -121,6 +131,10 @@ spec:
         - name: nri
           hostPath:
             path: /var/run/nri
+            type: DirectoryOrCreate
+        - name: cxi-state
+          hostPath:
+            path: /var/run/cxi
             type: DirectoryOrCreate
         - name: netns
           hostPath:
