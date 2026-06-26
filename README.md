@@ -155,6 +155,7 @@ Most-used values (full list in the [chart README](deploy/helm/cxi-dra-driver/REA
 | `driver.vniRange.start` / `.end` | `100` / `300` | per-namespace VNI pool |
 | `driver.systemSvcIDs` | `[1,2,3,4]` | blessed system services (never reaped; their usage is reserved) |
 | `admissionPolicy.excludedNamespaces` | `[kube-system]` | namespaces the policy ignores |
+| `resourceClaimTemplates.namespaces` | `[default]` | namespaces to render the templates into (one copy each) |
 
 Because every object keys off `driverName`, a second install under a different name is fully
 isolated, and pod anti-affinity keeps the two versions on different nodes — install once more for
@@ -197,9 +198,12 @@ You should see one slice per node with devices `cxi0`, `cxi1`, … and attribute
 ### 5. Run a test workload
 
 A Helm install already created the ResourceClaimTemplates — named `<prefix>-small`, `-medium`, …
-where the prefix is the sanitized driver name (e.g. `cxi-slingshot-hpe-com-small`) — in the
-`resourceClaimTemplates.namespace` (`default` by default). For the kubectl path, apply the raw
-templates (short names like `cxi-small`) and the example pod instead:
+where the prefix is the sanitized driver name (e.g. `cxi-slingshot-hpe-com-small`). Each template
+is rendered once into **every** namespace in `resourceClaimTemplates.namespaces` (default
+`[default]`), so a single install can stamp the templates into all of your tenant namespaces — e.g.
+`--set 'resourceClaimTemplates.namespaces={default,team-a,team-b}'`. The singular
+`resourceClaimTemplates.namespace` remains as a fallback, used only when that list is empty. For the
+kubectl path, apply the raw templates (short names like `cxi-small`) and the example pod instead:
 
 ```bash
 kubectl apply -f deploy/kubernetes/test/resourceclaim.yaml   # kubectl path only; Helm already renders these
