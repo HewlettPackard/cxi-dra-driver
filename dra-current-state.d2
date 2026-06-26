@@ -94,6 +94,7 @@ DRA Node Driver: {
     role: "device discovery + slice publishing + run loop"
     discovers: "sysfs (real) / mockDevices (--mock-devices)"
     resolves: "CXI ↔ HSN via PCIe root"
+    gpu_colocation: "NUMA-local NVIDIA GPU's PCIe root → resource.kubernetes.io/pcieRoot (cross-driver NIC↔GPU matchAttribute)"
     publishes: "node-scoped ResourceSlice per device"
     avail_refresh: "ticker (--resource-refresh-interval) + event-driven via notify chan"
     ticker_action: "reconcileOccupancyFromHardware THEN publish()"
@@ -206,6 +207,7 @@ DRA Node Driver: {
     avail: "live: hwAvail − pending"
     active_namespaces: "comma-padded sorted string ',ns1,ns2,' per device; drives CEL exclusion selector"
     multi_alloc: "AllowMultipleAllocations=true"
+    gpu_pcie_root: "resource.kubernetes.io/pcieRoot — NUMA-local GPU root (only when a GPU is found); standardized name, byte-comparable with the NVIDIA driver"
   }
 
   Kubelet Plugin -> ResourceSlice CXI: "publishes + refreshes"
