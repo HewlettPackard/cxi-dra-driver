@@ -172,10 +172,10 @@ resourceClaimTemplates:
   # rendered once per namespace. Falls back to the singular `namespace` below
   # when this list is empty.
   namespaces:
-   - default
-   - argo-workflows
-   - kserve-llm
-   - llm-d-optimized-baseline
+    - default
+    - argo-workflows
+    - kserve-llm
+    - llm-d-optimized-baseline
   # -- Deprecated single-namespace setting, used only when `namespaces` is empty.
   namespace: default
   templates:
