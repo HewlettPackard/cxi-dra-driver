@@ -152,7 +152,7 @@ envConfig:
       - "NCCL_MIN_NCHANNELS=4"
       - "NCCL_GDRCOPY_ENABLE=1"
       - "NCCL_NET_FORCE_FLUSH=0"
-      - "FI_MR_CACHE_MONITOR=userfaultfd"
+      - "FI_MR_CACHE_MONITOR=kdreg2"
       - "FI_CXI_DISABLE_HOST_REGISTER=1"
       - "FI_HMEM_CUDA_USE_GDRCOPY=1"
       - "FI_CXI_DEFAULT_CQ_SIZE=131072"
@@ -173,6 +173,9 @@ resourceClaimTemplates:
   # when this list is empty.
   namespaces:
     - default
+    - argo-workflows
+    - kserve-llm
+    - llm-d-optimized-baseline
   # -- Deprecated single-namespace setting, used only when `namespaces` is empty.
   namespace: default
   templates:

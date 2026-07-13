@@ -45,10 +45,16 @@ type CDIEnvConfig struct {
 	// aws-ofi-nccl spec (NCCL_NET, FI_CXI_*, etc).
 	AWSofiEnv []string `json:"awsOfiEnv,omitempty"`
 
-	// XpmemPath and GdrDrvPath override device-node host paths in tests;
-	// when empty the standard /dev/xpmem and /dev/gdrdrv are used.
+	// XpmemPath, GdrDrvPath, and KdReg2Path override device-node host paths in
+	// tests; when empty the standard /dev/xpmem, /dev/gdrdrv, and /dev/kdreg2
+	// are used. kdreg2 is libfabric's kernel-module MR cache monitor
+	// (FI_MR_CACHE_MONITOR=kdreg2); exposing /dev/kdreg2 here — paired with the
+	// libfabric mount — adds the cgroup BPF allowance an unprivileged pod needs
+	// to open it, the same way the userfaultfd monitor would otherwise require
+	// CAP_SYS_PTRACE on a host with vm.unprivileged_userfaultfd=0.
 	XpmemPath  string `json:"-"`
 	GdrDrvPath string `json:"-"`
+	KdReg2Path string `json:"-"`
 }
 
 func EnvDeviceID(driverName string) string {
@@ -80,9 +86,13 @@ func WriteEnvSpec(cdiRoot, driverName string, cfg CDIEnvConfig) error {
 	if gdrDrvPath == "" {
 		gdrDrvPath = "/dev/gdrdrv"
 	}
+	kdreg2Path := cfg.KdReg2Path
+	if kdreg2Path == "" {
+		kdreg2Path = "/dev/kdreg2"
+	}
 
 	var deviceNodes []*specs.DeviceNode
-	for _, p := range []string{xpmemPath, gdrDrvPath} {
+	for _, p := range []string{xpmemPath, gdrDrvPath, kdreg2Path} {
 		if dn := optionalDeviceNode(p); dn != nil {
 			deviceNodes = append(deviceNodes, dn)
 		}

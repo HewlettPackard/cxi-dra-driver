@@ -34,10 +34,11 @@ func TestWriteEnvSpec(t *testing.T) {
 	const driver = "cxi.slingshot.hpe.com"
 
 	const libfabricHost = "/opt/cray/libfabric/2.3.1/lib64/libfabric.so.1"
-	// Use non-existent paths so xpmem/gdrdrv device nodes are skipped.
+	// Use non-existent paths so xpmem/gdrdrv/kdreg2 device nodes are skipped.
 	cfg := CDIEnvConfig{
 		XpmemPath:  filepath.Join(t.TempDir(), "xpmem"),
 		GdrDrvPath: filepath.Join(t.TempDir(), "gdrdrv"),
+		KdReg2Path: filepath.Join(t.TempDir(), "kdreg2"),
 		EnvMounts: []MountSpec{
 			{HostPath: libfabricHost, ContainerPath: "/usr/lib64/libfabric.so.1"},
 			{HostPath: "/usr/lib64/libcxi.so.1", ContainerPath: "/usr/lib64/libcxi.so.1"},
@@ -68,7 +69,7 @@ func TestWriteEnvSpec(t *testing.T) {
 		t.Errorf("devices = %v, want [{env}]", spec.Devices)
 	}
 	if len(spec.Devices[0].ContainerEdits.DeviceNodes) != 0 {
-		t.Errorf("device nodes = %d, want 0 (both absent)", len(spec.Devices[0].ContainerEdits.DeviceNodes))
+		t.Errorf("device nodes = %d, want 0 (all absent)", len(spec.Devices[0].ContainerEdits.DeviceNodes))
 	}
 	found := false
 	for _, m := range spec.Devices[0].ContainerEdits.Mounts {
@@ -115,6 +116,51 @@ func TestWriteEnvSpec(t *testing.T) {
 	if !foundAMA {
 		t.Errorf("CXIP_SKIP_AMA_CHECK env var not found in env spec; env = %v",
 			spec.Devices[0].ContainerEdits.Env)
+	}
+}
+
+func TestWriteEnvSpecInjectsKdReg2(t *testing.T) {
+	cdiRoot := t.TempDir()
+	const driver = "cxi.slingshot.hpe.com"
+
+	// A regular file is enough: optionalDeviceNode only needs stat to succeed
+	// (Rdev is 0 for a regular file, but the entry is still emitted), which
+	// confirms /dev/kdreg2 is wired into the env spec's device-node loop.
+	kdreg2 := filepath.Join(t.TempDir(), "kdreg2")
+	if err := os.WriteFile(kdreg2, nil, 0o644); err != nil {
+		t.Fatalf("creating fake kdreg2: %v", err)
+	}
+	cfg := CDIEnvConfig{
+		XpmemPath:  filepath.Join(t.TempDir(), "xpmem"),  // absent → skipped
+		GdrDrvPath: filepath.Join(t.TempDir(), "gdrdrv"), // absent → skipped
+		KdReg2Path: kdreg2,
+		EnvMounts: []MountSpec{
+			{HostPath: "/usr/lib64/libcxi.so.1", ContainerPath: "/usr/lib64/libcxi.so.1"},
+		},
+	}
+	if err := WriteEnvSpec(cdiRoot, driver, cfg); err != nil {
+		t.Fatalf("WriteEnvSpec: %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(cdiRoot, driver+"-env.json"))
+	if err != nil {
+		t.Fatalf("reading spec: %v", err)
+	}
+	var spec specs.Spec
+	if err := json.Unmarshal(data, &spec); err != nil {
+		t.Fatalf("unmarshalling spec: %v", err)
+	}
+
+	found := false
+	for _, dn := range spec.Devices[0].ContainerEdits.DeviceNodes {
+		if dn.HostPath == kdreg2 {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("kdreg2 device node not injected; nodes = %v",
+			spec.Devices[0].ContainerEdits.DeviceNodes)
 	}
 }
 
