@@ -62,6 +62,14 @@ func main() {
 		enableCDIEnv         = flag.Bool("enable-cdi-env", false, "Write env/nccl/ofi CDI specs and inject their device IDs into pods")
 		containerdConfigPath = flag.String("containerd-config-path", "", "Path to write the containerd CDI config drop-in; empty disables")
 		envConfigPath        = flag.String("env-config", "", "Path to the JSON CDI env config file (required when --enable-cdi-env)")
+
+		// cxi-cdi-hook is the createContainer hook the env/nccl/ofi CDI specs
+		// use to refresh ldconfig's cache. It ships baked into this image at
+		// cdiHookSrc and must be installed onto the host at cdiHookPath — CDI
+		// createContainer hooks run in the runtime (host) namespace, so the
+		// binary has to exist on the node filesystem, not just this image.
+		cdiHookSrc  = flag.String("cdi-hook-src", "/cxi-cdi-hook", "Path to the cxi-cdi-hook binary bundled in this image")
+		cdiHookPath = flag.String("cdi-hook-path", cdi.DefaultHookPath, "Host path to install cxi-cdi-hook at; referenced by generated CDI hooks")
 	)
 	flag.Parse()
 
@@ -105,6 +113,11 @@ func main() {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			os.Exit(1)
 		}
+		if err := cdi.InstallHook(*cdiHookSrc, *cdiHookPath); err != nil {
+			fmt.Fprintf(os.Stderr, "error: installing cxi-cdi-hook: %v\n", err)
+			os.Exit(1)
+		}
+		envConfig.HookPath = *cdiHookPath
 	}
 
 	d := driver.New(driver.Config{
