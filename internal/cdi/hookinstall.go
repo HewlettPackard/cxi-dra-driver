@@ -14,17 +14,27 @@ import (
 // path on both sides.
 const DefaultHookPath = "/var/run/cxi/bin/cxi-cdi-hook"
 
-// InstallHook copies the cxi-cdi-hook binary from srcPath (baked into the
-// driver's own container image) to destPath, a host path reachable by the
-// container runtime. CDI createContainer hooks run in the runtime's (host)
-// namespace, not the container's, so the hook binary must live on the host
-// filesystem rather than inside any container image — the same constraint
-// that requires nvidia-container-toolkit to install nvidia-cdi-hook onto the
-// host instead of shipping it in application images.
+// DefaultLdconfigDir is the host directory a self-contained ldconfig, its
+// dynamic linker, and libc are installed into when no override is
+// configured. cxi-dra-driver installs all three there at startup (see
+// InstallHook) from copies baked into its own image, the same way it
+// installs cxi-cdi-hook itself, so update-ldcache never depends on the node
+// having ldconfig installed.
+const DefaultLdconfigDir = "/var/run/cxi/bin"
+
+// InstallHook copies a file from srcPath (baked into the driver's own
+// container image) to destPath, a host path reachable by the container
+// runtime. It installs cxi-cdi-hook itself, as well as the ldconfig binary
+// and its dynamic linker/libc it execs — CDI createContainer hooks run in
+// the runtime's (host) namespace, not the container's, so all of them must
+// live on the host filesystem rather than inside any container image — the
+// same constraint that requires nvidia-container-toolkit to install
+// nvidia-cdi-hook onto the host instead of shipping it in application
+// images.
 //
 // The copy is written to a temp file and renamed into place so a hook
 // invocation racing an in-progress DaemonSet rollout never observes a
-// partially written binary.
+// partially written file.
 func InstallHook(srcPath, destPath string) error {
 	src, err := os.Open(srcPath)
 	if err != nil {

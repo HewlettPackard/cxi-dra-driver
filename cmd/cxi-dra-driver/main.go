@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -23,6 +24,16 @@ import (
 )
 
 const defaultDriverName = "cxi.slingshot.hpe.com"
+
+// Fixed image paths of the dynamic linker and libc cxi-dra-driver's own
+// Dockerfile ENTRYPOINT uses to run this binary. installLdconfigRuntime
+// reuses these same in-image copies to run ldconfig on the host, so no
+// separate image or on-node introspection is needed — see cmd/cxi-cdi-hook.
+const (
+	driverLdconfigSrc = "/ldconfig"
+	driverLinkerSrc   = "/lib/ld-linux-aarch64.so.1"
+	driverLibcSrc     = "/lib64/libc.so.6"
+)
 
 func main() {
 	var (
@@ -70,6 +81,14 @@ func main() {
 		// binary has to exist on the node filesystem, not just this image.
 		cdiHookSrc  = flag.String("cdi-hook-src", "/cxi-cdi-hook", "Path to the cxi-cdi-hook binary bundled in this image")
 		cdiHookPath = flag.String("cdi-hook-path", cdi.DefaultHookPath, "Host path to install cxi-cdi-hook at; referenced by generated CDI hooks")
+
+		// cxi-cdi-hook's update-ldcache subcommand execs a self-contained
+		// ldconfig rather than depending on one being pre-installed on the
+		// node. That ldconfig, and the dynamic linker + libc it needs, are
+		// bundled in this image at the same fixed paths the Dockerfile's own
+		// ENTRYPOINT uses to run cxi-dra-driver itself, so they're installed
+		// unconditionally rather than via flags.
+		cdiLdconfigDir = flag.String("cdi-ldconfig-dir", cdi.DefaultLdconfigDir, "Host directory to install the ldconfig runtime (ldconfig, its dynamic linker, and libc) into; referenced by generated CDI hooks")
 	)
 	flag.Parse()
 
@@ -117,7 +136,12 @@ func main() {
 			fmt.Fprintf(os.Stderr, "error: installing cxi-cdi-hook: %v\n", err)
 			os.Exit(1)
 		}
+		if err := installLdconfigRuntime(*cdiLdconfigDir); err != nil {
+			fmt.Fprintf(os.Stderr, "error: installing ldconfig runtime: %v\n", err)
+			os.Exit(1)
+		}
 		envConfig.HookPath = *cdiHookPath
+		envConfig.LdconfigDir = *cdiLdconfigDir
 	}
 
 	d := driver.New(driver.Config{
@@ -234,4 +258,23 @@ func buildKubeClient(kubeconfig string) (kubernetes.Interface, error) {
 		return nil, err
 	}
 	return kubernetes.NewForConfig(cfg)
+}
+
+// installLdconfigRuntime installs the ldconfig binary, its dynamic linker,
+// and libc — all baked into this image — into dir on the host, alongside
+// cxi-cdi-hook. cxi-cdi-hook execs ldconfig through this linker with an
+// explicit --library-path pointing at dir, so update-ldcache never depends
+// on the node itself having ldconfig (or a compatible glibc) installed.
+func installLdconfigRuntime(dir string) error {
+	files := map[string]string{
+		driverLdconfigSrc: "ldconfig",
+		driverLinkerSrc:   "ld.so",
+		driverLibcSrc:     "libc.so.6",
+	}
+	for src, name := range files {
+		if err := cdi.InstallHook(src, filepath.Join(dir, name)); err != nil {
+			return fmt.Errorf("installing %s: %w", name, err)
+		}
+	}
+	return nil
 }

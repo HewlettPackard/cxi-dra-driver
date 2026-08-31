@@ -7,22 +7,32 @@ import (
 )
 
 func TestLdcacheHookUsesDefaultPathWhenEmpty(t *testing.T) {
-	hook := ldcacheHook("", "/usr/lib64")
+	hook := ldcacheHook("", "", "/usr/lib64")
 	if hook.Path != DefaultHookPath {
 		t.Errorf("Path = %q, want %q", hook.Path, DefaultHookPath)
 	}
 	if hook.HookName != "createContainer" {
 		t.Errorf("HookName = %q, want createContainer", hook.HookName)
 	}
+	want := []string{DefaultHookPath, "update-ldcache", "--ldconfig-dir", DefaultLdconfigDir, "--folder", "/usr/lib64"}
+	if len(hook.Args) != len(want) {
+		t.Fatalf("Args = %v, want %v", hook.Args, want)
+	}
+	for i, a := range want {
+		if hook.Args[i] != a {
+			t.Errorf("Args[%d] = %q, want %q", i, hook.Args[i], a)
+		}
+	}
 }
 
 func TestLdcacheHookUsesOverridePath(t *testing.T) {
 	const override = "/opt/cxi/bin/cxi-cdi-hook"
-	hook := ldcacheHook(override, "/usr/lib64", "/usr/lib")
+	const ldconfigOverride = "/opt/cxi/bin/ldconfig"
+	hook := ldcacheHook(override, ldconfigOverride, "/usr/lib64", "/usr/lib")
 	if hook.Path != override {
 		t.Errorf("Path = %q, want %q", hook.Path, override)
 	}
-	want := []string{override, "update-ldcache", "--folder", "/usr/lib64", "--folder", "/usr/lib"}
+	want := []string{override, "update-ldcache", "--ldconfig-dir", ldconfigOverride, "--folder", "/usr/lib64", "--folder", "/usr/lib"}
 	if len(hook.Args) != len(want) {
 		t.Fatalf("Args = %v, want %v", hook.Args, want)
 	}
