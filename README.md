@@ -67,9 +67,10 @@ cp /usr/lib64/libnl-3.so.200    bin/
 cp /lib64/libresolv.so.2        bin/
 cp /lib64/libc.so.6             bin/
 cp /lib/ld-linux-aarch64.so.1   bin/
+cp /usr/sbin/ldconfig           bin/
 ```
 
-These paths are for RHEL/SUSE-based Slingshot nodes with glibc 2.38 on ARM64. Adjust if your node layout differs.
+These paths are for RHEL/SUSE-based Slingshot nodes with glibc 2.38 on ARM64. Adjust if your node layout differs. `ldconfig` is bundled in the image so cxi-dra-driver can install it onto the host at startup for its own createContainer hook to run — see [internal/cdi/hookinstall.go](internal/cdi/hookinstall.go) — instead of depending on the node already having it installed.
 
 ### 2. Build the binary
 

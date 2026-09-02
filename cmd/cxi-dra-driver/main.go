@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -23,6 +24,13 @@ import (
 )
 
 const defaultDriverName = "cxi.slingshot.hpe.com"
+
+// defaultLinkerSrc and defaultLibcSrc match this repo's own Dockerfile, which
+// today only bundles ARM64 binaries — override via flags on other arches.
+const (
+	defaultLinkerSrc = "/lib/ld-linux-aarch64.so.1"
+	defaultLibcSrc   = "/lib64/libc.so.6"
+)
 
 func main() {
 	var (
@@ -62,6 +70,25 @@ func main() {
 		enableCDIEnv         = flag.Bool("enable-cdi-env", false, "Write env/nccl/ofi CDI specs and inject their device IDs into pods")
 		containerdConfigPath = flag.String("containerd-config-path", "", "Path to write the containerd CDI config drop-in; empty disables")
 		envConfigPath        = flag.String("env-config", "", "Path to the JSON CDI env config file (required when --enable-cdi-env)")
+
+		// cxi-cdi-hook is the createContainer hook the env/nccl/ofi CDI specs
+		// use to refresh ldconfig's cache. It ships baked into this image at
+		// cdiHookSrc and must be installed onto the host at cdiHookPath — CDI
+		// createContainer hooks run in the runtime (host) namespace, so the
+		// binary has to exist on the node filesystem, not just this image.
+		cdiHookSrc  = flag.String("cdi-hook-src", "/cxi-cdi-hook", "Path to the cxi-cdi-hook binary bundled in this image")
+		cdiHookPath = flag.String("cdi-hook-path", cdi.DefaultHookPath, "Host path to install cxi-cdi-hook at; referenced by generated CDI hooks")
+
+		// cxi-cdi-hook's update-ldcache subcommand execs a self-contained
+		// ldconfig rather than depending on one being pre-installed on the
+		// node. That ldconfig, and the dynamic linker + libc it needs, are
+		// bundled in this image and installed onto the host alongside
+		// cxi-cdi-hook. The linker/libc src paths default to this repo's own
+		// Dockerfile layout (ARM64); override on other architectures.
+		cdiLdconfigDir       = flag.String("cdi-ldconfig-dir", cdi.DefaultLdconfigDir, "Host directory to install the ldconfig runtime (ldconfig, its dynamic linker, and libc) into; referenced by generated CDI hooks")
+		cdiLdconfigSrc       = flag.String("cdi-ldconfig-src", "/ldconfig", "Path to the ldconfig binary bundled in this image")
+		cdiLdconfigLinkerSrc = flag.String("cdi-ldconfig-linker-src", defaultLinkerSrc, "Path to the dynamic linker bundled in this image, used to run the bundled ldconfig")
+		cdiLdconfigLibcSrc   = flag.String("cdi-ldconfig-libc-src", defaultLibcSrc, "Path to the libc bundled in this image, used to run the bundled ldconfig")
 	)
 	flag.Parse()
 
@@ -105,6 +132,16 @@ func main() {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			os.Exit(1)
 		}
+		if err := cdi.InstallHook(*cdiHookSrc, *cdiHookPath); err != nil {
+			fmt.Fprintf(os.Stderr, "error: installing cxi-cdi-hook: %v\n", err)
+			os.Exit(1)
+		}
+		if err := installLdconfigRuntime(*cdiLdconfigDir, *cdiLdconfigSrc, *cdiLdconfigLinkerSrc, *cdiLdconfigLibcSrc); err != nil {
+			fmt.Fprintf(os.Stderr, "error: installing ldconfig runtime: %v\n", err)
+			os.Exit(1)
+		}
+		envConfig.HookPath = *cdiHookPath
+		envConfig.LdconfigDir = *cdiLdconfigDir
 	}
 
 	d := driver.New(driver.Config{
@@ -221,4 +258,23 @@ func buildKubeClient(kubeconfig string) (kubernetes.Interface, error) {
 		return nil, err
 	}
 	return kubernetes.NewForConfig(cfg)
+}
+
+// installLdconfigRuntime installs the ldconfig binary, its dynamic linker,
+// and libc — all baked into this image — into dir on the host, alongside
+// cxi-cdi-hook. cxi-cdi-hook execs ldconfig through this linker with an
+// explicit --library-path pointing at dir, so update-ldcache never depends
+// on the node itself having ldconfig (or a compatible glibc) installed.
+func installLdconfigRuntime(dir, ldconfigSrc, linkerSrc, libcSrc string) error {
+	files := map[string]string{
+		ldconfigSrc: "ldconfig",
+		linkerSrc:   "ld.so",
+		libcSrc:     "libc.so.6",
+	}
+	for src, name := range files {
+		if err := cdi.InstallHook(src, filepath.Join(dir, name)); err != nil {
+			return fmt.Errorf("installing %s: %w", name, err)
+		}
+	}
+	return nil
 }
