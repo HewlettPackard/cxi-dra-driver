@@ -4,16 +4,23 @@ KIND_CLUSTER ?= cxi-dra-dev
 KIND_IMAGE   ?= localhost/cxi-dra-driver:dev
 CONTAINER_CLI ?= $(shell command -v docker 2>/dev/null || command -v podman-hpc)
 
-BINARY   = cxi-dra-driver
-CMD_PATH = ./cmd/cxi-dra-driver
+BINARY      = cxi-dra-driver
+CMD_PATH    = ./cmd/cxi-dra-driver
+HOOK_BINARY = cxi-cdi-hook
+HOOK_CMD_PATH = ./cmd/cxi-cdi-hook
 
-.PHONY: build image push deploy clean kind-load kind-reload
+.PHONY: build build-hook image push deploy clean kind-load kind-reload
 
-build:
+build: build-hook
 	CGO_ENABLED=1 GOOS=linux go build -tags cxi -o bin/$(BINARY) $(CMD_PATH)
 
-build-mock:
+build-mock: build-hook
 	CGO_ENABLED=0 GOOS=linux go build -o bin/$(BINARY) $(CMD_PATH)
+
+# cxi-cdi-hook runs on the bare host (see internal/cdi.InstallHook), so it must
+# stay CGO-free regardless of how the driver binary itself is built.
+build-hook:
+	CGO_ENABLED=0 GOOS=linux go build -o bin/$(HOOK_BINARY) $(HOOK_CMD_PATH)
 
 image:
 	$(CONTAINER_CLI) build --no-cache -t $(IMAGE):$(TAG) .
@@ -60,4 +67,4 @@ test-clean:
 	kubectl delete -f deploy/kubernetes/test/resourceclaim.yaml --ignore-not-found
 
 clean:
-	rm -f bin/$(BINARY)
+	rm -f bin/$(BINARY) bin/$(HOOK_BINARY)

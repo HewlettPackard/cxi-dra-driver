@@ -55,6 +55,16 @@ type CDIEnvConfig struct {
 	XpmemPath  string `json:"-"`
 	GdrDrvPath string `json:"-"`
 	KdReg2Path string `json:"-"`
+
+	// HookPath overrides the host path of the cxi-cdi-hook binary (see
+	// internal/cdi.InstallHook) that the ldcache createContainer hook execs.
+	// Empty uses DefaultHookPath.
+	HookPath string `json:"-"`
+
+	// LdconfigDir overrides the host directory containing the self-contained
+	// ldconfig binary the driver installs at startup (see DefaultLdconfigDir).
+	// Empty uses DefaultLdconfigDir.
+	LdconfigDir string `json:"-"`
 }
 
 func EnvDeviceID(driverName string) string {
@@ -122,7 +132,7 @@ func WriteEnvSpec(cdiRoot, driverName string, cfg CDIEnvConfig) error {
 				Env:         append([]string(nil), cfg.EnvVars...),
 				DeviceNodes: deviceNodes,
 				Mounts:      mounts,
-				Hooks:       []*specs.Hook{ldcacheHook("/usr/lib64")},
+				Hooks:       []*specs.Hook{ldcacheHook(cfg.HookPath, cfg.LdconfigDir, "/usr/lib64")},
 			},
 		}},
 	}
@@ -158,16 +168,25 @@ func optionalDeviceNode(hostPath string) *specs.DeviceNode {
 	}
 }
 
-// ldcacheHook returns a createContainer hook that runs nvidia-cdi-hook
-// update-ldcache for each provided folder.
-func ldcacheHook(folders ...string) *specs.Hook {
-	args := []string{"nvidia-cdi-hook", "update-ldcache"}
+// ldcacheHook returns a createContainer hook that runs cxi-cdi-hook
+// update-ldcache for each provided folder. hookPath is the host path
+// cxi-cdi-hook was installed at by InstallHook; empty uses DefaultHookPath.
+// ldconfigDir is the host directory containing the self-contained ldconfig
+// binary the driver installs at startup; empty uses DefaultLdconfigDir.
+func ldcacheHook(hookPath, ldconfigDir string, folders ...string) *specs.Hook {
+	if hookPath == "" {
+		hookPath = DefaultHookPath
+	}
+	if ldconfigDir == "" {
+		ldconfigDir = DefaultLdconfigDir
+	}
+	args := []string{hookPath, "update-ldcache", "--ldconfig-dir", ldconfigDir}
 	for _, f := range folders {
 		args = append(args, "--folder", f)
 	}
 	return &specs.Hook{
 		HookName: "createContainer",
-		Path:     "/usr/bin/nvidia-cdi-hook",
+		Path:     hookPath,
 		Args:     args,
 	}
 }
@@ -200,7 +219,7 @@ func WriteNCCLSpec(cdiRoot, driverName string, cfg CDIEnvConfig) error {
 						Options:       []string{"bind", "ro", "nosuid", "nodev", "private"},
 					},
 				},
-				Hooks: []*specs.Hook{ldcacheHook("/host/nccl/lib")},
+				Hooks: []*specs.Hook{ldcacheHook(cfg.HookPath, cfg.LdconfigDir, "/host/nccl/lib")},
 			},
 		}},
 	}
@@ -242,7 +261,7 @@ func WriteAWSofiNCCLSpec(cdiRoot, driverName string, cfg CDIEnvConfig) error {
 			ContainerEdits: specs.ContainerEdits{
 				Env:    append([]string(nil), cfg.AWSofiEnv...),
 				Mounts: mounts,
-				Hooks:  []*specs.Hook{ldcacheHook("/usr/lib", "/usr/lib64")},
+				Hooks:  []*specs.Hook{ldcacheHook(cfg.HookPath, cfg.LdconfigDir, "/usr/lib", "/usr/lib64")},
 			},
 		}},
 	}
