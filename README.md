@@ -4,6 +4,8 @@ A Kubernetes [Dynamic Resource Allocation (DRA)](https://kubernetes.io/docs/conc
 
 The driver runs as a DaemonSet on each Slingshot-equipped node. It discovers CXI devices via sysfs, publishes them as a `ResourceSlice` so the scheduler can allocate them to pods, programs a scoped CXI service (VNI + netns) via libcxi, and injects each device into its container via CDI (Container Device Interface) and NRI (Node Resource Interface).
 
+> **Contributing or exploring with an AI assistant?** Start with [CONTEXT.md](CONTEXT.md) (AI session briefing) and [ARCHITECTURE.md](ARCHITECTURE.md) (full component map and data flow). See [AGENTS.md](AGENTS.md) for the full Copilot customization index and [CONTRIBUTING.md](CONTRIBUTING.md) before opening a PR.
+
 ## Architecture
 
 ```
