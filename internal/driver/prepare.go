@@ -135,6 +135,19 @@ func (d *Driver) prepareClaim(ctx context.Context, claim *resourceapi.ResourceCl
 		podUID := types.UID(ref.UID)
 		d.store.Set(podUID, podAllocs)
 		d.store.SetClaimPod(claim.UID, podUID)
+
+		// The hint file is the CNI plugin's read-side contract (no access to
+		// this in-process store) — a write failure must fail the claim so
+		// kubelet retries, rather than silently handing the pod to CRI
+		// without net-hints. The pod annotation below is a best-effort
+		// observability side channel only; it is never load-bearing.
+		if err := d.writeCNIHint(podUID); err != nil {
+			return kubeletplugin.PrepareResult{
+				Err: fmt.Errorf("claim %s/%s: writing CNI hint file for pod %s: %w",
+					claim.Namespace, claim.Name, podUID, err),
+			}
+		}
+		d.annotatePodCNIHints(ctx, claim.Namespace, ref.Name, cniHintsFor(d.store.Get(podUID)))
 	}
 
 	return kubeletplugin.PrepareResult{Devices: kubeletDevices}

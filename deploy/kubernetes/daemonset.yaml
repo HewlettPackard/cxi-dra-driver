@@ -57,6 +57,10 @@ spec:
             # stock libfabric) are built under this host path; it must be mounted
             # writable at the same path below.
             - --netns-sysfs-root=/var/run/cxi/netns
+            # Per-pod CNI hint files (the read-side contract for the
+            # Slingshot CNI plugin) are written under this host path; it must
+            # be mounted writable at the same path below.
+            - --cni-hints-dir=/var/run/cxi/net-hints
           env:
             - name: NODE_NAME
               valueFrom:
