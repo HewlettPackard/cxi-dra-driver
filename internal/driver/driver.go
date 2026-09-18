@@ -52,6 +52,7 @@ type Config struct {
 	CDIEnvConfig         cdi.CDIEnvConfig
 	EnableCDIEnv         bool   // if false, env/nccl/ofi CDI specs are not written and not injected into pods
 	ContainerdConfigPath string // path for the containerd CDI config drop-in; empty = skip
+	CNIHintsDir          string // host dir for per-pod CNI hint files; empty disables the hint-file write/delete
 }
 
 // Driver implements kubeletplugin.DRAPlugin for CXI devices.
@@ -71,6 +72,7 @@ type Driver struct {
 	cdiEnvConfig         cdi.CDIEnvConfig
 	enableCDIEnv         bool          // if false, env/nccl/ofi CDI specs are not written and not injected into pods
 	containerdConfigPath string        // path for the containerd CDI config drop-in; empty = skip
+	cniHintsDir          string        // host dir for per-pod CNI hint files; empty disables the hint-file write/delete
 	notify               chan struct{} // signals an immediate ResourceSlice republish
 
 	pendingMu sync.Mutex
@@ -167,6 +169,7 @@ func New(cfg Config) *Driver {
 		cdiEnvConfig:         cfg.CDIEnvConfig,
 		enableCDIEnv:         cfg.EnableCDIEnv,
 		containerdConfigPath: cfg.ContainerdConfigPath,
+		cniHintsDir:          cfg.CNIHintsDir,
 		notify:               make(chan struct{}, 1),
 		pending:              make(map[pendingKey]pendingEntry),
 		nsDeviceOccupancy:    make(map[string]map[string]types.UID),

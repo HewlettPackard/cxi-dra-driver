@@ -67,6 +67,7 @@ spec:
         - --env-config=/etc/cxi-dra/env.json
         {{- end }}
         - --netns-sysfs-root={{ .Values.driver.netnsSysfsRoot }}
+        - --cni-hints-dir={{ .Values.driver.cniHintsDir }}
         {{- with .Values.driver.extraArgs }}
         {{- toYaml . | nindent 8 }}
         {{- end }}

@@ -53,6 +53,14 @@ func main() {
 		netnsSysfsRoot = flag.String("netns-sysfs-root", "/var/run/cxi/netns",
 			"Host directory for per-pod synthetic /sys/class/net trees (empty disables HSN sysfs injection)")
 
+		// Root directory for the per-pod CNI hint files this driver writes at
+		// PrepareResourceClaims time and removes at UnprepareResourceClaims time.
+		// This is the read-side contract for the Slingshot CNI plugin,
+		// invoked locally by containerd/CRI with no access to this
+		// driver's in-process AllocationStore. See docs/cnidra-cni-hint-contract.md.
+		cniHintsDir = flag.String("cni-hints-dir", "/var/run/cxi/net-hints",
+			"Host directory for per-pod CNI hint files (empty disables the hint-file write/delete)")
+
 		refreshInterval = flag.Duration("resource-refresh-interval", 10*time.Second,
 			"How often to republish the ResourceSlice with refreshed available-capacity attributes")
 
@@ -158,6 +166,7 @@ func main() {
 		EnableCDIEnv:         *enableCDIEnv,
 		ContainerdConfigPath: *containerdConfigPath,
 		CDIEnvConfig:         envConfig,
+		CNIHintsDir:          *cniHintsDir,
 	})
 
 	// Start the cluster-wide namespace→VNI allocator if a VNI range is

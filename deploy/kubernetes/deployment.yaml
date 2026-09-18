@@ -66,6 +66,7 @@ spec:
             # stock libfabric) are built under this host path; it must be mounted
             # writable at the same path below.
             - --netns-sysfs-root=/var/run/cxi/netns
+            - --cni-hints-dir=/var/run/cxi/net-hints
           env:
             - name: NODE_NAME
               valueFrom:

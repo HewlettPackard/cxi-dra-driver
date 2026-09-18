@@ -12,6 +12,7 @@ The core DRA (Dynamic Resource Allocation) plugin. This package owns device publ
 | `devicestatus.go` | Publishes per-device status onto the `ResourceSlice` |
 | `prepare.go` | `PrepareResourceClaims` — kubelet plugin hook; reads the namespace's VNI annotation, performs the static ceiling check, stores a `PodAllocation`, returns CDI device IDs |
 | `unprepare.go` | `UnprepareResourceClaims` — kubelet plugin hook; removes the `PodAllocation` on pod deletion |
+| `cnihints.go` | Writes/deletes the per-pod CNI hint file (the Slingshot CNI plugin's read-side contract) and the observability-only pod annotation — see [docs/cnidra-cni-hint-contract.md](../../docs/cnidra-cni-hint-contract.md) |
 | `store.go` | `AllocationStore` — thread-safe in-memory map of pod UID → `PodAllocation` (device, HSN, VNI, resources) |
 | `reconciler.go` | Poll-driven safety net: periodically rebuilds occupancy from live CXI services, covering driver restarts and missed events |
 | `reaper.go` | Periodically scans for CXI services with no owning pod and deletes them |
@@ -25,4 +26,4 @@ Pods never carry their own VNI. `vniallocator.go` assigns exactly one VNI per na
 
 ## Testing
 
-`driver_test.go`, `claimbinder_test.go`, `prepare_test.go`, `reconciler_test.go`, `store_test.go`, `vniallocator_test.go`, and `vni_test.go` cover this package — the strongest unit-test coverage in the repository. `resourceslice.go`, `devicestatus.go`, `unprepare.go`, and `reaper.go` currently have no dedicated tests; consider these first when adding coverage.
+`driver_test.go`, `claimbinder_test.go`, `prepare_test.go`, `reconciler_test.go`, `store_test.go`, `vniallocator_test.go`, `vni_test.go`, and `cnihints_test.go` cover this package — the strongest unit-test coverage in the repository. `resourceslice.go`, `devicestatus.go`, `unprepare.go`, and `reaper.go` currently have no dedicated tests; consider these first when adding coverage.

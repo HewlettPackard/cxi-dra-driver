@@ -460,6 +460,7 @@ deploy/kind/             kind mock-mode test harness (no hardware)
 | `--vni-range-end` | `0` | Last VNI in the pool (inclusive) |
 | `--system-svc-ids` | `""` | Comma-separated svc_ids of blessed system services: never deleted, and their reserved resources are deducted from each device's usable ceiling |
 | `--netns-sysfs-root` | `/var/run/cxi/netns` | Host directory for the per-pod synthetic `/sys/class/net` trees (empty disables HSN sysfs injection) |
+| `--cni-hints-dir` | `/var/run/cxi/net-hints` | Host directory for per-pod CNI hint files — the read-side contract for the Slingshot CNI plugin (empty disables the hint-file write/delete); see [docs/cnidra-cni-hint-contract.md](docs/cnidra-cni-hint-contract.md) |
 | `--enable-cdi-env` | `false` | Write the `env`/`nccl`/`ofi` CDI specs and inject their device IDs into pods |
 | `--env-config` | `""` | Path to the JSON CDI env config file (required when `--enable-cdi-env`) |
 | `--containerd-config-path` | `""` | Path to write the containerd CDI config drop-in (empty disables) |

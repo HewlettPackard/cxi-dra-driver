@@ -67,6 +67,12 @@ driver:
   # the device). Its parent is mounted writable into the driver. Set to "" to
   # disable HSN sysfs injection.
   netnsSysfsRoot: /var/run/cxi/netns
+  # -- Host directory for per-pod CNI hint files: the read-side contract for
+  # the Slingshot CNI plugin, written at PrepareResourceClaims time and
+  # removed at UnprepareResourceClaims time. Its parent is the same
+  # `cxi-state` volume mounted writable for netnsSysfsRoot above. Set to ""
+  # to disable the hint-file write/delete.
+  cniHintsDir: /var/run/cxi/net-hints
   # -- Inject the env.json runtime-library CDI spec into claimed pods.
   enableCdiEnv: true
   # -- Per-namespace VNI pool.
