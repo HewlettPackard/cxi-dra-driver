@@ -8,8 +8,10 @@ BINARY      = cxi-dra-driver
 CMD_PATH    = ./cmd/cxi-dra-driver
 HOOK_BINARY = cxi-cdi-hook
 HOOK_CMD_PATH = ./cmd/cxi-cdi-hook
+CNI_BINARY  = slingshot-cni
+CNI_CMD_PATH = ./cmd/slingshot-cni
 
-.PHONY: build build-hook image push deploy clean kind-load kind-reload
+.PHONY: build build-hook build-cni image push deploy clean kind-load kind-reload
 
 build: build-hook
 	CGO_ENABLED=1 GOOS=linux go build -tags cxi -o bin/$(BINARY) $(CMD_PATH)
@@ -21,6 +23,12 @@ build-mock: build-hook
 # stay CGO-free regardless of how the driver binary itself is built.
 build-hook:
 	CGO_ENABLED=0 GOOS=linux go build -o bin/$(HOOK_BINARY) $(HOOK_CMD_PATH)
+
+# slingshot-cni is invoked directly by containerd/Multus on the host, so it
+# must also stay CGO-free; it ships independently of the driver DaemonSet
+# image built by `image` below.
+build-cni:
+	CGO_ENABLED=0 GOOS=linux go build -o bin/$(CNI_BINARY) $(CNI_CMD_PATH)
 
 image:
 	$(CONTAINER_CLI) build --no-cache -t $(IMAGE):$(TAG) .
@@ -67,4 +75,4 @@ test-clean:
 	kubectl delete -f deploy/kubernetes/test/resourceclaim.yaml --ignore-not-found
 
 clean:
-	rm -f bin/$(BINARY) bin/$(HOOK_BINARY)
+	rm -f bin/$(BINARY) bin/$(HOOK_BINARY) bin/$(CNI_BINARY)
