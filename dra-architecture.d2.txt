@@ -92,13 +92,14 @@ DRA Node Driver: {
     reads_vni: "from claim.namespace annotation"
     fast_fail: "rejects requests > usable ceiling"
     writes_store: "podUID → []PodAllocation{Device,HSN,VNI}"
+    writes_cni_hint: "<--cni-hints-dir>/<podUID>.json for slingshot-cni"
     returns: "CDI device IDs"
   }
 
   UnprepareResourceClaims: {
     shape: sql_table
     role: "kubelet hook on pod removal"
-    clears: "AllocationStore entry"
+    clears: "AllocationStore entry; CNI hint file (best-effort)"
   }
 
   AllocationStore: {
@@ -186,7 +187,18 @@ Container: {
     no_privileged: "CDI lets non-root pods access device"
     libfabric: "stock provider discovers HSN via injected /sys/class/net"
     vni_scope: "restricted by CXI service to namespace VNI"
+    hsn_ip: "<hsn_iface> IPVLAN netdev + Whereabouts address via slingshot-cni"
   }
+
+  Slingshot CNI: {
+    shape: sql_table
+    role: "host CNI plugin (cmd/slingshot-cni + internal/cni), exec'd by containerd/Multus"
+    ADD: "per hint entry: L2 IPVLAN on host hsn_iface → pod netns → Whereabouts IPAM (CNI_IFNAME per device)"
+    DEL: "release IPAM + delete IPVLAN, idempotent"
+    complementary: "L3 only; NRI sysfs injection still serves libfabric"
+  }
+
+  Slingshot CNI -> Pod Container: "IPVLAN netdev + IP"
 }
 
 # ── Flows ────────────────────────────────────────────────────────────────────
@@ -211,6 +223,8 @@ DRA Node Driver.Namespace VNI Allocator -> Node Resources.Namespace: "patch anno
 # Node preparation
 Kubernetes Scheduler.Structured Parameters -> DRA Node Driver.PrepareResourceClaims: "pod scheduled to node"
 Node Resources.Namespace -> DRA Node Driver.PrepareResourceClaims: "read VNI from annotation"
+DRA Node Driver.PrepareResourceClaims -> Container.Slingshot CNI: "hint file (before RunPodSandbox)"
+Node Resources.HSN Interface -> Container.Slingshot CNI: "IPVLAN parent"
 
 # Container lifecycle (NRI)
 DRA Node Driver.NRI Plugin -> Node Resources.CXI Service: "CreateService on RunPodSandbox"

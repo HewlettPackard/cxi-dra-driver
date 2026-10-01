@@ -6,9 +6,12 @@ import (
 )
 
 func TestParseNetConf_Defaults(t *testing.T) {
-	conf, err := ParseNetConf([]byte(`{"cniVersion":"1.0.0","name":"slingshot-hsn","type":"slingshot-cni"}`))
+	conf, err := ParseNetConf([]byte(`{"cniVersion":"1.0.0","name":"slingshot-hsn","type":"slingshot-cni","ipam":{"type":"whereabouts"}}`))
 	if err != nil {
 		t.Fatalf("ParseNetConf: %v", err)
+	}
+	if conf.IPAM.Type != "whereabouts" {
+		t.Errorf("IPAM.Type = %q, want whereabouts", conf.IPAM.Type)
 	}
 	if got := conf.hintsDirOrDefault(); got != DefaultHintsDir {
 		t.Errorf("hintsDirOrDefault() = %q, want %q", got, DefaultHintsDir)
@@ -22,7 +25,7 @@ func TestParseNetConf_Defaults(t *testing.T) {
 }
 
 func TestParseNetConf_Overrides(t *testing.T) {
-	conf, err := ParseNetConf([]byte(`{"cniVersion":"1.0.0","hintsDir":"/tmp/hints","retryInterval":"20ms","retryTimeout":"1s"}`))
+	conf, err := ParseNetConf([]byte(`{"cniVersion":"1.0.0","hintsDir":"/tmp/hints","retryInterval":"20ms","retryTimeout":"1s","ipam":{"type":"whereabouts"}}`))
 	if err != nil {
 		t.Fatalf("ParseNetConf: %v", err)
 	}
@@ -38,14 +41,20 @@ func TestParseNetConf_Overrides(t *testing.T) {
 }
 
 func TestParseNetConf_InvalidRetryInterval(t *testing.T) {
-	if _, err := ParseNetConf([]byte(`{"retryInterval":"not-a-duration"}`)); err == nil {
+	if _, err := ParseNetConf([]byte(`{"retryInterval":"not-a-duration","ipam":{"type":"whereabouts"}}`)); err == nil {
 		t.Fatal("expected error for invalid retryInterval")
 	}
 }
 
 func TestParseNetConf_InvalidRetryTimeout(t *testing.T) {
-	if _, err := ParseNetConf([]byte(`{"retryTimeout":"not-a-duration"}`)); err == nil {
+	if _, err := ParseNetConf([]byte(`{"retryTimeout":"not-a-duration","ipam":{"type":"whereabouts"}}`)); err == nil {
 		t.Fatal("expected error for invalid retryTimeout")
+	}
+}
+
+func TestParseNetConf_MissingIPAMType(t *testing.T) {
+	if _, err := ParseNetConf([]byte(`{"cniVersion":"1.0.0","name":"slingshot-hsn","type":"slingshot-cni"}`)); err == nil {
+		t.Fatal("expected error for missing ipam.type")
 	}
 }
 

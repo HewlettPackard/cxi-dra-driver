@@ -89,6 +89,10 @@ state and live hardware state.
       │    (10-retry: allocator may not have annotated yet)                       ││
       │  stores PodAllocation in AllocationStore                                  ││
       │    (device path, HSN interface, VNI, requested resources)                 ││
+      │  writes CNI hint file <--cni-hints-dir>/<podUID>.json (atomic)            ││
+      │    one {device, hsn_iface, vni} per claimed device — read by slingshot-cni││
+      │    ▲ kubelet waits for this hook before RunPodSandbox, so CNI ADD always  ││
+      │      finds the file; a write failure fails the claim (kubelet retries)     ││
       │  returns CDI device IDs to kubelet                                        ││
       │                                                                          ││
       ▼                                                                          ││
@@ -97,6 +101,18 @@ state and live hardware state.
       │  programs cgroup BPF allowance for major:minor                           ││
       │  ▲ must happen before cgroup policy is locked in;                        ││
       │    NRI alone fires too late for cgroup — CDI handles this                ││
+      ▼                                                                          ││
+  CNI ADD: slingshot-cni  (separate host process, exec'd by containerd/Multus)  ││
+      │  reads hint file for K8S_POD_UID (bounded retry)                         ││
+      │  per device:                                                             ││
+      │    L2 IPVLAN sub-interface on host <hsn_iface> → moved into pod netns     ││
+      │      renamed <hsn_iface>  (fallback <hsn_iface>_inet if taken), set up   ││
+      │    DelegateAdd(ipam.type=whereabouts, CNI_IFNAME=<in-pod name>)          ││
+      │      ▲ per-device CNI_IFNAME: Whereabouts keys on (containerID, ifname)  ││
+      │    apply returned address + routes                                       ││
+      │  any failure → unwind every interface/reservation made this invocation   ││
+      │  ▲ L3 only — complementary to the NRI sysfs injection below, which is    ││
+      │    what stock libfabric's HSN discovery depends on                       ││
       ▼                                                                          ││
   NRI: RunPodSandbox                                                             ││
       │  netns inode via /proc/<sandbox-pid>/ns/net + fstat                      ││
@@ -147,7 +163,8 @@ state and live hardware state.
       ▼
   Pod running ✓
       /dev/cxiN accessible, SLINGSHOT_DEVICES/VNIS/SVC_IDS set, netns-scoped VNI bound,
-      stock libfabric discovers the HSN via the injected /sys/class/net
+      stock libfabric discovers the HSN via the injected /sys/class/net,
+      <hsn_iface> IPVLAN netdev carries a Whereabouts address for IP over the HSN
 
 
 ══════════════════════════════════════════════════════════════════════════════════════
@@ -183,9 +200,18 @@ strictly in lockstep and only triggers a republish on real state change.
       │   reconciler below; calling RemoveOccupancyForClaim here    
       │   would race the kernel service in the rare NRI-failed case  
       │   and cause -EEXIST on the next claim)                       
+      │  best-effort removal of the CNI hint file (never blocks release)     │
       │                                                                       │
       ▼                                                                       │
   ResourceClaim garbage-collected  (ephemeral template claim)                 │
+                                                                              │
+  In parallel, containerd runs CNI DEL: slingshot-cni                         │
+      │  per device: Whereabouts DelegateDel under the in-pod name ADD used, │
+      │    then delete the IPVLAN link                                        │
+      │  idempotent: missing hint file / netns / link = success; only IPVLAN  │
+      │    links are ever deleted; all devices attempted, errors joined       │
+      │  no ordering vs. the hint-file removal above — if the hint is already │
+      │    gone, DEL logs and succeeds; Whereabouts ip-reconciler GCs leftovers│
                                                                               │
 └─────────────────────────────────────────────────────────────────────────────┘
 
@@ -295,12 +321,23 @@ strictly in lockstep and only triggers a republish on real state change.
   10 s ticker             Drives reconcileOccupancyFromHardware THEN publish();
                             also a safety-net re-eval of Ready=False queue
   PrepareResourceClaims   Static ceiling check; VNI lookup from namespace
-                            annotation; AllocationStore write
-  UnprepareResourceClaims AllocationStore cleanup only — occupancy release is
+                            annotation; AllocationStore write; atomic CNI
+                            hint-file write (handoff to slingshot-cni)
+  UnprepareResourceClaims AllocationStore cleanup + best-effort CNI hint-file
+                            removal — occupancy release is
                             owned by NRI (Path A) + binder watch (Path B) +
                             reconciler (Path C)
   CDI                     /dev/cxiN injection + cgroup BPF allowance
                             (pre-cgroup-lock)
+  CNI ADD / DEL           slingshot-cni (cmd/slingshot-cni + internal/cni),
+                            a separate host process exec'd by containerd/
+                            Multus. ADD: per claimed device, L2 IPVLAN on the
+                            host hsn_iface moved into the pod netns as
+                            <hsn_iface> (or <hsn_iface>_inet) + Whereabouts
+                            IPAM address; unwinds on partial failure. DEL:
+                            release + delete, idempotent (missing hint/netns/
+                            link = success; only IPVLAN links deleted). Owns
+                            L3 only — complementary to HSN sysfs injection.
   NRI RunPodSandbox       Live fit-check under per-device mutex; hardware
                             service create; per-pod synthetic /sys/class/net
                             build (HSN sysfs injection); RemovePending

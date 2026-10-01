@@ -15,6 +15,8 @@ For the AI-session domain-model summary (terminology, anti-patterns, known gaps)
 5. Injecting the device, libraries, and environment variables the pod's container needs to use the hardware, via CDI and NRI.
 6. Tearing all of the above down when the pod stops, and cleaning up anything that leaks.
 
+The repository also ships **`slingshot-cni`**, a separate host-side CNI plugin (not part of the DaemonSet image) that gives each claiming pod a real, IP-addressed netdev on the HSN. The driver hands it per-pod state through a host hint file (see §3.4 and §3.5b); it owns L3 addressing only and is complementary to the driver's sysfs-based HSN injection.
+
 It does **not** implement scheduling itself (that's the Kubernetes DRA scheduler plugin, out of tree) and it does **not** contain end-to-end tests (that's the sibling `cxi-dra-integration-tests` repository, which deploys this driver to a live cluster and exercises it).
 
 ## 2. Component map
@@ -23,11 +25,13 @@ It does **not** implement scheduling itself (that's the Kubernetes DRA scheduler
 |-----------|-------------|-----------------|
 | Driver entry point | `cmd/cxi-dra-driver/main.go` | Parses ~23 CLI flags, builds the Kubernetes client, and wires every other component together (see §5, Initialization ordering) |
 | CDI hook binary | `cmd/cxi-cdi-hook/main.go` | Standalone binary, installed onto the host by `internal/cdi`, that refreshes the container's ldconfig cache after CDI bind-mounts libraries in |
+| Slingshot CNI binary | `cmd/slingshot-cni/main.go` | Standalone, CGO-free host CNI plugin (`make build-cni`), exec'd by containerd/Multus — wires `internal/cni`'s `CmdAdd`/`CmdDel`/`CmdCheck` into `skel.PluginMainFuncs` |
 | Hardware layer | `internal/cxi/` | Device discovery (`device.go`), capacity reads (`capacity_cgo.go`/`capacity_stub.go`), HSN pairing (`hsn.go`), GPU co-location (`gpu.go`), CXI service CRUD (`service*.go`) — see [internal/cxi/README.md](internal/cxi/README.md) |
-| DRA plugin core | `internal/driver/` | `ClaimBinder`, `ResourceSlice` publishing, `Prepare`/`UnprepareResourceClaims`, `AllocationStore`, VNI allocator, reconciler, reaper — see [internal/driver/README.md](internal/driver/README.md) |
+| DRA plugin core | `internal/driver/` | `ClaimBinder`, `ResourceSlice` publishing, `Prepare`/`UnprepareResourceClaims`, `AllocationStore`, VNI allocator, reconciler, reaper, CNI hint-file writer (`cnihints.go`) — see [internal/driver/README.md](internal/driver/README.md) |
 | CDI integration | `internal/cdi/` | Generates CDI specs (`spec.go`, `env.go`), loads the env config (`config.go`), installs the hook binary and ldconfig runtime onto the host (`hookinstall.go`), writes the containerd drop-in config (`containerd.go`) |
 | Synthetic network sysfs | `internal/netsysfs/` | Builds a per-pod replacement `/sys/class/net` tree (`build.go`) and bind-mounts it over the pod's own (`netns_linux.go`) so stock libfabric can discover the HSN interface |
 | NRI plugin | `internal/nri/` | `Plugin` (`plugin.go`) — hooks into containerd's pod lifecycle (`RunPodSandbox`, `CreateContainer`, `StopPodSandbox`) to create/destroy the CXI service and inject env vars |
+| Slingshot CNI logic | `internal/cni/` | CNI `ADD`/`DEL`/`CHECK` orchestration (`cmd.go`), hint-file read/validate (`hint.go`, `podargs.go`), stdin config (`config.go`), L2 IPVLAN link management behind the `linkManager` seam (`network.go`, `network_linux.go`, `network_other.go`), Whereabouts IPAM delegation behind `ipamDelegate` (`ipam.go`) — see [docs/cni/cni-plugin.md](docs/cni/cni-plugin.md) |
 | Kubernetes admission | `deploy/kubernetes/admission-policy.yaml` | `MutatingAdmissionPolicy`, evaluated in-process by the API server — injects CEL capacity selectors into `ResourceClaim` requests at CREATE time |
 | Deployment | `deploy/helm/cxi-dra-driver/` (recommended), `deploy/kubernetes/` (raw manifests) | DaemonSet/Deployment, RBAC, `DeviceClass`, admission policy, `ResourceClaimTemplate`s |
 
@@ -61,11 +65,25 @@ Once bound, kubelet calls this driver's `PrepareResourceClaims` gRPC hook (via t
 1. Reads the pod's namespace `cxi.slingshot.hpe.com/vni` annotation (written by the VNI allocator — see §3.8). It does **not** read a per-claim VNI; VNIs are namespace-scoped.
 2. Performs a static ceiling check against the requested `ResourceSet` (from the claim's opaque config) and the device's total capacity.
 3. Stores a `PodAllocation` (device, HSN interface, VNI, resources) in the in-memory `AllocationStore` (`internal/driver/store.go`), keyed by pod UID.
-4. Returns the CDI device IDs kubelet should ask the container runtime to attach — these reference the CDI specs `internal/cdi` already wrote (see §3.5).
+4. Writes the pod's **CNI hint file** `<--cni-hints-dir>/<podUID>.json` (`cnihints.go`) — a JSON array with one `{device, hsn_iface, vni}` entry per claimed device — atomically (temp file + rename). This is the only handoff to `slingshot-cni` (§3.5b), which runs as a separate process and cannot see the `AllocationStore`. A write failure fails the claim so kubelet retries rather than starting a sandbox with no hint. Contract: [docs/cni/cnidra-cni-hint-contract.md](docs/cni/cnidra-cni-hint-contract.md).
+5. Returns the CDI device IDs kubelet should ask the container runtime to attach — these reference the CDI specs `internal/cdi` already wrote (see §3.5).
+
+Because kubelet waits for this hook to return before calling CRI `RunPodSandbox`, the hint file is guaranteed to exist before CNI `ADD` fires — ordering is a kubelet sequencing guarantee, not a race the plugin has to defend against (it still has a bounded retry as a safety net for driver crashes).
 
 ### 3.5 CDI (container runtime, driven by specs this driver wrote ahead of time)
 
 Before any of the above, at driver startup (see §5) and per-device as devices are discovered, `internal/cdi` writes CDI spec files to `/var/run/cdi/` (`spec.go`) describing: the `/dev/cxiN` device node plus its `/sys/class/cxi_user/<name>` sysfs path, and — if `--enable-cdi-env=true` — additional "profile" specs (`env.go`) bundling libcxi/libfabric runtime libraries and environment variables (notably `CXIP_SKIP_AMA_CHECK=1`). The container runtime (containerd, with CDI support enabled) reads the CDI IDs returned by `PrepareResourceClaims` and performs the actual bind-mounts/device-node creation as part of standard OCI container creation — no driver code runs at this exact step, but the specs it wrote are what makes it possible.
+
+### 3.5b CNI `ADD` (`slingshot-cni`, exec'd by containerd/Multus during `RunPodSandbox`)
+
+When containerd sets up the sandbox's network — before this driver's NRI `RunPodSandbox` hook in §3.6 fires — it invokes every CNI plugin in the pod's network attachment list. If a `NetworkAttachmentDefinition` of `type: slingshot-cni` is attached, `internal/cni.CmdAdd` runs **as a separate host process** with no access to the driver's memory:
+
+1. Parses its stdin config (`ipam.type` is mandatory) and `CNI_ARGS` (`K8S_POD_UID`), then reads the hint file from §3.4, retrying briefly if absent.
+2. For **every** hint entry (a `count > 1` claim yields several): looks up the host HSN netdev named `hsn_iface`, creates an **L2 IPVLAN** sub-interface on it, moves it into the pod netns, renames it to `hsn_iface` (falling back to `hsn_iface_inet` if that name is taken), and brings it up (`network_linux.go`, via `vishvananda/netlink`).
+3. Execs the configured IPAM plugin (**Whereabouts**) with the unmodified stdin config and `CNI_IFNAME` overridden to the in-pod name — Whereabouts keys reservations on `(containerID, ifname)`, so each device needs its own — and applies the returned address and routes (`ipam.go`).
+4. Prints one aggregated CNI 1.0.0 result. Any failure partway unwinds every interface and reservation already made in this invocation.
+
+This produces a real netdev with an IP on the HSN, for anything that needs IP over the fabric. It is **complementary to, not a replacement for**, the sysfs injection in §3.6 step 4: stock libfabric discovers the HSN by globbing `/sys/class/net`, which inside the container is the driver's synthetic overmount — the IPVLAN interface is visible via netlink (`ip link`/`ip addr`) but not under that overmounted path, and libfabric does not need it to be. Full command reference: [docs/cni/cni-plugin.md](docs/cni/cni-plugin.md).
 
 ### 3.6 NRI `RunPodSandbox` (`internal/nri/plugin.go`)
 
@@ -93,7 +111,9 @@ Independently of any single pod's lifecycle, `internal/driver/vniallocator.go` r
 
 ### 3.10 Pod teardown (`internal/nri/plugin.go`, `StopPodSandbox`)
 
-On pod stop, the plugin destroys the CXI service and removes the synthetic sysfs tree it created in §3.6. `internal/driver/unprepare.go`'s `UnprepareResourceClaims` removes the `PodAllocation` from the `AllocationStore` around the same time via the kubelet hook path.
+On pod stop, the plugin destroys the CXI service and removes the synthetic sysfs tree it created in §3.6. `internal/driver/unprepare.go`'s `UnprepareResourceClaims` removes the `PodAllocation` from the `AllocationStore` and deletes the pod's CNI hint file (best-effort — a removal failure never blocks claim release) around the same time via the kubelet hook path.
+
+Independently, containerd invokes CNI `DEL` for the sandbox, and `internal/cni.CmdDel` releases each device's Whereabouts reservation (under the in-pod name `ADD` actually chose) and deletes its IPVLAN interface. `DEL` is best-effort and idempotent per the CNI spec: a missing hint file, an already-gone interface, or a vanished netns all count as success, every device is attempted even if an earlier one fails, and only IPVLAN links are ever deleted — a pod's own interface that happens to share the HSN's name is never touched. There is no ordering dependency between CNI `DEL` and the driver's hint-file removal; if the hint is already gone, `DEL` logs and returns success, leaving any stragglers to Whereabouts's own `ip-reconciler`.
 
 ## 4. Component interaction diagram
 
@@ -115,6 +135,14 @@ Scheduler ──allocates──► ResourceSlice (cxi0, cxi1, …)
                          │     injects SLINGSHOT_* env, bind-mounts sysfs
                          └── internal/nri (StopPodSandbox)
                                destroys CXI service, removes synthetic sysfs tree
+                              │
+                              │ PrepareResourceClaims writes /var/run/cxi/net-hints/<podUID>.json
+                              ▼
+                         slingshot-cni (host CNI plugin; cmd/slingshot-cni + internal/cni)
+                         ├── ADD   per device: L2 IPVLAN on host <hsn_iface> → pod netns as
+                         │         <hsn_iface> (or <hsn_iface>_inet) → Whereabouts IPAM address
+                         ├── DEL   release Whereabouts address, delete IPVLAN (idempotent)
+                         └── CHECK verify link up + IPAM state
 
 MutatingAdmissionPolicy (in-process in API server)
     injects CEL selectors (avail_txqs >= N && avail_tles >= M) from claim opaque config
@@ -166,6 +194,8 @@ Both paths render: the DaemonSet/Deployment, `ClusterRole`/RBAC, `DeviceClass`, 
 | Pod force-deleted (`kubectl delete --force`, node failure) | `StopPodSandbox` never runs, so the CXI service and synthetic sysfs tree for that pod are never explicitly torn down | The reaper (`internal/driver/reaper.go`) periodically finds CXI services with no live owning pod and deletes them |
 | Live fit-check fails at `RunPodSandbox` (§3.6) after `PrepareResourceClaims`'s static check (§3.4) already passed | A concurrent pod on the same node consumed the remaining capacity between the two checks | `RunPodSandbox` fails the sandbox creation; kubelet retries pod creation, by which point `ResourceSlice`/`ClaimBinder` should reflect the new occupancy and the scheduler can pick a different device/node |
 | Two namespaces need VNIs simultaneously | Race on VNI assignment | Leader election on the VNI allocator ensures only one process assigns VNIs cluster-wide; the underlying namespace annotation write is a single atomic API server update |
+| CNI `ADD` fails partway through a multi-device pod (IPVLAN creation, IPAM, or address application) | Some devices already have an interface and a Whereabouts reservation | `internal/cni.CmdAdd` unwinds every interface and reservation it created in that invocation before returning the error; containerd fails `RunPodSandbox` and kubelet retries from a clean slate |
+| Driver removed the hint file before CNI `DEL` ran (or crashed and restarted mid-teardown) | `CmdDel` cannot map devices to interfaces | `DEL` logs and returns success rather than wedging pod teardown; the pod netns is destroyed with the sandbox (taking the IPVLAN links with it) and Whereabouts's `ip-reconciler` garbage-collects any reservation left behind |
 
 ## 9. Extension points — "how to add X"
 
@@ -184,9 +214,11 @@ Logging is the only observability signal today (structured via the standard libr
 |---------|-------|-----------------|------------|-------|
 | `cmd/cxi-dra-driver` | 1 | Package-level only (it's `main`) | None (integration-tested via CI image + sibling repo) | Wiring/orchestration only, no business logic |
 | `cmd/cxi-cdi-hook` | 2 | Yes | `main_test.go` | Small, standalone, CGO-free by design |
+| `cmd/slingshot-cni` | 1 | Package-level only (it's `main`) | None (logic lives in `internal/cni`) | Thin `skel.PluginMainFuncs` wiring; CGO-free (`make build-cni`) |
 | `internal/cxi` | 11 | Yes | None | Hardware-dependent; see [internal/cxi/README.md](internal/cxi/README.md) |
 | `internal/driver` | 14 | Yes | 7 of 14 files | Strongest test coverage in the repo; see [internal/driver/README.md](internal/driver/README.md) |
 | `internal/cdi` | 8 | Yes | 3 of 8 files | Spec generation and host installation logic |
+| `internal/cni` | 10 (+ `testdata/fakewhereabouts`) | Yes, including package-level rationale | 6 of 10 files | Three test layers: orchestration with fakes (any platform), real IPAM delegate exec'ing a fake `whereabouts` binary (any platform), real netlink against a throwaway netns (`network_linux_test.go`, Linux root only — skips otherwise) |
 | `internal/netsysfs` | 4 | Yes, including package-level rationale | 1 of 4 files (`build_test.go`) | `netns_linux.go` is platform-specific and untested by design |
 | `internal/nri` | 1 | Yes | None | Integration-tested only, by the sibling `cxi-dra-integration-tests` repo |
 
@@ -198,6 +230,8 @@ Logging is the only observability signal today (structured via the standard libr
 | `ResourceSet` | `internal/cxi/resources.go` | `txqs`, `tgqs`, `eqs`, `cts`, `ptes`, `le_pools`, `tle_pools`, `acs` | The hardware quota a claim requests or a device has available; see §12 for how it flows through the system |
 | `PodAllocation` | `internal/driver/store.go` | Device, HSN interface, VNI, `ResourceSet` | What `PrepareResourceClaims` decided for one pod; keyed by pod UID in `AllocationStore` |
 | `AllocationStore` | `internal/driver/store.go` | `map[types.UID]PodAllocation` + `sync.RWMutex` | Thread-safe lookup shared by the kubelet prepare/unprepare hooks, the NRI plugin, and the reconciler |
+| `CNIHint` / `cni.Hint` | `internal/driver/cnihints.go` / `internal/cni/hint.go` | `device`, `hsn_iface`, `vni` | One claimed device's entry in the per-pod hint file. Deliberately two separate Go types that agree only on the JSON schema — the writer (driver daemon) and reader (`slingshot-cni` process) are different binaries on different lifecycles and must not share code |
+| `linkManager` / `ipamDelegate` | `internal/cni/network.go` / `internal/cni/ipam.go` | interfaces | The two seams `CmdAdd`/`CmdDel`/`CmdCheck` are written against: kernel-facing netlink operations and IPAM plugin exec. Real implementations are Linux-only / exec-based; tests substitute fakes so orchestration runs on any platform |
 | `Driver` | `internal/driver/driver.go` | Devices, pending grants, occupancy, references to `ClaimBinder`/`AllocationStore` | Top-level type wiring every other `internal/driver` file together |
 | CDI `Spec` (from `tags.cncf.io/container-device-interface`) | `internal/cdi/spec.go`, `env.go` | Device nodes, mounts, env vars | The on-disk `/var/run/cdi/*.json` contract between this driver and the container runtime |
 

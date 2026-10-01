@@ -1,6 +1,6 @@
 ---
 name: 'coding'
-description: "Implements and modifies Go code in cxi-dra-driver: cmd/ entry points and internal/ packages (cxi, driver, cdi, netsysfs, nri). Use for: adding a driver flag, extending a package, fixing a bug in the DRA lifecycle."
+description: "Implements and modifies Go code in cxi-dra-driver: cmd/ entry points and internal/ packages (cxi, driver, cdi, cni, netsysfs, nri). Use for: adding a driver flag, extending a package, fixing a bug in the DRA lifecycle or the slingshot-cni plugin."
 tools: ['read', 'edit', 'search', 'runInTerminal']
 ---
 
@@ -8,7 +8,7 @@ tools: ['read', 'edit', 'search', 'runInTerminal']
 
 ## Role
 
-Implements changes to the driver's Go source: `cmd/cxi-dra-driver`, `cmd/cxi-cdi-hook`, and the five `internal/` packages.
+Implements changes to the driver's Go source: `cmd/cxi-dra-driver`, `cmd/cxi-cdi-hook`, `cmd/slingshot-cni`, and the six `internal/` packages.
 
 ## Key Constraints
 

@@ -1,6 +1,6 @@
 ---
 name: cxi-dra-glossary
-description: "Glossary of CXI/DRA/Kubernetes domain terms used throughout this driver. USE FOR: understanding source comments, README, and CONTEXT.md; writing new code that touches DRA/CXI/CDI/NRI concepts. Trigger keywords: DRA, CXI, CDI, NRI, ResourceClaim, ResourceSlice, HSN, VNI, reconciler, reaper, glossary."
+description: "Glossary of CXI/DRA/Kubernetes domain terms used throughout this driver. USE FOR: understanding source comments, README, and CONTEXT.md; writing new code that touches DRA/CXI/CDI/NRI/CNI concepts. Trigger keywords: DRA, CXI, CDI, NRI, CNI, ResourceClaim, ResourceSlice, HSN, VNI, IPVLAN, Whereabouts, hint file, reconciler, reaper, glossary."
 ---
 
 # CXI DRA Glossary
@@ -14,7 +14,12 @@ description: "Glossary of CXI/DRA/Kubernetes domain terms used throughout this d
 | **ClaimBinder** | Watches ResourceClaims cluster-wide, runs the real fit-check, and sets DRA `Ready`/`Unschedulable` BindingConditions |
 | **CDI** | Container Device Interface — injects `/dev/cxiN`, optional env/NCCL/AWS-OFI-NCCL library specs, and cgroup BPF device allowance |
 | **NRI** | Node Resource Interface — this driver's `RunPodSandbox`/`CreateContainer`/`StopPodSandbox` hooks |
-| **HSN** | Slingshot High-Speed Network fabric; the physical interface each CXI device is paired with |
+| **HSN** | Slingshot High-Speed Network fabric; the physical interface (`hsnN` netdev) each CXI device is paired with |
+| **HSN sysfs injection** | `internal/netsysfs`: a per-pod synthetic `/sys/class/net` overmount so stock libfabric discovers the HSN inside the pod; gives no real netdev |
+| **Slingshot CNI / `slingshot-cni`** | Separate host CNI plugin (`cmd/slingshot-cni` + `internal/cni`) exec'd by containerd/Multus; gives the pod a real IP-addressed netdev per claimed device. Complementary to HSN sysfs injection, not a replacement |
+| **CNI hint file** | `<--cni-hints-dir>/<podUID>.json`, written by `PrepareResourceClaims`, one `{device, hsn_iface, vni}` per device; the only handoff from the driver daemon to the CNI process |
+| **IPVLAN (L2)** | Kernel virtual-interface type `slingshot-cni` creates on the host HSN and moves into the pod netns, named `<hsn_iface>` (fallback `<hsn_iface>_inet`) |
+| **Whereabouts** | Cluster-wide CNI IPAM plugin `slingshot-cni` delegates to for HSN addresses; keys reservations on `(containerID, ifname)`, hence the per-device `CNI_IFNAME` override |
 | **VNI** | Virtual Network Identifier — assigned once per namespace (not per pod/claim) by the leader-elected namespace allocator |
 | **Reconciler** | Poll-driven safety net rebuilding in-memory device occupancy from live CXI services (covers driver restarts, missed events) |
 | **Reaper** | Cleans up orphaned CXI services left behind by pods that didn't tear down cleanly |

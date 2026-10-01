@@ -139,6 +139,7 @@ DRA Node Driver: {
     ceiling_check: "fast-fail if request > hardware total - overhead"
     reads_vni: "from claim.namespace annotation (10-retry)"
     writes_store: "podUID → []PodAllocation{Device,HSN,VNI}"
+    writes_cni_hint: "atomic write of <--cni-hints-dir>/<podUID>.json (one {device,hsn_iface,vni} per device) — handoff to slingshot-cni; failure fails the claim"
     returns_cdi: "[]CDI device IDs"
   }
 
@@ -147,7 +148,7 @@ DRA Node Driver: {
     label: "■ UnprepareResourceClaims"
     impl: "internal/driver/unprepare.go"
     role: "kubelet plugin hook"
-    clears: "AllocationStore.Delete(podUID) only"
+    clears: "AllocationStore.Delete(podUID); best-effort delete of the CNI hint file"
     no_occupancy_touch: "does NOT release occupancy — racing the kernel service would cause -EEXIST on the next grant; NRI + binder + reconciler own occupancy release"
   }
 
@@ -314,9 +315,24 @@ Container: {
     no_privileged_required: "CDI grants device access without privileged"
     vni_scope: "restricted by CXI service to namespace VNI"
     libfabric: "stock provider discovers HSN via injected /sys/class/net"
+    hsn_ip: "<hsn_iface> (or <hsn_iface>_inet) L2 IPVLAN netdev with Whereabouts address, from slingshot-cni"
+  }
+
+  Slingshot CNI: {
+    shape: sql_table
+    label: "■ slingshot-cni (host CNI plugin, separate process)"
+    impl: "cmd/slingshot-cni + internal/cni"
+    invoked_by: "containerd/Multus during RunPodSandbox network setup (before the NRI hook)"
+    reads: "<hintsDir>/<K8S_POD_UID>.json (bounded retry)"
+    ADD: "per device: L2 IPVLAN on host hsn_iface → pod netns as hsn_iface | hsn_iface_inet → DelegateAdd(ipam.type, CNI_IFNAME=<in-pod name>) → apply addr/routes; unwind all on failure"
+    DEL: "per device: DelegateDel under the name ADD used; delete IPVLAN only; missing hint/netns/link = success"
+    CHECK: "link exists+ipvlan+up; DelegateCheck"
+    seams: "linkManager (network_linux.go / network_other.go), ipamDelegate (ipam.go)"
+    complementary: "L3 only — does not replace the NRI synthetic sysfs libfabric depends on"
   }
 
   CDI Spec -> Pod Container: "kubelet applies on container start"
+  Slingshot CNI -> Pod Container: "IPVLAN netdev + IP in pod netns"
 }
 
 # ── FLOWS ────────────────────────────────────────────────────────────────────
@@ -341,6 +357,8 @@ Node Resources.Namespace -> DRA Node Driver.Polling Reconciler: "list namespaces
 # Node preparation
 Kubernetes Scheduler.Structured Parameters -> DRA Node Driver.PrepareResourceClaims: "pod scheduled to node"
 DRA Node Driver.PrepareResourceClaims -> Container.CDI Spec: "returns CDI device IDs"
+DRA Node Driver.PrepareResourceClaims -> Container.Slingshot CNI: "writes hint file (kubelet orders prepare before RunPodSandbox)"
+Node Resources.HSN Interface -> Container.Slingshot CNI: "IPVLAN parent"
 
 # Container lifecycle (NRI → service)
 DRA Node Driver.NRI Plugin -> Node Resources.CXI Service: "CreateService(dev, netnsInode, VNI)"

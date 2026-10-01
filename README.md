@@ -40,6 +40,16 @@ Scheduler ──allocates──► ResourceSlice (cxi0, cxi1, …)
                          └── NRI plugin (StopPodSandbox)
                                └── destroys CXI service and removes the synthetic sysfs tree
 
+slingshot-cni (host CNI plugin, invoked by containerd/Multus — see docs/cni/cni-plugin.md)
+    ├── reads the driver's per-pod hint file (/var/run/cxi/net-hints/<podUID>.json,
+    │   written by PrepareResourceClaims before RunPodSandbox fires)
+    ├── ADD: per claimed device, creates an L2 IPVLAN sub-interface on the paired
+    │        host HSN, moves it into the pod netns as <hsn_iface> (or <hsn_iface>_inet),
+    │        and delegates addressing to Whereabouts IPAM (cluster-wide HSN pool)
+    └── DEL: releases the Whereabouts address and removes the interface (idempotent)
+    (owns L3 addressing only — complementary to the NRI sysfs injection above,
+     which is what stock libfabric's HSN discovery depends on)
+
 MutatingAdmissionPolicy (in-process in API server)
     └── intercepts ResourceClaim CREATE
           └── injects CEL selectors from opaque config parameters
@@ -79,6 +89,16 @@ These paths are for RHEL/SUSE-based Slingshot nodes with glibc 2.38 on ARM64. Ad
 ```bash
 CGO_ENABLED=1 GOOS=linux GOARCH=arm64 go build -tags cxi -o bin/cxi-dra-driver ./cmd/cxi-dra-driver
 ```
+
+### 2b. Build the Slingshot CNI plugin (optional, any machine)
+
+`slingshot-cni` is a separate host binary, not part of the driver image, and is always CGO-free:
+
+```bash
+make build-cni     # → bin/slingshot-cni (GOOS=linux; set GOARCH to match your nodes)
+```
+
+Install it on each Slingshot node's `CNI_PATH` (typically `/opt/cni/bin/`) alongside the `whereabouts` IPAM binary, then attach it to pods via a `NetworkAttachmentDefinition` — see [HSN IP Interface (Slingshot CNI)](#hsn-ip-interface-slingshot-cni) and [docs/cni/cni-plugin.md](docs/cni/cni-plugin.md).
 
 ### 3. Build and push the container image
 
@@ -408,11 +428,34 @@ In `RunPodSandbox` the NRI plugin builds a per-pod synthetic `/sys/class/net` tr
 - a symlink per real pod NIC, enumerated by entering the pod netns and mounting a fresh sysfs, so the pod keeps visibility of its own interfaces; and
 - one `hsnN/` directory per allocated HSN with exactly the metadata libfabric reads — `operstate=up`, `carrier=1`, `speed`, and `device → …/<BDF>` (the BDF of the paired CXI device, matched via PCIe topology).
 
-Only `/sys/class/net` is overmounted; `/sys/devices` is left untouched, so the replicated NIC symlinks still resolve. The HSN presents **only** as a sysfs directory under its host-native name — it is not a real netdev, so `ip link`, `ethtool`, netlink, and IP addressing all show nothing. This is sufficient because libfabric globs sysfs rather than using netlink, and the RDMA datapath is kernel-bypass and needs no netdev.
+Only `/sys/class/net` is overmounted; `/sys/devices` is left untouched, so the replicated NIC symlinks still resolve. The HSN presents **only** as a sysfs directory under its host-native name — the synthetic entry is not a real netdev, so on its own `ip link`, `ethtool`, netlink, and IP addressing show nothing for it. This is sufficient for libfabric, which globs sysfs rather than using netlink, and the RDMA datapath is kernel-bypass and needs no netdev. Pods that also need **IP** over the HSN get a real netdev from the separate [Slingshot CNI plugin](#hsn-ip-interface-slingshot-cni), which runs alongside this mechanism.
 
 Two libfabric gates interact with the tree. The link gate (`cxip_if.c:142`) has no env bypass and is satisfied by `operstate=up`. The AMA gate (`cxip_if.c:580`) drops any device whose netdev lacks a recognised MAC unless `CXIP_SKIP_AMA_CHECK=1` is set; the synthetic tree omits a MAC, so the `env` CDI profile supplies that env var (see [CDI Profiles](#cdi-profiles)) — it is deliberately **not** hardcoded in NRI.
 
 Injection is skipped in mock mode and when `--netns-sysfs-root` is empty. Reading the host HSN metadata is fatal (the services are rolled back and the kubelet retries the sandbox) because libfabric cannot bootstrap without it; replicating the pod's own NICs is best-effort and falls back to an HSN-only tree on failure.
+
+## HSN IP Interface (Slingshot CNI)
+
+The sysfs injection above is what stock libfabric needs; it deliberately does not give the pod an IP-addressed netdev on the HSN. Workloads that also need IP over the fabric (out-of-band launchers, control-plane traffic, tooling) get one from **`slingshot-cni`** ([cmd/slingshot-cni](cmd/slingshot-cni), [internal/cni](internal/cni)) — a standalone host CNI plugin exec'd by containerd/Multus, separate from the driver DaemonSet. The two mechanisms are complementary and both run for a pod that has the network attached.
+
+How it works, per pod:
+
+1. `PrepareResourceClaims` writes a **hint file** `<--cni-hints-dir>/<podUID>.json` with one `{device, hsn_iface, vni}` entry per claimed device — the only handoff from the driver daemon to the CNI process. Kubelet waits for prepare to return before `RunPodSandbox`, so the file always exists before CNI `ADD` fires ([contract](docs/cni/cnidra-cni-hint-contract.md)).
+2. On CNI **`ADD`**, for every entry: an **L2 IPVLAN** sub-interface is created on the paired host HSN, moved into the pod netns as `<hsn_iface>` (e.g. `hsn2`; falls back to `hsn2_inet` if that name is taken), and given an address by the **Whereabouts** IPAM plugin from a cluster-wide HSN pool. A `count: 2` claim yields two interfaces and two reservations. Any partial failure is fully unwound.
+3. On CNI **`DEL`**, each reservation is released and each interface removed — best-effort and idempotent.
+
+Minimal `NetworkAttachmentDefinition` config (full field reference in [docs/cni/cni-plugin.md](docs/cni/cni-plugin.md)):
+
+```json
+{
+  "cniVersion": "1.0.0",
+  "name": "slingshot-hsn",
+  "type": "slingshot-cni",
+  "ipam": { "type": "whereabouts", "range": "10.200.0.0/16" }
+}
+```
+
+`ipam.type` is required. Node prerequisites: `slingshot-cni` and `whereabouts` on `CNI_PATH`, Whereabouts's cluster-side install, Multus (or equivalent) to attach the network, and the driver's `--cni-hints-dir` matching the config's `hintsDir` (both default to `/var/run/cxi/net-hints`). Inside the container the IPVLAN link is visible via `ip link`/`ip addr` but not under the overmounted `/sys/class/net` — that is expected.
 
 ## CXI Service Programming
 
@@ -432,8 +475,12 @@ Pre-existing annotations are respected: if a namespace already has a valid `cxi.
 
 ```
 cmd/cxi-dra-driver/      Binary entrypoint and CLI flags
+cmd/cxi-cdi-hook/        Standalone OCI createContainer hook binary (ldconfig cache refresh)
+cmd/slingshot-cni/       Slingshot CNI plugin binary (host-side; IPVLAN-on-HSN + Whereabouts IPAM)
 internal/cxi/            Sysfs device discovery, CXI↔HSN pairing, libcxi CGo wrapper
 internal/cdi/            CDI spec generation (DeviceNodes; env/nccl/ofi specs; containerd CDI config drop-in)
+internal/cni/            CNI ADD/DEL/CHECK logic: hint-file consumption, IPVLAN link management,
+                         IPAM delegation (see docs/cni/cni-plugin.md)
 internal/netsysfs/       Per-pod synthetic /sys/class/net tree builder for HSN sysfs injection
 internal/driver/         DRA kubelet plugin (ResourceSlice, Prepare/Unprepare,
                          ClaimBinder, namespace VNI allocator, store)
@@ -460,7 +507,7 @@ deploy/kind/             kind mock-mode test harness (no hardware)
 | `--vni-range-end` | `0` | Last VNI in the pool (inclusive) |
 | `--system-svc-ids` | `""` | Comma-separated svc_ids of blessed system services: never deleted, and their reserved resources are deducted from each device's usable ceiling |
 | `--netns-sysfs-root` | `/var/run/cxi/netns` | Host directory for the per-pod synthetic `/sys/class/net` trees (empty disables HSN sysfs injection) |
-| `--cni-hints-dir` | `/var/run/cxi/net-hints` | Host directory for per-pod CNI hint files — the read-side contract for the Slingshot CNI plugin (empty disables the hint-file write/delete); see [docs/cnidra-cni-hint-contract.md](docs/cnidra-cni-hint-contract.md) |
+| `--cni-hints-dir` | `/var/run/cxi/net-hints` | Host directory for per-pod CNI hint files read by `slingshot-cni` (empty disables the hint-file write/delete); must match the `hintsDir` in the plugin's network config. See [docs/cni/cnidra-cni-hint-contract.md](docs/cni/cnidra-cni-hint-contract.md) |
 | `--enable-cdi-env` | `false` | Write the `env`/`nccl`/`ofi` CDI specs and inject their device IDs into pods |
 | `--env-config` | `""` | Path to the JSON CDI env config file (required when `--enable-cdi-env`) |
 | `--containerd-config-path` | `""` | Path to write the containerd CDI config drop-in (empty disables) |

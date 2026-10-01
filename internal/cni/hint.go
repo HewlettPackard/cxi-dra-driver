@@ -23,7 +23,7 @@ type Hint struct {
 // retrying every interval until the file appears or timeout elapses. The
 // retry is a safety net for the driver crashing between claim allocation and
 // PrepareResourceClaims completing — see the ordering guarantee in
-// docs/cnidra-cni-hint-contract.md, which this backstops rather than relies
+// docs/cni/cnidra-cni-hint-contract.md, which this backstops rather than relies
 // on for the common case.
 func ReadHint(hintsDir, podUID string, interval, timeout time.Duration) ([]Hint, error) {
 	path := filepath.Join(hintsDir, podUID+".json")

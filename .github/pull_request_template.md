@@ -4,7 +4,7 @@
 
 ## Components touched
 
-<!-- cmd/cxi-dra-driver, cmd/cxi-cdi-hook, internal/cxi, internal/driver, internal/cdi, internal/netsysfs, internal/nri, deploy/, .github/ -->
+<!-- cmd/cxi-dra-driver, cmd/cxi-cdi-hook, cmd/slingshot-cni, internal/cxi, internal/driver, internal/cdi, internal/cni, internal/netsysfs, internal/nri, deploy/, .github/ -->
 
 ## Test plan
 
