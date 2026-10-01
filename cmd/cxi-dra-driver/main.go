@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"log"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -60,6 +61,16 @@ func main() {
 		// driver's in-process AllocationStore. See docs/cni/cnidra-cni-hint-contract.md.
 		cniHintsDir = flag.String("cni-hints-dir", "/var/run/cxi/net-hints",
 			"Host directory for per-pod CNI hint files (empty disables the hint-file write/delete)")
+
+		// Optional host install of the slingshot-cni plugin binary bundled in
+		// this image, mirroring how cxi-cdi-hook is installed below. Opt-in:
+		// using the CNI is one of several ways a pod can reach the HSN
+		// (hostNetwork, future SR-IOV VFs), so the default leaves the node's
+		// CNI_PATH untouched. The directory must be a hostPath mounted at the
+		// same path in this container.
+		cniInstallDir = flag.String("cni-install-dir", "",
+			"Host CNI plugin directory (e.g. /opt/cni/bin) to install the bundled slingshot-cni binary into at startup; empty disables")
+		cniSrc = flag.String("cni-src", "/slingshot-cni", "Path to the slingshot-cni binary bundled in this image")
 
 		refreshInterval = flag.Duration("resource-refresh-interval", 10*time.Second,
 			"How often to republish the ResourceSlice with refreshed available-capacity attributes")
@@ -150,6 +161,19 @@ func main() {
 		}
 		envConfig.HookPath = *cdiHookPath
 		envConfig.LdconfigDir = *cdiLdconfigDir
+	}
+
+	if *cniInstallDir != "" {
+		if *cniHintsDir == "" {
+			fmt.Fprintln(os.Stderr, "error: --cni-install-dir requires --cni-hints-dir; slingshot-cni cannot operate without hint files")
+			os.Exit(1)
+		}
+		dest := filepath.Join(*cniInstallDir, "slingshot-cni")
+		if err := cdi.InstallHook(*cniSrc, dest); err != nil {
+			fmt.Fprintf(os.Stderr, "error: installing slingshot-cni: %v\n", err)
+			os.Exit(1)
+		}
+		log.Printf("installed slingshot-cni at %s", dest)
 	}
 
 	d := driver.New(driver.Config{

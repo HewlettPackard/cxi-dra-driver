@@ -51,7 +51,7 @@ This repository implements the **CXI DRA driver** — a Kubernetes Dynamic Resou
 | **VNI (namespace-scoped)** | One VNI per namespace, assigned by a leader-elected `vniallocator` and stored as the `cxi.slingshot.hpe.com/vni` namespace annotation — pods never request their own VNI |
 | **CDI** | Injects `/dev/cxiN`, optional env/NCCL/AWS-OFI-NCCL library specs, and cgroup BPF device allowance |
 | **NRI** | `RunPodSandbox` creates the CXI service + synthetic sysfs tree; `CreateContainer` injects `SLINGSHOT_DEVICES`/`SLINGSHOT_VNIS`/`SLINGSHOT_SVC_IDS` env vars; `StopPodSandbox` tears both down |
-| **Slingshot CNI (`slingshot-cni`)** | Separate host CNI plugin (`cmd/slingshot-cni` + `internal/cni`), exec'd by containerd/Multus. `ADD` creates one **L2 IPVLAN** sub-interface per claimed device on the host `hsn_iface`, moves it into the pod netns as `<hsn_iface>` (fallback `<hsn_iface>_inet`), and delegates addressing to **Whereabouts** IPAM; `DEL` releases and removes idempotently. Owns L3 addressing only — complementary to the NRI sysfs injection, which is what libfabric's HSN discovery depends on |
+| **Slingshot CNI (`slingshot-cni`)** | Host CNI plugin (`cmd/slingshot-cni` + `internal/cni`), bundled in the driver image and **optionally** installed onto nodes by the driver (`--cni-install-dir`, Helm `cni.install=true`, default off — `hostNetwork`/future SR-IOV remain first-class), exec'd by containerd/Multus. `ADD` creates one **L2 IPVLAN** sub-interface per claimed device on the host `hsn_iface`, moves it into the pod netns as `<hsn_iface>` (fallback `<hsn_iface>_inet`), and delegates addressing to **Whereabouts** IPAM; `DEL` releases and removes idempotently. Owns L3 addressing only — complementary to the NRI sysfs injection, which is what libfabric's HSN discovery depends on |
 | **CNI hint file** | `<--cni-hints-dir>/<podUID>.json`, written atomically by `PrepareResourceClaims` (`internal/driver/cnihints.go`), one `{device, hsn_iface, vni}` per claimed device. The only handoff from the driver daemon to the CNI process; ordering vs. CNI `ADD` is guaranteed by kubelet (prepare returns before `RunPodSandbox`). See `docs/cni/cnidra-cni-hint-contract.md` |
 | **Reconciler** | Poll-driven safety net rebuilding in-memory occupancy from live CXI services (covers driver restarts, missed events) |
 | **Reaper** | Deletes orphaned CXI services left behind by pods that didn't tear down cleanly |
@@ -75,7 +75,7 @@ This repository implements the **CXI DRA driver** — a Kubernetes Dynamic Resou
 ```bash
 make build          # CGO_ENABLED=1, tags=cxi — real hardware build, ARM64 Slingshot node only
 make build-mock      # CGO_ENABLED=0 — no libcxi, for kind/local dev
-make build-cni       # CGO_ENABLED=0 — slingshot-cni host CNI plugin binary (ships separately from the driver image)
+make build-cni       # CGO_ENABLED=0 — slingshot-cni host CNI plugin binary; honours GOARCH; bundled into the driver image (`make image` depends on it)
 go test ./...        # unit tests (also run in CI)
 golangci-lint run    # lint (also run in CI; config in .golangci.yml)
 make vet             # go vet ./...

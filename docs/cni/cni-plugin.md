@@ -157,11 +157,17 @@ A `NetworkAttachmentDefinition` for Multus (or a raw conflist entry):
 
 Prerequisites on each node:
 
-- `slingshot-cni` and `whereabouts` binaries on `CNI_PATH` (typically
-  `/opt/cni/bin`).
-- Whereabouts's own cluster-side install (CRDs, `ip-reconciler`) — see its
-  documentation. The HSN pool is cluster-wide, so use a single `range` across
-  all nodes.
+- `slingshot-cni` on `CNI_PATH` (typically `/opt/cni/bin`) — installed by
+  the driver when `--cni-install-dir` / Helm `cni.install=true` is set, or by
+  hand (`install -m 0755 bin/slingshot-cni /opt/cni/bin/`; build with the
+  node's `GOARCH`).
+- `whereabouts` on `CNI_PATH`, plus Whereabouts's own cluster-side install
+  (CRDs, `ip-reconciler`) — see its documentation. The HSN pool is
+  cluster-wide, so use a single `range` across all nodes.
+- Multus (or an equivalent meta-plugin) to attach the NAD to pods via the
+  `k8s.v1.cni.cncf.io/networks` annotation. The Helm chart can render the NAD
+  (`cni.nad.create=true`); the raw-manifest example is
+  [deploy/kubernetes/cni/networkattachmentdefinition.yaml](../../deploy/kubernetes/cni/networkattachmentdefinition.yaml).
 - The driver running with `--cni-hints-dir` non-empty (the default).
 
 ## Testing

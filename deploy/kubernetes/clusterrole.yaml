@@ -33,6 +33,13 @@ rules:
   - apiGroups: [""]
     resources: ["namespaces"]
     verbs: ["get", "list", "watch", "patch"]
+  # PrepareResourceClaims best-effort patches the observability-only
+  # cxi.slingshot.hpe.com/net-hints annotation onto each claiming pod (mirrors
+  # the CNI hint file so `kubectl describe pod` shows it). Failure is logged,
+  # never fatal, and slingshot-cni does not read it.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

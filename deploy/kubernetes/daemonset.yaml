@@ -61,6 +61,13 @@ spec:
             # Slingshot CNI plugin) are written under this host path; it must
             # be mounted writable at the same path below.
             - --cni-hints-dir=/var/run/cxi/net-hints
+            # OPTIONAL Slingshot CNI: uncomment to have the driver install the
+            # bundled slingshot-cni binary onto the node's CNI_PATH at startup
+            # (also uncomment the cni-bin volumeMount and volume below, and
+            # apply deploy/kubernetes/cni/networkattachmentdefinition.yaml).
+            # Requires Multus + Whereabouts on the cluster. Leave commented to
+            # keep using hostNetwork (or SR-IOV) for HSN access instead.
+            # - --cni-install-dir=/opt/cni/bin
           env:
             - name: NODE_NAME
               valueFrom:
@@ -101,6 +108,8 @@ spec:
             - name: env-config
               mountPath: /etc/cxi-dra
               readOnly: true
+            # - name: cni-bin
+            #   mountPath: /opt/cni/bin
 
       volumes:
         - name: sys
@@ -139,3 +148,7 @@ spec:
         - name: env-config
           configMap:
             name: cxi-dra-driver-env
+        # - name: cni-bin
+        #   hostPath:
+        #     path: /opt/cni/bin
+        #     type: DirectoryOrCreate

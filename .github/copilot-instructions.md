@@ -14,7 +14,7 @@ Related repository: **cxi-dra-integration-tests** exercises this driver end-to-e
 |------|------|
 | `cmd/cxi-dra-driver/` | Driver daemon entry point — flags, wiring of all subsystems |
 | `cmd/cxi-cdi-hook/` | Standalone OCI createContainer hook binary, installed on hosts; refreshes the ldconfig cache |
-| `cmd/slingshot-cni/` | Standalone host CNI plugin binary (CGO-free, `make build-cni`), exec'd by containerd/Multus; thin wrapper over `internal/cni` |
+| `cmd/slingshot-cni/` | Host CNI plugin binary (CGO-free, `make build-cni`), bundled in the driver image and optionally installed onto nodes by the driver (`--cni-install-dir`); exec'd by containerd/Multus; thin wrapper over `internal/cni` |
 | `internal/cxi/` | Hardware abstraction: device discovery, capacity, HSN pairing, CXI service CRUD (three build modes: `cxi` CGO, mock, stub) — see [internal/cxi/README.md](../internal/cxi/README.md) |
 | `internal/driver/` | Core DRA plugin: `ClaimBinder`, `ResourceSlice` publishing, `Prepare`/`UnprepareResourceClaims`, namespace VNI allocator, reconciler, reaper, CNI hint-file writer — see [internal/driver/README.md](../internal/driver/README.md) |
 | `internal/cdi/` | CDI spec generation (device/env/NCCL/AWS-OFI-NCCL), hook + ldconfig-runtime installation, containerd drop-in config |
@@ -35,7 +35,7 @@ Scheduler → admission policy (injects CEL capacity selectors) → `ClaimBinder
 make build         # CGO_ENABLED=1, tags=cxi — requires libcxi headers on an ARM64 Slingshot node
 make build-mock    # CGO_ENABLED=0 — no libcxi required, for kind/local dev
 make build-hook    # cxi-cdi-hook is always CGO-free regardless of driver build mode
-make build-cni     # slingshot-cni is always CGO-free; ships separately from the driver image
+make build-cni     # slingshot-cni is always CGO-free; honours GOARCH; bundled into the image (make image depends on it)
 make vet           # go vet ./...
 make image         # container build (FROM scratch; see Dockerfile ENTRYPOINT note in README)
 ```
@@ -59,7 +59,7 @@ CI (`.github/workflows/build.yaml`) runs `go vet`, `go test ./...`, and `golangc
 
 ## Environment variables / flags
 
-Driver flags are defined in `cmd/cxi-dra-driver/main.go`: `--node-name`/`NODE_NAME`, `--pod-uid`/`POD_UID`, `--pod-namespace`/`POD_NAMESPACE` (required); `--driver-name`, `--vni-range-start`/`-end`, `--enable-cdi-env`, `--env-config`, `--cdi-hook-*`, `--cdi-ldconfig-*`, `--mock-devices`, `--system-svc-ids`, `--cni-hints-dir` (default `/var/run/cxi/net-hints`; must match the `hintsDir` in the `slingshot-cni` network config). Full table in [README.md](../README.md#configuration-flags). `slingshot-cni` itself takes no flags — it is configured via its CNI stdin config (`ipam.type` required; `hintsDir`, `retryInterval`, `retryTimeout` optional), see [docs/cni/cni-plugin.md](../docs/cni/cni-plugin.md).
+Driver flags are defined in `cmd/cxi-dra-driver/main.go`: `--node-name`/`NODE_NAME`, `--pod-uid`/`POD_UID`, `--pod-namespace`/`POD_NAMESPACE` (required); `--driver-name`, `--vni-range-start`/`-end`, `--enable-cdi-env`, `--env-config`, `--cdi-hook-*`, `--cdi-ldconfig-*`, `--mock-devices`, `--system-svc-ids`, `--cni-hints-dir` (default `/var/run/cxi/net-hints`; must match the `hintsDir` in the `slingshot-cni` network config), `--cni-install-dir` (default empty = disabled; opt-in host install of the bundled `slingshot-cni` into e.g. `/opt/cni/bin`, Helm `cni.install`), `--cni-src` (default `/slingshot-cni`). Full table in [README.md](../README.md#configuration-flags). `slingshot-cni` itself takes no flags — it is configured via its CNI stdin config (`ipam.type` required; `hintsDir`, `retryInterval`, `retryTimeout` optional), see [docs/cni/cni-plugin.md](../docs/cni/cni-plugin.md).
 
 ## External dependencies
 

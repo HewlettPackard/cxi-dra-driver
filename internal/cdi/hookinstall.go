@@ -30,7 +30,9 @@ const DefaultLdconfigDir = "/var/run/cxi/bin"
 // live on the host filesystem rather than inside any container image — the
 // same constraint that requires nvidia-container-toolkit to install
 // nvidia-cdi-hook onto the host instead of shipping it in application
-// images.
+// images. cmd/cxi-dra-driver reuses it for the optional slingshot-cni host
+// install (--cni-install-dir), which has the identical constraint: CNI
+// plugins are exec'd by containerd from the node's CNI_PATH.
 //
 // The copy is written to a temp file and renamed into place so a hook
 // invocation racing an in-progress DaemonSet rollout never observes a

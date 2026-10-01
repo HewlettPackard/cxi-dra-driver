@@ -7,7 +7,7 @@ applyTo: "**/*.go"
 
 - Module: `github.com/slingshot/cxi-dra-driver`, Go 1.24.
 - Real hardware build (CGO, links libcxi): `make build` — requires an ARM64 Slingshot node with libcxi headers. Never run this on a laptop or generic CI runner.
-- Hardware-free build (kind/local dev, tests, CI): `make build-mock` (driver) / `make build-hook` (hook binary — always CGO-free regardless of driver mode) / `make build-cni` (`slingshot-cni` host CNI plugin — always CGO-free, ships separately from the driver image).
+- Hardware-free build (kind/local dev, tests, CI): `make build-mock` (driver) / `make build-hook` (hook binary — always CGO-free regardless of driver mode) / `make build-cni` (`slingshot-cni` host CNI plugin — always CGO-free, honours `GOARCH`, bundled into the driver image and optionally installed onto nodes by the driver).
 - Unit tests: `go test ./...` — also run in CI (`.github/workflows/build.yaml`).
 - Lint: `golangci-lint run` (config in `.golangci.yml`, includes `gosec`) — also enforced in CI.
 - `make vet` / `go vet ./...` — required.

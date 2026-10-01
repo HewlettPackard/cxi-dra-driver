@@ -1,0 +1,30 @@
+# Slingshot HSN secondary network for the raw-manifest (kubectl) install path.
+# NOT applied by `make deploy` — the Slingshot CNI is optional. Apply only if
+# you also uncommented the --cni-install-dir / cni-bin lines in daemonset.yaml
+# (or installed slingshot-cni onto CNI_PATH yourself), and Multus + Whereabouts
+# are present on the cluster. See docs/cni/cni-plugin.md.
+#
+#   kubectl apply -f deploy/kubernetes/cni/networkattachmentdefinition.yaml
+#
+# Attach to a CXI-claiming pod with:
+#   metadata:
+#     annotations:
+#       k8s.v1.cni.cncf.io/networks: default/slingshot-hsn
+apiVersion: k8s.cni.cncf.io/v1
+kind: NetworkAttachmentDefinition
+metadata:
+  name: slingshot-hsn
+  namespace: default
+spec:
+  config: |
+    {
+      "cniVersion": "1.0.0",
+      "name": "slingshot-hsn",
+      "type": "slingshot-cni",
+      "hintsDir": "/var/run/cxi/net-hints",
+      "ipam": {
+        "type": "whereabouts",
+        "range": "10.200.0.0/16",
+        "exclude": ["10.200.0.0/30"]
+      }
+    }

@@ -67,7 +67,7 @@ MutatingAdmissionPolicy (in-process in API server)
 
 ## Building
 
-The binary must be built on an ARM64 Slingshot node (e.g. `nid001040`) because it links against libcxi via CGo.
+The driver binary must be built on a Slingshot node of the **same architecture as your target nodes** (the examples below are from an ARM64 node, e.g. `nid001040`; x86-64 Slingshot nodes exist too) because it links against libcxi via CGo.
 
 ### 1. Copy host libraries into `bin/`
 
@@ -90,15 +90,16 @@ These paths are for RHEL/SUSE-based Slingshot nodes with glibc 2.38 on ARM64. Ad
 CGO_ENABLED=1 GOOS=linux GOARCH=arm64 go build -tags cxi -o bin/cxi-dra-driver ./cmd/cxi-dra-driver
 ```
 
-### 2b. Build the Slingshot CNI plugin (optional, any machine)
+### 2b. Build the Slingshot CNI plugin
 
-`slingshot-cni` is a separate host binary, not part of the driver image, and is always CGO-free:
+`slingshot-cni` is a CGO-free host binary **bundled into the driver image** (the `Dockerfile` copies `bin/slingshot-cni`), so it must exist before step 3. `make image` builds it automatically; to build it alone:
 
 ```bash
-make build-cni     # → bin/slingshot-cni (GOOS=linux; set GOARCH to match your nodes)
+make build-cni                 # → bin/slingshot-cni for the build host's arch
+make build-cni GOARCH=amd64    # cross-build, e.g. from an arm64 workstation for x86-64 nodes
 ```
 
-Install it on each Slingshot node's `CNI_PATH` (typically `/opt/cni/bin/`) alongside the `whereabouts` IPAM binary, then attach it to pods via a `NetworkAttachmentDefinition` — see [HSN IP Interface (Slingshot CNI)](#hsn-ip-interface-slingshot-cni) and [docs/cni/cni-plugin.md](docs/cni/cni-plugin.md).
+Bundling it does **not** install it on nodes — that is opt-in at deploy time (`cni.install=true`, see [Optional: Slingshot CNI](#optional-slingshot-cni)). Sites that use `hostNetwork` (or, in future, SR-IOV VFs) for HSN access simply leave it off.
 
 ### 3. Build and push the container image
 
@@ -209,6 +210,31 @@ make deploy                                          # clusterrole, deviceclass,
 `make deploy` applies the `ClusterRole`/RBAC, the `DeviceClass`, the `MutatingAdmissionPolicy`, and
 the `DaemonSet` in order. It does **not** apply `configmap.yaml`, which the DaemonSet mounts as
 `cxi-dra-driver-env` for `--enable-cdi-env` — apply it first (as above) or the pods will not start.
+
+#### Optional: Slingshot CNI
+
+The driver works without any CNI involvement — pods reach the HSN via `hostNetwork` (and in future via SR-IOV VFs). If you want each CXI-claiming pod to get its own IP-addressed HSN interface instead, enable the bundled [`slingshot-cni`](#hsn-ip-interface-slingshot-cni). It is off by default and everything below renders nothing until you opt in.
+
+Prerequisites not installed by this chart: **Multus** (secondary-network attachment; provides the `NetworkAttachmentDefinition` CRD) and **Whereabouts** (the `whereabouts` binary on each node's `CNI_PATH` plus its CRDs / `ip-reconciler`).
+
+```bash
+# cni.install     — driver installs slingshot-cni into /opt/cni/bin on every node at startup
+# cni.nad.create  — render a NetworkAttachmentDefinition "slingshot-hsn" into the claim-template namespaces
+# cni.nad.ipam.*  — Whereabouts HSN pool (any Whereabouts option goes under cni.nad.ipam)
+helm install cxi deploy/helm/cxi-dra-driver \
+  --set cni.install=true \
+  --set cni.nad.create=true \
+  --set cni.nad.ipam.range=10.200.0.0/16
+```
+
+| Value | Default | Purpose |
+|---|---|---|
+| `cni.install` | `false` | install the bundled binary into `cni.binDir` via `--cni-install-dir` (atomic, re-done on every driver start so upgrades roll it; left in place on uninstall) |
+| `cni.binDir` | `/opt/cni/bin` | node CNI plugin directory, mounted into the driver pod only when `cni.install=true` |
+| `cni.nad.create` | `false` | render the NAD (`cni.nad.name`, into `cni.nad.namespaces` or, if empty, `resourceClaimTemplates.namespaces`) |
+| `cni.nad.ipam` | `{type: whereabouts, range: 10.200.0.0/16}` | passed through verbatim as the NAD `ipam` block; `type` is required |
+
+Pods then opt in with `k8s.v1.cni.cncf.io/networks: <namespace>/slingshot-hsn`; pods without the annotation are unaffected. For the kubectl path, uncomment the `--cni-install-dir` / `cni-bin` lines in [deploy/kubernetes/daemonset.yaml](deploy/kubernetes/daemonset.yaml) and apply [deploy/kubernetes/cni/networkattachmentdefinition.yaml](deploy/kubernetes/cni/networkattachmentdefinition.yaml).
 
 ### 4. Verify the ResourceSlice
 
@@ -455,7 +481,7 @@ Minimal `NetworkAttachmentDefinition` config (full field reference in [docs/cni/
 }
 ```
 
-`ipam.type` is required. Node prerequisites: `slingshot-cni` and `whereabouts` on `CNI_PATH`, Whereabouts's cluster-side install, Multus (or equivalent) to attach the network, and the driver's `--cni-hints-dir` matching the config's `hintsDir` (both default to `/var/run/cxi/net-hints`). Inside the container the IPVLAN link is visible via `ip link`/`ip addr` but not under the overmounted `/sys/class/net` — that is expected.
+`ipam.type` is required. Node prerequisites: `slingshot-cni` on `CNI_PATH` (installed by the driver when `cni.install=true` / `--cni-install-dir` is set, or by hand), `whereabouts` on `CNI_PATH` plus Whereabouts's cluster-side install, Multus (or equivalent) to attach the network, and the driver's `--cni-hints-dir` matching the config's `hintsDir` (both default to `/var/run/cxi/net-hints`). Inside the container the IPVLAN link is visible via `ip link`/`ip addr` but not under the overmounted `/sys/class/net` — that is expected. Install details: [Optional: Slingshot CNI](#optional-slingshot-cni).
 
 ## CXI Service Programming
 
@@ -508,6 +534,8 @@ deploy/kind/             kind mock-mode test harness (no hardware)
 | `--system-svc-ids` | `""` | Comma-separated svc_ids of blessed system services: never deleted, and their reserved resources are deducted from each device's usable ceiling |
 | `--netns-sysfs-root` | `/var/run/cxi/netns` | Host directory for the per-pod synthetic `/sys/class/net` trees (empty disables HSN sysfs injection) |
 | `--cni-hints-dir` | `/var/run/cxi/net-hints` | Host directory for per-pod CNI hint files read by `slingshot-cni` (empty disables the hint-file write/delete); must match the `hintsDir` in the plugin's network config. See [docs/cni/cnidra-cni-hint-contract.md](docs/cni/cnidra-cni-hint-contract.md) |
+| `--cni-install-dir` | `""` (disabled) | Host CNI plugin directory (e.g. `/opt/cni/bin`, must be a hostPath mounted at the same path) to install the bundled `slingshot-cni` into at startup; requires `--cni-hints-dir`. Opt-in — the driver works without the CNI |
+| `--cni-src` | `/slingshot-cni` | Path of the `slingshot-cni` binary bundled in the image |
 | `--enable-cdi-env` | `false` | Write the `env`/`nccl`/`ofi` CDI specs and inject their device IDs into pods |
 | `--env-config` | `""` | Path to the JSON CDI env config file (required when `--enable-cdi-env`) |
 | `--containerd-config-path` | `""` | Path to write the containerd CDI config drop-in (empty disables) |

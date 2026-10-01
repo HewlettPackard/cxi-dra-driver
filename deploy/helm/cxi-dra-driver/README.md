@@ -15,6 +15,7 @@ A/B two driver versions) and each install is fully isolated.
 | MutatingAdmissionPolicy + Binding | `cxi-slingshot-hpe-com-selector-injection` | only mutates claims carrying this driver |
 | ConfigMap | `cxi-slingshot-hpe-com-env` | `env.json` runtime-library mounts |
 | ResourceClaimTemplates | `cxi-slingshot-hpe-com-{small,medium,large,whole,2-small,2-whole}` | one set per `resourceClaimTemplates.namespaces` entry; point at this install's DeviceClass |
+| NetworkAttachmentDefinition (opt-in) | `slingshot-hsn` | only when `cni.nad.create=true`; one per `cni.nad.namespaces` (falls back to the claim-template namespaces); requires Multus + Whereabouts |
 
 ## Isolation model
 

@@ -1,6 +1,7 @@
 FROM scratch
 COPY bin/cxi-dra-driver /cxi-dra-driver
 COPY bin/cxi-cdi-hook /cxi-cdi-hook
+COPY bin/slingshot-cni /slingshot-cni
 COPY bin/ldconfig /ldconfig
 COPY bin/libcxi.so.1 /usr/lib64/libcxi.so.1
 COPY bin/libnl-3.so.200 /usr/lib64/libnl-3.so.200

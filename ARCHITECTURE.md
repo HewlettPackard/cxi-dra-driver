@@ -15,7 +15,7 @@ For the AI-session domain-model summary (terminology, anti-patterns, known gaps)
 5. Injecting the device, libraries, and environment variables the pod's container needs to use the hardware, via CDI and NRI.
 6. Tearing all of the above down when the pod stops, and cleaning up anything that leaks.
 
-The repository also ships **`slingshot-cni`**, a separate host-side CNI plugin (not part of the DaemonSet image) that gives each claiming pod a real, IP-addressed netdev on the HSN. The driver hands it per-pod state through a host hint file (see §3.4 and §3.5b); it owns L3 addressing only and is complementary to the driver's sysfs-based HSN injection.
+The repository also ships **`slingshot-cni`**, a host-side CNI plugin (bundled in the driver image, optionally installed onto each node's `CNI_PATH` by the driver at startup via `--cni-install-dir`) that gives each claiming pod a real, IP-addressed netdev on the HSN. The driver hands it per-pod state through a host hint file (see §3.4 and §3.5b); it owns L3 addressing only and is complementary to the driver's sysfs-based HSN injection. Its use is opt-in — `hostNetwork` pods (and, in future, SR-IOV VFs) remain first-class ways to reach the HSN, and the driver behaves identically with the CNI absent.
 
 It does **not** implement scheduling itself (that's the Kubernetes DRA scheduler plugin, out of tree) and it does **not** contain end-to-end tests (that's the sibling `cxi-dra-integration-tests` repository, which deploys this driver to a live cluster and exercises it).
 
@@ -25,7 +25,7 @@ It does **not** implement scheduling itself (that's the Kubernetes DRA scheduler
 |-----------|-------------|-----------------|
 | Driver entry point | `cmd/cxi-dra-driver/main.go` | Parses ~23 CLI flags, builds the Kubernetes client, and wires every other component together (see §5, Initialization ordering) |
 | CDI hook binary | `cmd/cxi-cdi-hook/main.go` | Standalone binary, installed onto the host by `internal/cdi`, that refreshes the container's ldconfig cache after CDI bind-mounts libraries in |
-| Slingshot CNI binary | `cmd/slingshot-cni/main.go` | Standalone, CGO-free host CNI plugin (`make build-cni`), exec'd by containerd/Multus — wires `internal/cni`'s `CmdAdd`/`CmdDel`/`CmdCheck` into `skel.PluginMainFuncs` |
+| Slingshot CNI binary | `cmd/slingshot-cni/main.go` | CGO-free host CNI plugin (`make build-cni`), bundled in the driver image and optionally installed onto nodes by the driver (`--cni-install-dir`, reusing `internal/cdi.InstallHook`); exec'd by containerd/Multus — wires `internal/cni`'s `CmdAdd`/`CmdDel`/`CmdCheck` into `skel.PluginMainFuncs` |
 | Hardware layer | `internal/cxi/` | Device discovery (`device.go`), capacity reads (`capacity_cgo.go`/`capacity_stub.go`), HSN pairing (`hsn.go`), GPU co-location (`gpu.go`), CXI service CRUD (`service*.go`) — see [internal/cxi/README.md](internal/cxi/README.md) |
 | DRA plugin core | `internal/driver/` | `ClaimBinder`, `ResourceSlice` publishing, `Prepare`/`UnprepareResourceClaims`, `AllocationStore`, VNI allocator, reconciler, reaper, CNI hint-file writer (`cnihints.go`) — see [internal/driver/README.md](internal/driver/README.md) |
 | CDI integration | `internal/cdi/` | Generates CDI specs (`spec.go`, `env.go`), loads the env config (`config.go`), installs the hook binary and ldconfig runtime onto the host (`hookinstall.go`), writes the containerd drop-in config (`containerd.go`) |
