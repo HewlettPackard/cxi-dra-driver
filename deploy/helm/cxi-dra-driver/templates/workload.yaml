@@ -68,6 +68,12 @@ spec:
         {{- end }}
         - --netns-sysfs-root={{ .Values.driver.netnsSysfsRoot }}
         - --cni-hints-dir={{ .Values.driver.cniHintsDir }}
+        {{- if .Values.cni.install }}
+        {{- if not .Values.driver.cniHintsDir }}
+        {{- fail "cni.install=true requires driver.cniHintsDir to be set; slingshot-cni cannot operate without hint files" }}
+        {{- end }}
+        - --cni-install-dir={{ .Values.cni.binDir }}
+        {{- end }}
         {{- with .Values.driver.extraArgs }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
@@ -112,6 +118,11 @@ spec:
         - name: netns
           mountPath: /var/run/netns
           readOnly: true
+        {{- if .Values.cni.install }}
+        # Same path on both sides so --cni-install-dir is a host path too.
+        - name: cni-bin
+          mountPath: {{ .Values.cni.binDir }}
+        {{- end }}
         {{- if .Values.envConfig.enabled }}
         - name: env-config
           mountPath: /etc/cxi-dra
@@ -151,6 +162,12 @@ spec:
       hostPath:
         path: /var/run/netns
         type: DirectoryOrCreate
+    {{- if .Values.cni.install }}
+    - name: cni-bin
+      hostPath:
+        path: {{ .Values.cni.binDir }}
+        type: DirectoryOrCreate
+    {{- end }}
     {{- if .Values.envConfig.enabled }}
     - name: env-config
       configMap:

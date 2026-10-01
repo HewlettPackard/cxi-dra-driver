@@ -93,6 +93,45 @@ deviceClass:
   # -- Render the DeviceClass that selects this install's ResourceSlices.
   enabled: true
 
+# Optional Slingshot CNI plugin (slingshot-cni). Gives each CXI-claiming pod an
+# L2 IPVLAN netdev on its HSN with a Whereabouts-assigned address — see
+# docs/cni/cni-plugin.md. Entirely OPT-IN: a site may instead keep hostNetwork
+# pods, or (future) SR-IOV VFs, and the driver behaves identically with the
+# CNI absent. Everything below is off by default and renders nothing.
+cni:
+  # -- Install the slingshot-cni binary bundled in the driver image onto each
+  # node's CNI plugin directory at driver startup (atomic temp-file + rename,
+  # re-done on every restart so upgrades roll the plugin too). Adds a hostPath
+  # mount of `binDir` to the driver pod. The binary is left in place on
+  # uninstall — removing a CNI plugin from under running pods is unsafe.
+  install: false
+  # -- Host CNI plugin directory (containerd's CNI_PATH / bin_dir).
+  binDir: /opt/cni/bin
+  nad:
+    # -- Render a NetworkAttachmentDefinition for slingshot-cni. Requires
+    # Multus (for the k8s.cni.cncf.io/v1 CRD and per-pod attachment) and the
+    # Whereabouts binary + CRDs on the cluster; neither is installed by this
+    # chart. Pods opt in with the annotation
+    #   k8s.v1.cni.cncf.io/networks: <namespace>/<name>
+    create: false
+    # -- NAD name.
+    name: slingshot-hsn
+    # -- Namespaces to render the NAD into (one copy each). Falls back to
+    # `resourceClaimTemplates.namespaces` when empty, so the network exists
+    # wherever the claim templates do.
+    namespaces: []
+    # -- Passed through verbatim as the NAD's `ipam` block; any Whereabouts
+    # option (range, exclude, range_start, range_end, …) goes here.
+    # `type` is required by slingshot-cni.
+    ipam:
+      type: whereabouts
+      range: 10.200.0.0/16
+    # -- Hint-file polling bounds while waiting for the driver's hint file
+    # (a safety net; see docs/cni/cnidra-cni-hint-contract.md). Empty uses the
+    # plugin defaults (100ms / 5s).
+    retryInterval: ""
+    retryTimeout: ""
+
 admissionPolicy:
   # -- Render the MutatingAdmissionPolicy + Binding that injects capacity/namespace
   # selectors into claims carrying this install's opaque driver.

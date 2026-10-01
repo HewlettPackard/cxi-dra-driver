@@ -1,0 +1,40 @@
+{{- if .Values.cni.nad.create }}
+{{- $root := . }}
+{{- if not .Values.cni.nad.ipam.type }}
+{{- fail "cni.nad.ipam.type is required (slingshot-cni has no built-in IPAM; use \"whereabouts\")" }}
+{{- end }}
+{{- if not .Values.driver.cniHintsDir }}
+{{- fail "cni.nad.create=true requires driver.cniHintsDir to be set; slingshot-cni cannot operate without hint files" }}
+{{- end }}
+{{- $namespaces := .Values.cni.nad.namespaces }}
+{{- if not $namespaces }}
+{{- $namespaces = .Values.resourceClaimTemplates.namespaces }}
+{{- end }}
+{{- if not $namespaces }}
+{{- $namespaces = list .Values.resourceClaimTemplates.namespace }}
+{{- end }}
+{{- $conf := dict
+      "cniVersion" "1.0.0"
+      "name" .Values.cni.nad.name
+      "type" "slingshot-cni"
+      "hintsDir" .Values.driver.cniHintsDir
+      "ipam" .Values.cni.nad.ipam }}
+{{- with .Values.cni.nad.retryInterval }}{{ $_ := set $conf "retryInterval" . }}{{ end }}
+{{- with .Values.cni.nad.retryTimeout }}{{ $_ := set $conf "retryTimeout" . }}{{ end }}
+{{- range $ns := $namespaces }}
+---
+# Slingshot HSN secondary network (ns: {{ $ns }}). Attach to a pod with
+#   k8s.v1.cni.cncf.io/networks: {{ $ns }}/{{ $root.Values.cni.nad.name }}
+# Requires Multus and Whereabouts on the cluster — neither is installed by this
+# chart. See docs/cni/cni-plugin.md.
+apiVersion: k8s.cni.cncf.io/v1
+kind: NetworkAttachmentDefinition
+metadata:
+  name: {{ $root.Values.cni.nad.name }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "cxi-dra.labels" $root | nindent 4 }}
+spec:
+  config: {{ toJson $conf | quote }}
+{{- end }}
+{{- end }}

@@ -10,6 +10,10 @@ HOOK_BINARY = cxi-cdi-hook
 HOOK_CMD_PATH = ./cmd/cxi-cdi-hook
 CNI_BINARY  = slingshot-cni
 CNI_CMD_PATH = ./cmd/slingshot-cni
+# Target architecture for the CGO-free host binaries. Defaults to the build
+# host's arch; set GOARCH=amd64 when building on an arm64 workstation for
+# x86-64 nodes (or vice versa).
+GOARCH ?= $(shell go env GOARCH)
 
 .PHONY: build build-hook build-cni image push deploy clean kind-load kind-reload
 
@@ -25,12 +29,13 @@ build-hook:
 	CGO_ENABLED=0 GOOS=linux go build -o bin/$(HOOK_BINARY) $(HOOK_CMD_PATH)
 
 # slingshot-cni is invoked directly by containerd/Multus on the host, so it
-# must also stay CGO-free; it ships independently of the driver DaemonSet
-# image built by `image` below.
+# must also stay CGO-free. It is bundled into the driver image (see
+# Dockerfile) and optionally installed onto the node's CNI_PATH by the driver
+# at startup (--cni-install-dir), so `image` depends on it.
 build-cni:
-	CGO_ENABLED=0 GOOS=linux go build -o bin/$(CNI_BINARY) $(CNI_CMD_PATH)
+	CGO_ENABLED=0 GOOS=linux GOARCH=$(GOARCH) go build -o bin/$(CNI_BINARY) $(CNI_CMD_PATH)
 
-image:
+image: build-cni
 	$(CONTAINER_CLI) build --no-cache -t $(IMAGE):$(TAG) .
 
 push: image
@@ -44,7 +49,7 @@ vet:
 
 # kind-load: build dev image and load it into the kind cluster.
 # Removes the old image from the node's containerd first to prevent dedup no-ops.
-kind-load:
+kind-load: build-cni
 	$(CONTAINER_CLI) build --no-cache -t $(KIND_IMAGE) .
 	-$(CONTAINER_CLI) exec $(KIND_CLUSTER)-worker ctr -n k8s.io images rm $(KIND_IMAGE) 2>/dev/null
 	$(CONTAINER_CLI) save $(KIND_IMAGE) | $(CONTAINER_CLI) exec -i $(KIND_CLUSTER)-worker ctr -n k8s.io images import -

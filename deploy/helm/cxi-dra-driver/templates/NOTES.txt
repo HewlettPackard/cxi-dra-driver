@@ -35,3 +35,27 @@ Anti-affinity is ON: every install's pods carry the constant label
 `app: {{ .Values.workload.antiAffinity.label }}`, so this install's pods will not
 share a node with any other CXI DRA install — ideal for side-by-side version testing.
 {{- end }}
+
+{{- if .Values.cni.install }}
+
+Slingshot CNI: the driver installs slingshot-cni into {{ .Values.cni.binDir }} on each
+node at startup. External prerequisites NOT installed by this chart:
+  - Multus (per-pod secondary-network attachment; provides the k8s.cni.cncf.io/v1 CRD)
+  - Whereabouts IPAM: `whereabouts` binary in {{ .Values.cni.binDir }} + its CRDs/ip-reconciler
+Verify on a node:  ls -la {{ .Values.cni.binDir }}/slingshot-cni {{ .Values.cni.binDir }}/whereabouts
+{{- if .Values.cni.nad.create }}
+
+NetworkAttachmentDefinition "{{ .Values.cni.nad.name }}" rendered (ipam: {{ .Values.cni.nad.ipam.type }}).
+Attach it to a CXI-claiming pod with:
+
+  metadata:
+    annotations:
+      k8s.v1.cni.cncf.io/networks: <namespace>/{{ .Values.cni.nad.name }}
+
+Pods without the annotation are unaffected (hostNetwork etc. keep working).
+{{- else }}
+
+No NetworkAttachmentDefinition was rendered (cni.nad.create=false) — create one
+referencing type "slingshot-cni", or set cni.nad.create=true. See docs/cni/cni-plugin.md.
+{{- end }}
+{{- end }}
