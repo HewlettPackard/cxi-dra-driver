@@ -12,7 +12,7 @@ The core DRA (Dynamic Resource Allocation) plugin. This package owns device publ
 | `devicestatus.go` | Publishes per-device status onto the `ResourceSlice` |
 | `prepare.go` | `PrepareResourceClaims` — kubelet plugin hook; reads the namespace's VNI annotation, performs the static ceiling check, stores a `PodAllocation`, returns CDI device IDs |
 | `unprepare.go` | `UnprepareResourceClaims` — kubelet plugin hook; removes the `PodAllocation` on pod deletion |
-| `cnihints.go` | Writes/deletes the per-pod CNI hint file (the Slingshot CNI plugin's read-side contract) and the observability-only pod annotation — see [docs/cnidra-cni-hint-contract.md](../../docs/cnidra-cni-hint-contract.md) |
+| `cnihints.go` | Writes/deletes the per-pod CNI hint file (the read-side contract for `slingshot-cni`, see `internal/cni`) and the observability-only pod annotation — see [docs/cni/cnidra-cni-hint-contract.md](../../docs/cni/cnidra-cni-hint-contract.md) |
 | `store.go` | `AllocationStore` — thread-safe in-memory map of pod UID → `PodAllocation` (device, HSN, VNI, resources) |
 | `reconciler.go` | Poll-driven safety net: periodically rebuilds occupancy from live CXI services, covering driver restarts and missed events |
 | `reaper.go` | Periodically scans for CXI services with no owning pod and deletes them |

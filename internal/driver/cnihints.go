@@ -15,7 +15,7 @@ import (
 // read-side contract for the Slingshot CNI plugin: a
 // CNI plugin invoked by containerd/CRI for RunPodSandbox has no access to
 // this driver's in-process AllocationStore, so the allocation is handed off
-// via a host file instead. See docs/cnidra-cni-hint-contract.md for the full
+// via a host file instead. See docs/cni/cnidra-cni-hint-contract.md for the full
 // contract, including why ordering against CNI ADD is guaranteed.
 type CNIHint struct {
 	Device   string `json:"device"`
@@ -81,7 +81,7 @@ func (d *Driver) deleteCNIHint(podUID types.UID) error {
 // cniHintAnnotationKey is the pod annotation the driver best-effort writes
 // with the same content as the hint file, purely for `kubectl describe pod`
 // visibility. The CNI plugin MUST NOT read this annotation — it reads the
-// hint file written by writeCNIHint. See docs/cnidra-cni-hint-contract.md.
+// hint file written by writeCNIHint. See docs/cni/cnidra-cni-hint-contract.md.
 const cniHintAnnotationKey = "cxi.slingshot.hpe.com/net-hints"
 
 // annotatePodCNIHints best-effort patches the pod's annotations with the same

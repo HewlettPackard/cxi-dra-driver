@@ -28,7 +28,7 @@ Reviews a pending or open diff against this repository's conventions and flags i
 ## Workflow
 
 1. Determine mode (author vs. reviewer) from context; if ambiguous, ask.
-2. Run the appropriate `git diff` and map changed files to components (`cmd/cxi-dra-driver`, `cmd/cxi-cdi-hook`, `internal/cxi`, `internal/driver`, `internal/cdi`, `internal/netsysfs`, `internal/nri`, `deploy/`, `.github/`).
+2. Run the appropriate `git diff` and map changed files to components (`cmd/cxi-dra-driver`, `cmd/cxi-cdi-hook`, `cmd/slingshot-cni`, `internal/cxi`, `internal/driver`, `internal/cdi`, `internal/cni`, `internal/netsysfs`, `internal/nri`, `deploy/`, `.github/`).
 3. Walk the checklist above against the diff; run `go test ./...`, `make vet`, and `golangci-lint run` to confirm before flagging a finding as confirmed vs. suspected.
 4. Report findings grouped by severity (blocking / suggestion / nit), each with a file:line reference.
 5. Never push, edit, commit, or comment on the PR — return the findings for the human to act on.

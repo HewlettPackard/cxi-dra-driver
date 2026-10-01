@@ -6,7 +6,7 @@ import (
 )
 
 // podUIDArgKey is the CNI_ARGS key kubelet populates with the pod's UID on
-// every CNI invocation (see docs/cnidra-cni-hint-contract.md) — no
+// every CNI invocation (see docs/cni/cnidra-cni-hint-contract.md) — no
 // API-server lookup is needed to resolve it.
 const podUIDArgKey = "K8S_POD_UID"
 

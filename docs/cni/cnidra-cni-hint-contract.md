@@ -2,9 +2,9 @@
 
 This document defines the contract by which the CXI DRA driver hands off
 per-pod network information (`hsn_iface`, `vni`, per device) to the Slingshot
-CNI plugin. It is written from the driver side only — **no CNI
-plugin binary exists yet**; this document specifies the read-side contract
-so a future plugin implementation does not have to re-derive it.
+CNI plugin. It specifies the driver-side write contract; the read side is
+implemented by `slingshot-cni` ([internal/cni](../../internal/cni)), described
+in [cni-plugin.md](./cni-plugin.md).
 
 ## Why a file, not an API call
 
@@ -38,7 +38,7 @@ sequenceDiagram
     participant Kubelet
     participant Driver as cxi-dra-driver<br/>(NodePrepareResources)
     participant CRI as containerd/CRI
-    participant CNI as Slingshot CNI plugin<br/>(not yet implemented)
+    participant CNI as Slingshot CNI plugin<br/>(slingshot-cni)
 
     Scheduler->>APIServer: allocate ResourceClaim (device resolved)
     Kubelet->>APIServer: observe ResourceClaim allocation
@@ -92,9 +92,9 @@ the pod, matching how `AllocationStore` merges per-pod state across claims):
   directory already mounted writable into the driver container for
   `--netns-sysfs-root` — no additional volume is required for the driver to
   write hints.
-- The future CNI plugin's execution context should mount this same directory
-  **read-only**, the same way `--netns-sysfs-root` is mounted into the NRI
-  plugin's view today.
+- `slingshot-cni` runs directly on the host (exec'd by containerd/Multus), so
+  it reads this directory in place; it only ever reads, never writes. Its
+  `hintsDir` config field must match the driver's `--cni-hints-dir`.
 
 ## Driver-side lifecycle
 

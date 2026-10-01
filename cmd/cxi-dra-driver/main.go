@@ -57,7 +57,7 @@ func main() {
 		// PrepareResourceClaims time and removes at UnprepareResourceClaims time.
 		// This is the read-side contract for the Slingshot CNI plugin,
 		// invoked locally by containerd/CRI with no access to this
-		// driver's in-process AllocationStore. See docs/cnidra-cni-hint-contract.md.
+		// driver's in-process AllocationStore. See docs/cni/cnidra-cni-hint-contract.md.
 		cniHintsDir = flag.String("cni-hints-dir", "/var/run/cxi/net-hints",
 			"Host directory for per-pod CNI hint files (empty disables the hint-file write/delete)")
 
