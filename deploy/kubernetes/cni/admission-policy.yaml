@@ -1,0 +1,83 @@
+---
+# MutatingAdmissionPolicy: automatically attach the Slingshot network to Pods
+# that reference one of the CXI ResourceClaimTemplates.
+#
+# This policy is kept alongside the Slingshot NetworkAttachmentDefinition
+# because both resources are part of the opt-in CNI configuration.
+#
+# Logic:
+#   - Intercept Pod CREATE
+#   - Match Pods with at least one resourceClaim
+#   - Match CXI ResourceClaimTemplate names
+#   - Skip Pods that already define the Multus networks annotation
+#   - Inject <namespace>/slingshot-hsn as the Multus secondary network
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingAdmissionPolicy
+metadata:
+  name: cxi-dra-slingshot-network-injection
+spec:
+  failurePolicy: Ignore
+  reinvocationPolicy: Never
+
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE"]
+        resources: ["pods"]
+
+  matchConditions:
+    - name: has-resource-claims
+      expression: >
+        has(object.spec.resourceClaims) &&
+        object.spec.resourceClaims.size() > 0
+
+    - name: has-cxi-resource-claim-template
+      expression: >
+        object.spec.resourceClaims.exists(rc,
+          has(rc.resourceClaimTemplateName) &&
+          rc.resourceClaimTemplateName.startsWith("cxi-")
+        )
+
+    - name: no-existing-multus-network
+      expression: >
+        !has(object.metadata.annotations) ||
+        !("k8s.v1.cni.cncf.io/networks" in object.metadata.annotations)
+
+  mutations:
+    - patchType: JSONPatch
+      jsonPatch:
+        expression: >
+          !has(object.metadata.annotations)
+          ? [
+              JSONPatch{
+                op: "add",
+                path: "/metadata/annotations",
+                value: {
+                  "k8s.v1.cni.cncf.io/networks":
+                    object.metadata.namespace + "/slingshot-hsn"
+                }
+              }
+            ]
+          : [
+              JSONPatch{
+                op: "add",
+                path: "/metadata/annotations/" +
+                      jsonpatch.escapeKey("k8s.v1.cni.cncf.io/networks"),
+                value: object.metadata.namespace + "/slingshot-hsn"
+              }
+            ]
+
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingAdmissionPolicyBinding
+metadata:
+  name: cxi-dra-slingshot-network-injection-binding
+spec:
+  policyName: cxi-dra-slingshot-network-injection
+  matchResources:
+    namespaceSelector:
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: NotIn
+          values: ["kube-system"]

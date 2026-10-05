@@ -52,9 +52,12 @@ slingshot-cni (host CNI plugin, invoked by containerd/Multus — see docs/cni/cn
 
 MutatingAdmissionPolicy (in-process in API server)
     └── intercepts ResourceClaim CREATE
-          └── injects CEL selectors from opaque config parameters
-                (e.g. avail_txqs >= 256 && avail_tles >= 512)
-                so the scheduler bin-packs onto devices with sufficient headroom
+    │      └── injects CEL selectors from opaque config parameters
+    │            (e.g. avail_txqs >= 256 && avail_tles >= 512)
+    │          so the scheduler bin-packs onto devices with sufficient │headroom   
+    └── intercepts Pod CREATE
+           └── injects Multus slingshot-hsn network annotation
+                for Pods referencing CXI ResourceClaimTemplates
 ```
 
 ## Requirements
@@ -368,6 +371,29 @@ spec:
 ```
 
 See [deploy/kubernetes/test/pod.yaml](deploy/kubernetes/test/pod.yaml) for a complete example.
+
+### Slingshot CNI auto-attachment
+
+Pods that reference a CXI `ResourceClaimTemplate` do not need to add the
+Multus network-selection annotation manually.
+
+At Pod CREATE admission time, the driver's `MutatingAdmissionPolicy`
+checks `spec.resourceClaims` for a CXI claim-template name. Helm-rendered
+CXI `ResourceClaimTemplate` objects follow the naming convention:
+
+`<fullname>-<template>`
+
+For example:
+
+`cxi-slingshot-hpe-com-small`
+
+When a matching claim is found, the admission policy automatically injects:
+
+```yaml
+metadata:
+  annotations:
+    k8s.v1.cni.cncf.io/networks: <namespace>/slingshot-hsn
+``` 
 
 ### Why pods carry exactly one ResourceClaim
 
