@@ -1,5 +1,6 @@
 {{- if .Values.admissionPolicy.enabled }}
 {{- $driver := include "cxi-dra.driverName" . }}
+{{- $fullname := include "cxi-dra.fullname" . }}
 ---
 # MutatingAdmissionPolicy: inject CEL selectors into ResourceClaims that have
 # an explicit CXI opaque config, so the scheduler only places them on devices
@@ -122,4 +123,98 @@ spec:
           operator: NotIn
           values:
             {{- toYaml .Values.admissionPolicy.excludedNamespaces | nindent 12 }}
+---
+
+{{- if .Values.cni.nad.create }}
+# MutatingAdmissionPolicy: automatically attach the Slingshot network to Pods
+# that reference one of this driver's CXI ResourceClaimTemplates.
+#
+# Logic:
+#   - Intercept Pod CREATE
+#   - Match Pods with at least one resourceClaim
+#   - Match when a ResourceClaimTemplate name starts with <fullname>-
+#   - Skip Pods that already define the Multus networks annotation
+#   - Inject <namespace>/<configured NAD name> as the Multus secondary network
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingAdmissionPolicy
+metadata:
+  name: {{ $fullname }}-slingshot-network-injection
+  labels:
+    {{- include "cxi-dra.labels" . | nindent 4 }}
+spec:
+  failurePolicy: Ignore
+  reinvocationPolicy: Never
+
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE"]
+        resources: ["pods"]
+
+  matchConditions:
+    # Only process Pods that declare ResourceClaims.
+    - name: has-resource-claims
+      expression: >
+        has(object.spec.resourceClaims) &&
+        object.spec.resourceClaims.size() > 0
+
+    # Match Pods that reference one of this chart's CXI ResourceClaimTemplates.
+    # Templates are named <fullname>-<template>, for example:
+    # cxi-slingshot-hpe-com-small.
+    - name: has-cxi-resource-claim-template
+      expression: >
+        object.spec.resourceClaims.exists(rc,
+          has(rc.resourceClaimTemplateName) &&
+          rc.resourceClaimTemplateName.startsWith("{{ $fullname }}-")
+        )
+
+    # Preserve a Multus network selection explicitly supplied by the user.
+    - name: no-existing-multus-network
+      expression: >
+        !has(object.metadata.annotations) ||
+        !("k8s.v1.cni.cncf.io/networks" in object.metadata.annotations)
+
+  mutations:
+    - patchType: JSONPatch
+      jsonPatch:
+        expression: >
+          !has(object.metadata.annotations)
+          ? [
+              JSONPatch{
+                op: "add",
+                path: "/metadata/annotations",
+                value: {
+                  "k8s.v1.cni.cncf.io/networks":
+                    object.metadata.namespace + "/{{ .Values.cni.nad.name }}"
+                }
+              }
+            ]
+          : [
+              JSONPatch{
+                op: "add",
+                path: "/metadata/annotations/" +
+                      jsonpatch.escapeKey("k8s.v1.cni.cncf.io/networks"),
+                value:
+                  object.metadata.namespace + "/{{ .Values.cni.nad.name }}"
+              }
+            ]
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingAdmissionPolicyBinding
+metadata:
+  name: {{ $fullname }}-slingshot-network-injection-binding
+  labels:
+    {{- include "cxi-dra.labels" . | nindent 4 }}
+spec:
+  policyName: {{ $fullname }}-slingshot-network-injection
+  matchResources:
+    namespaceSelector:
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: NotIn
+          values:
+            {{- toYaml .Values.admissionPolicy.excludedNamespaces | nindent 12 }}
+{{- end }}
+
 {{- end }}
