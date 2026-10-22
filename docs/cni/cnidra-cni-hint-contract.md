@@ -79,7 +79,7 @@ the pod, matching how `AllocationStore` merges per-pod state across claims):
 
 | Field | Type | Meaning |
 |---|---|---|
-| `schema_version` | int, optional | Per-entry schema version; absent or `0` denotes the legacy unversioned format, `1` denotes the legacy fields, and `2` adds optional `ifname`. The CNI supports versions through `2`. |
+| `schema_version` | int, optional | Per-entry schema version; absent is treated as `1`. Version `1` includes the optional `ifname`. The CNI supports versions through `1`. |
 | `device` | string | CXI device name, e.g. `cxi0` — matches the `ResourceSlice` device name |
 | `hsn_iface` | string | The host link the CNI attaches the pod interface to: a PF netdev in PF mode or a VF netdev in VF mode. Same value as the device's `hsn_iface` `ResourceSlice` attribute; not necessarily the pod-side name. |
 | `ifname` | string, optional | Preferred pod-side interface name. When absent or empty, the CNI uses `hsn_iface`. |
@@ -89,11 +89,11 @@ the pod, matching how `AllocationStore` merges per-pod state across claims):
 
 The file remains a JSON array. Existing unversioned hints without `ifname`
 continue to work with the same names (`hsn2`, fallback `hsn2_inet`).
-For a distinct pod-side name, the version-2 contract accepts:
+For a distinct pod-side name, the version-1 contract accepts:
 
 ```json
 [
-  { "schema_version": 2, "device": "cxi4", "hsn_iface": "enp197s0f1np0", "ifname": "cxi4", "vni": 137 }
+  { "schema_version": 1, "device": "cxi4", "hsn_iface": "enp197s0f1np0", "ifname": "cxi4", "vni": 137 }
 ]
 ```
 

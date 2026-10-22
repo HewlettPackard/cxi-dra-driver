@@ -77,16 +77,16 @@ All three commands start the same way:
    `schema_version`, and effective name plus `_inet` at most 15 bytes).
 
 The optional `ifname` separates the pod-side name from the host parent:
-`{"schema_version":2,"device":"cxi4","hsn_iface":"enp197s0f1np0","ifname":"cxi4","vni":137}`
+`{"schema_version":1,"device":"cxi4","hsn_iface":"enp197s0f1np0","ifname":"cxi4","vni":137}`
 creates `cxi4` (fallback `cxi4_inet`) on host parent `enp197s0f1np0`.
 The base name must be at most **10 bytes**, leaving five bytes for `_inet`.
 The host parent's length is not subject to that fallback constraint when
 `ifname` is set.
 
-Existing unversioned JSON arrays and hints without `ifname` remain supported;
+Hints without `ifname` and without `schema_version` remain supported;
 absent or empty `ifname` preserves PF naming. Optional per-entry
-`schema_version` supports legacy versions `0`/`1` and version `2` with
-optional naming. Newer versions are logged and rejected, including on
+`schema_version` (absent is treated as `1`) supports version `1`, which
+includes optional naming. Newer versions are logged and rejected, including on
 `DEL`, rather than interpreted as a missing hint. Upgrade the CNI before
 enabling a custom-name writer; older binaries ignore the new fields.
 See the [hint contract](./cnidra-cni-hint-contract.md#naming-and-compatibility)

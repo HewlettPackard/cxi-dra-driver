@@ -177,7 +177,7 @@ func TestCommands_CustomName(t *testing.T) {
 		t.Run(fmt.Sprintf("fallback=%t", fallback), func(t *testing.T) {
 			dir := t.TempDir()
 			const parent = "enp197s0f1np0"
-			mustWriteHint(t, dir, "pod", []Hint{{SchemaVersion: 2, Device: "cxi4", HSNIface: parent, IfName: "cxi4", VNI: 137}})
+			mustWriteHint(t, dir, "pod", []Hint{{SchemaVersion: 1, Device: "cxi4", HSNIface: parent, IfName: "cxi4", VNI: 137}})
 			p, links, ipam, out := testPlugin()
 			wantName := "cxi4"
 			if fallback {
@@ -226,7 +226,7 @@ func TestCommands_RejectInvalidHintsBeforeNetworking(t *testing.T) {
 		name, data, wantError string
 	}{
 		{"long name", `[{"device":"cxi4","hsn_iface":"hsn0","ifname":"12345678901","vni":137}]`, "base name at most 10 bytes"},
-		{"newer schema", `[{"schema_version":3,"device":"cxi4","hsn_iface":"hsn0","vni":137}]`, "unsupported schema_version"},
+		{"newer schema", `[{"schema_version":2,"device":"cxi4","hsn_iface":"hsn0","vni":137}]`, "unsupported schema_version"},
 		{"malformed JSON", `[`, "parsing CNI hint file"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
