@@ -16,54 +16,57 @@ Related repository: **cxi-dra-integration-tests** exercises this driver end-to-e
 | `cmd/cxi-cdi-hook/` | Standalone OCI createContainer hook binary, installed on hosts; refreshes the ldconfig cache |
 | `cmd/slingshot-cni/` | Host CNI plugin binary (CGO-free, `make build-cni`), bundled in the driver image and optionally installed onto nodes by the driver (`--cni-install-dir`); exec'd by containerd/Multus; thin wrapper over `internal/cni` |
 | `internal/cxi/` | Hardware abstraction: device discovery, capacity, HSN pairing, CXI service CRUD (three build modes: `cxi` CGO, mock, stub) — see [internal/cxi/README.md](../internal/cxi/README.md) |
-| `internal/driver/` | Core DRA plugin: `ClaimBinder`, `ResourceSlice` publishing, `Prepare`/`UnprepareResourceClaims`, namespace VNI allocator, reconciler, reaper, CNI hint-file writer — see [internal/driver/README.md](../internal/driver/README.md) |
-| `internal/cdi/` | CDI spec generation (device/env/NCCL/AWS-OFI-NCCL), hook + ldconfig-runtime installation, containerd drop-in config |
+| `internal/driver/` | Core DRA plugin: `ClaimBinder`, consumable-capacity model + static `ResourceSlice` publishing, `Prepare`/`UnprepareResourceClaims`, namespace VNI allocator, orphan-service reaper, CNI hint-file writer — see [internal/driver/README.md](../internal/driver/README.md) |
+| `internal/cdi/` | CDI spec generation (per-device spec + the shared `env` spec attached to every device), `cxi-cdi-hook` + ldconfig-runtime installation, containerd drop-in config |
 | `internal/cni/` | Slingshot CNI `ADD`/`DEL`/`CHECK`: reads the driver's per-pod hint file, creates one L2 IPVLAN sub-interface per claimed device on its host HSN, delegates addressing to Whereabouts IPAM — see [docs/cni/cni-plugin.md](../docs/cni/cni-plugin.md) |
 | `internal/netsysfs/` | Synthetic per-pod `/sys/class/net` tree so stock libfabric discovers the HSN interface |
 | `internal/nri/` | NRI plugin: `RunPodSandbox`/`CreateContainer`/`StopPodSandbox` hooks |
 | `deploy/helm/` | Recommended install path — parameterized Helm chart |
 | `deploy/kubernetes/` | Raw manifests (DaemonSet, ClusterRole, DeviceClass, MutatingAdmissionPolicy) + test fixtures |
-| `.github/` | AI-context files, CI workflow, issue/PR templates, CODEOWNERS |
+| `.github/` | AI-context files, CI workflows, issue/PR templates, dependabot config |
 
 ## Architecture
 
-Scheduler → admission policy (injects CEL capacity selectors) → `ClaimBinder` (fit-check, sets BindingConditions) → kubelet `PrepareResourceClaims` (reads namespace VNI, stores allocation, writes the per-pod CNI hint file, returns CDI IDs) → CDI (`/dev/cxiN` + cgroup BPF) → CNI `ADD` (`slingshot-cni`, separate host process: L2 IPVLAN on the HSN + Whereabouts address, per device) → NRI `RunPodSandbox` (creates CXI service, builds synthetic sysfs) → NRI `CreateContainer` (injects `SLINGSHOT_*` env, bind-mounts sysfs). The CNI interface and the synthetic sysfs are complementary: libfabric discovers the HSN via the sysfs, IP consumers use the IPVLAN netdev. See [ARCHITECTURE.md](../ARCHITECTURE.md) for the full component map and data-flow narrative, [docs/pod-lifecycle-flow.txt](../docs/pod-lifecycle-flow.txt) for the annotated step-by-step, and the `dra-*.d2*` files for diagrams.
+Scheduler (consumable-capacity accounting against the static `ResourceSlice`; the admission policy first converts legacy opaque config into `exactly.capacity.requests`) → `ClaimBinder` (live-hardware safety net, sets BindingConditions: `Ready=True` / `Ready=False` / `Unschedulable` `DeviceAtCapacity`) → kubelet `PrepareResourceClaims` (reads namespace VNI, stores allocation, writes the per-pod CNI hint file, returns CDI IDs) → CDI (`/dev/cxiN` + cgroup BPF) → CNI `ADD` (`slingshot-cni`, separate host process: L2 IPVLAN on the HSN + Whereabouts address, per device) → NRI `RunPodSandbox` (creates CXI service, builds synthetic sysfs) → NRI `CreateContainer` (injects `SLINGSHOT_*` env, bind-mounts sysfs). The CNI interface and the synthetic sysfs are complementary: libfabric discovers the HSN via the sysfs, IP consumers use the IPVLAN netdev. See [ARCHITECTURE.md](../ARCHITECTURE.md) for the full component map and data-flow narrative, [docs/pod-lifecycle-flow.txt](../docs/pod-lifecycle-flow.txt) for the annotated step-by-step, and the `dra-*.d2*` files for diagrams.
 
 ## Build commands
 
 ```bash
-make build         # CGO_ENABLED=1, tags=cxi — requires libcxi headers on an ARM64 Slingshot node
+make build         # CGO_ENABLED=1, tags=cxi — requires libcxi headers on the build host (a Slingshot node); `make image` builds libcxi in-container instead
 make build-mock    # CGO_ENABLED=0 — no libcxi required, for kind/local dev
 make build-hook    # cxi-cdi-hook is always CGO-free regardless of driver build mode
-make build-cni     # slingshot-cni is always CGO-free; honours GOARCH; bundled into the image (make image depends on it)
+make build-cni     # slingshot-cni is always CGO-free; honours GOARCH (the image builds it itself)
 make vet           # go vet ./...
-make image         # container build (FROM scratch; see Dockerfile ENTRYPOINT note in README)
+make image         # production container build: self-contained multi-stage Dockerfile (builds libcxi from pinned SHS sources, driver, cxi-cdi-hook, slingshot-cni; Debian runtime; amd64/arm64)
+make image-mock    # no-hardware image from Dockerfile.mock (used by make kind-load / deploy/kind/setup.sh)
 ```
 
 ## Test commands
 
 ```bash
 go test ./...              # unit tests across internal/cdi, internal/cni, internal/driver, internal/netsysfs, cmd/cxi-cdi-hook
-golangci-lint run          # lint (see .golangci.yml); enforced in CI
+golangci-lint run          # lint; not run in CI
 ```
 
-CI (`.github/workflows/build.yaml`) runs `go vet`, `go test ./...`, and `golangci-lint`. `internal/cxi` and `internal/nri` have no unit tests (hardware/cluster-dependent; exercised via `mock.go` and the sibling `cxi-dra-integration-tests` repo). `internal/cni`'s real-netlink tests (`network_linux_test.go`) need Linux + root and skip otherwise — run them via a privileged container from a non-Linux workstation (see [docs/cni/cni-plugin.md](../docs/cni/cni-plugin.md) § Testing); its orchestration and IPAM-delegate tests run anywhere.
+CI (`.github/workflows/build.yaml`) runs `go vet` and `go test ./...`, then builds the image natively per architecture and merges a multi-arch manifest to ghcr; it does **not** run `golangci-lint`. `.github/workflows/release-chart.yaml` lints/templates and publishes the Helm chart. `internal/cxi` and `internal/nri` have no unit tests (hardware/cluster-dependent; exercised via `mock.go` and the sibling `cxi-dra-integration-tests` repo). `internal/cni`'s real-netlink tests (`network_linux_test.go`) need Linux + root and skip otherwise — run them via a privileged container from a non-Linux workstation (see [docs/cni/cni-plugin.md](../docs/cni/cni-plugin.md) § Testing); its orchestration and IPAM-delegate tests run anywhere.
 
 ## Critical anti-patterns
 
-- **Do not** build the real (`tags cxi`) binary anywhere but an ARM64 Slingshot node with libcxi headers — it links against `libcxi.so` via CGO. Use `build-mock` elsewhere.
+- **Do not** build the real (`tags cxi`) binary anywhere without libcxi headers — it links against `libcxi.so` via CGO. Use `build-mock` elsewhere, or `make image`, which builds libcxi itself.
+- **Do not** let the `Dockerfile`'s libcxi pins (`CASSINI_HEADERS_REF`, `CXI_DRIVER_REF`, `LIBCXI_REF`) drift from the SHS release on the nodes — a userspace/kernel skew surfaces at runtime as `cxil_*` errors, not at build time; nothing needs staging in `bin/` before `make image`.
+- **Do not** reintroduce `avail_*`/`capacity_*` attributes, per-namespace device occupancy, or periodic `ResourceSlice` republishing — the slice is static with consumable capacity, and SHS 14.0.1 lifted the one-namespace-per-device constraint.
+- **Do not** add NCCL/aws-ofi-nccl CDI profiles back — they are injected by k8s-modules; the shared `env` spec is always attached to every device.
 - **Do not** assume `le_pools: 0` / `tle_pools: 0` means "no capacity" — it maps the service to a shared default kernel pool on a best-effort basis, not "unavailable" (see README § Resource field reference).
 - **Do not** hand-roll a VNI per pod — VNIs are namespace-scoped and assigned once by the leader-elected namespace allocator (`internal/driver/vniallocator.go`); pods read the namespace's `cxi.slingshot.hpe.com/vni` annotation.
-- **Do not** skip copying the exact host shared libraries into `bin/` before an image build — the image is `FROM scratch` and has no other way to resolve them at runtime; see README step 1.
 - **Do not** treat `slingshot-cni`'s IPVLAN interface and `internal/netsysfs`'s synthetic sysfs as alternatives — both run; libfabric needs the sysfs, IP consumers need the netdev. Keep netlink calls behind `internal/cni`'s `linkManager` seam (`network_linux.go`/`network_other.go`), override `CNI_IFNAME` per device when delegating to Whereabouts, and keep CNI `DEL` idempotent (missing hint/netns/link = success; only IPVLAN links are ever deleted).
 
 ## Environment variables / flags
 
-Driver flags are defined in `cmd/cxi-dra-driver/main.go`: `--node-name`/`NODE_NAME`, `--pod-uid`/`POD_UID`, `--pod-namespace`/`POD_NAMESPACE` (required); `--driver-name`, `--vni-range-start`/`-end`, `--enable-cdi-env`, `--env-config`, `--cdi-hook-*`, `--cdi-ldconfig-*`, `--mock-devices`, `--system-svc-ids`, `--cni-hints-dir` (default `/var/run/cxi/net-hints`; must match the `hintsDir` in the `slingshot-cni` network config), `--cni-install-dir` (default empty = disabled; opt-in host install of the bundled `slingshot-cni` into e.g. `/opt/cni/bin`, Helm `cni.install`), `--cni-src` (default `/slingshot-cni`). Full table in [README.md](../README.md#configuration-flags). `slingshot-cni` itself takes no flags — it is configured via its CNI stdin config (`ipam.type` required; `hintsDir`, `retryInterval`, `retryTimeout` optional), see [docs/cni/cni-plugin.md](../docs/cni/cni-plugin.md).
+Driver flags are defined in `cmd/cxi-dra-driver/main.go`: `--node-name`/`NODE_NAME`, `--pod-uid`/`POD_UID`, `--pod-namespace`/`POD_NAMESPACE` (required); `--driver-name`, `--vni-range-start`/`-end`, `--resource-refresh-interval` (orphan-service reaper period), `--enable-cdi-env`, `--env-config`, `--cdi-hook-*`, `--cdi-ldconfig-*` (`--cdi-ldconfig-src`/`-linker-src`/`-libc-src` default to `/ldconfig-runtime/{ldconfig,ld.so,libc.so.6}`, bundled in the image), `--mock-devices`, `--system-svc-ids`, `--cni-hints-dir` (default `/var/run/cxi/net-hints`; must match the `hintsDir` in the `slingshot-cni` network config), `--cni-install-dir` (default empty = disabled; opt-in host install of the bundled `slingshot-cni` into e.g. `/opt/cni/bin`, Helm `cni.install`), `--cni-src` (default `/slingshot-cni`). Full table in [README.md](../README.md#configuration-flags). `slingshot-cni` itself takes no flags — it is configured via its CNI stdin config (`ipam.type` required; `hintsDir`, `retryInterval`, `retryTimeout` optional), see [docs/cni/cni-plugin.md](../docs/cni/cni-plugin.md).
 
 ## External dependencies
 
-Kubernetes 1.34+ (stable `resource.k8s.io/v1`; `MutatingAdmissionPolicy` needs 1.32+), containerd ≥2.0 with CDI + NRI enabled, and libcxi (host-provided, not vendored) for the real build. `slingshot-cni` additionally needs the **Whereabouts** IPAM plugin binary on the node's `CNI_PATH` plus its cluster-side install (CRDs, `ip-reconciler`), and Multus (or equivalent) to attach the `slingshot-cni` network to pods; Go-side it depends on `github.com/vishvananda/netlink`. No sibling-repo dependency in this direction — `cxi-dra-integration-tests` depends on this repo, not the reverse.
+Kubernetes 1.36+ (stable `resource.k8s.io/v1`; DRA consumable capacity — the `DRAConsumableCapacity` feature gate — is beta and on by default from 1.36, enable it plus `DRADeviceBindingConditions` on 1.34/1.35; `MutatingAdmissionPolicy` needs 1.32+), containerd ≥2.0 with CDI + NRI enabled, and libcxi (built from pinned SHS sources inside the `Dockerfile`; the host needs only the matching `cxi` kernel driver) for the real build. `slingshot-cni` additionally needs the **Whereabouts** IPAM plugin binary on the node's `CNI_PATH` plus its cluster-side install (CRDs, `ip-reconciler`), and Multus (or equivalent) to attach the `slingshot-cni` network to pods; Go-side it depends on `github.com/vishvananda/netlink`. No sibling-repo dependency in this direction — `cxi-dra-integration-tests` depends on this repo, not the reverse.
 
 ## When to use which agent
 
@@ -89,11 +92,11 @@ See [AGENTS.md](../AGENTS.md) for the full, bidirectional index.
 
 ## Generated / auto-modified files
 
-None hand-generated in source control. `bin/` (build output) and the host libraries copied there before an image build are gitignored build artifacts, not committed.
+None hand-generated in source control. `bin/` (build output) is a gitignored build artifact, not committed.
 
 ## Security
 
-Report vulnerabilities per [SECURITY.md](../SECURITY.md). Sensitive paths (`internal/driver`, `internal/cxi`, `.github/`) have owners in [CODEOWNERS](CODEOWNERS).
+Report vulnerabilities per [SECURITY.md](../SECURITY.md). Treat `internal/driver`, `internal/cxi`, `internal/cdi` host-install paths, and `.github/` as security-relevant; the repo has no `CODEOWNERS` file.
 
 ## Maintenance matrix
 
@@ -105,3 +108,5 @@ Report vulnerabilities per [SECURITY.md](../SECURITY.md). Sensitive paths (`inte
 | Add/remove/rename an agent, prompt, instruction, or skill | This file's customization index, `AGENTS.md` |
 | `internal/driver` public API used across packages | `CONTEXT.md` domain model, `ARCHITECTURE.md` component map |
 | A notable user-facing change | `CHANGELOG.md` |
+| RBAC, `DeviceClass`, or admission-policy content (incl. the VNI allocator Lease name `<driverName>-vni-allocator-leader`) | both `deploy/helm/cxi-dra-driver/` and `deploy/kubernetes/` (and `deploy/kind/test-vni.sh`) |
+| `Dockerfile` libcxi pins, bundled ldconfig runtime, or build workflows | `README.md` § Building, `ARCHITECTURE.md` § CI/CD pipeline |

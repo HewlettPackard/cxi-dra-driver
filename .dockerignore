@@ -1,0 +1,12 @@
+bin/
+.git/
+.github/
+.kube/
+.claude/
+.agent/
+.agents/
+.vscode/
+graphify-out/
+deploy/
+docs/
+*.md

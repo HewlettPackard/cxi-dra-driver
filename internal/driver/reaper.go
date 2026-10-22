@@ -33,9 +33,7 @@ type reapKey struct {
 	svcID      int
 }
 
-// reapOrphanServices destroys CXI services whose owning pod is gone. It is the
-// hardware-side counterpart to reconcileOccupancyFromHardware: the reconciler
-// repairs only the in-memory occupancy map, never the service itself, so a
+// reapOrphanServices destroys CXI services whose owning pod is gone. A
 // service leaked by a force-deleted pod (NRI StopPodSandbox never fired), a
 // driver restart, or out-of-band creation would otherwise hold its VNI and
 // resources on the device forever.
@@ -186,7 +184,7 @@ func netnsInodeAt(path string) (uint64, error) {
 	if err != nil {
 		return 0, err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	var st syscall.Stat_t
 	if err := syscall.Fstat(int(f.Fd()), &st); err != nil {
 		return 0, err

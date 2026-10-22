@@ -7,14 +7,32 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ## [Unreleased]
 
 ### Added
-- `slingshot-cni` is now bundled into the driver image and can be installed onto nodes by the driver itself: new `--cni-install-dir` / `--cni-src` flags (default off), Helm `cni.install` / `cni.binDir`, plus an optional `NetworkAttachmentDefinition` render (`cni.nad.*`). Entirely opt-in — default renders are unchanged and `hostNetwork`/future SR-IOV remain first-class. `make build-cni` honours `GOARCH`; `make image` now depends on it.
+- `slingshot-cni` is now bundled into the driver image and can be installed onto nodes by the driver itself: new `--cni-install-dir` / `--cni-src` flags (default off), Helm `cni.install` / `cni.binDir`, plus an optional `NetworkAttachmentDefinition` render (`cni.nad.*`). Entirely opt-in — default renders are unchanged and `hostNetwork`/future SR-IOV remain first-class. `make build-cni` honours `GOARCH`; the image build compiles `slingshot-cni` itself.
 - `slingshot-cni` now produces a working HSN-backed pod interface end-to-end: on `ADD` it creates one L2 IPVLAN sub-interface per claimed CXI device on the paired host HSN, moves it into the pod netns as `<hsn_iface>` (falling back to `<hsn_iface>_inet`), and delegates addressing to the Whereabouts IPAM plugin per the standard CNI delegate contract; `DEL` releases the address and tears the interface down idempotently; `CHECK` verifies both. Multi-device (`count > 1`) claims are fully supported. The driver's `internal/netsysfs` sysfs injection is unchanged and runs alongside. New dependency: `github.com/vishvananda/netlink`. See `docs/cni/cni-plugin.md`.
-- AI-readiness pass: `.github/copilot-instructions.md`, `CONTEXT.md`, `ARCHITECTURE.md`, `AGENTS.md`, `.github/instructions/*`, `.github/agents/*`, `.github/prompts/*`, `.github/skills/cxi-dra-glossary/`.
-- Repository hygiene: `SECURITY.md`, `CONTRIBUTING.md`, `.github/CODEOWNERS`, `.github/pull_request_template.md`, `.github/ISSUE_TEMPLATE/bug_report.md`, `.gitleaks.toml`, `.github/dependabot.yml`, `.editorconfig`, `.golangci.yml`.
-- CI: `go test ./...` and `golangci-lint run` steps in `.github/workflows/build.yaml` (previously `go vet` only).
+- AI-readiness pass: `.github/copilot-instructions.md`, `CONTEXT.md`, `ARCHITECTURE.md`, `AGENTS.md`, `.github/instructions/*` (including `domain-patterns.instructions.md`), `.github/agents/*`, `.github/prompts/*`, `.github/skills/cxi-dra-glossary/`.
+- Repository hygiene: `SECURITY.md`, `CONTRIBUTING.md`, `.github/pull_request_template.md`, `.github/ISSUE_TEMPLATE/bug_report.md`, `.github/dependabot.yml`, `.editorconfig`.
+- CI: `go test ./...` step in `.github/workflows/build.yaml` (previously `go vet` only).
 - `internal/cxi/README.md` and `internal/driver/README.md` package maps.
+- Consumable-capacity scheduling: devices publish `txqs`, `tgqs`, `eqs`, `cts`, `ptes`, `acs`, `les` and `tles` as DRA consumable capacity (`allowMultipleAllocations`, at the usable ceiling; LE/TLE in whole pools) in a static `ResourceSlice` published once at startup, and the scheduler accounts for allocations via `consumedCapacity` (`internal/driver/capacity.go`). Requires Kubernetes 1.36+ (`DRAConsumableCapacity` is beta and on by default; enable it plus `DRADeviceBindingConditions` on 1.34/1.35).
+- Standard device attributes `resource.kubernetes.io/numaNode` (omitted when unknown) and `resource.kubernetes.io/pciBusID` on every device.
+- `.github/workflows/release-chart.yaml`: lints/templates the Helm chart, publishes it as an OCI artifact on ghcr.io and creates a release, and pushes a `<version>-pr.<n>` prerelease chart for same-repo PRs.
+
+### Changed
+- `Dockerfile` is now a self-contained multi-stage, multi-arch (amd64/arm64) build: it builds libcxi from pinned SHS sources, the driver, `cxi-cdi-hook` and `slingshot-cni`, bundles an ldconfig runtime, and uses a Debian bookworm-slim runtime instead of `FROM scratch`. Nothing needs staging in `bin/`. `Dockerfile.mock` is the no-hardware image used by `make image-mock`, `make kind-load` and `deploy/kind/setup.sh`.
+- `.github/workflows/build.yaml` runs `go vet` and `go test ./...`, builds each architecture natively (no QEMU), and merges the digests into one multi-arch manifest on ghcr.io. It does not run `golangci-lint`.
+- The `MutatingAdmissionPolicy` now converts legacy opaque resource config into `exactly.capacity.requests` instead of injecting `avail_*` CEL selectors.
+- `ClaimBinder` is now a three-way live-hardware safety net (`Ready=True`, `Ready=False`, `Unschedulable` `DeviceAtCapacity`); multiple claims from one namespace may share a device, since SHS 14.0.1 lifted the one-VNI-per-device constraint. The orphan-service reaper, running every `--resource-refresh-interval`, is the remaining backstop.
+- The shared `env` CDI spec (kdreg2/gdrdrv/xpmem device nodes, `/dev/shm`) is now always attached to every CXI device; with `--enable-cdi-env`, the host libraries from `--env-config` are bind-mounted at `/host/env/<basename>` along with the configured env vars. The `ldcache` object in the env config has only `enabled`; hook and ldconfig locations are driver flags (`--cdi-hook-path`, `--cdi-ldconfig-dir`, …).
+- `--cdi-ldconfig-src`, `--cdi-ldconfig-linker-src` and `--cdi-ldconfig-libc-src` now default to `/ldconfig-runtime/{ldconfig,ld.so,libc.so.6}`, the layout of the bundled ldconfig runtime. `cxi-cdi-hook` execs a statically linked ldconfig directly and otherwise runs it through the bundled `ld.so`.
+
+### Fixed
+- The raw `deploy/kubernetes/clusterrole.yaml` Lease role named `cxi-vni-allocator-leader`, but the driver's Lease is `<driverName>-vni-allocator-leader`; it now names `cxi.slingshot.hpe.com-vni-allocator-leader` so the kubectl install path can run the VNI allocator. `deploy/kind/test-vni.sh` follows.
+- Documentation drift after merging the Bristol consumable-capacity work: README flag table and chart defaults, `ARCHITECTURE.md` initialization order and package indexes, `internal/driver/README.md`, `CONTRIBUTING.md`/`SECURITY.md`/PR template claims about CI-enforced linting and files that do not exist.
 
 ### Removed
+- Per-device `avail_*`/`capacity_*` and `active_namespaces` `ResourceSlice` attributes, per-namespace device occupancy tracking, the occupancy reconciler, periodic `ResourceSlice` republishing (`TriggerRepublish`), and the `NamespaceDeviceOccupied` unschedulable reason, all superseded by consumable capacity.
+- The `nccl` and `aws-ofi-nccl` CDI profiles (now injected by k8s-modules); their spec files are deleted on startup. NVIDIA GPU co-location (`gpu.go`) is gone as well, replaced by the standard `numaNode`/`pciBusID` attributes.
+- `Dockerfile.ci` (the production `Dockerfile` is now the CI image too).
 - `docs/superpowers/` (implementation plans and design specs for CDI env integration and namespace VNI allocation) — both features are fully implemented and merged (`internal/cdi/env.go`, `internal/driver/vniallocator.go`); the directory was stale, agentic-framework-specific TDD scaffolding no longer relevant once the work landed.
 
 <!--

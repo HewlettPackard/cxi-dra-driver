@@ -52,15 +52,12 @@ func newClaimBinderHarness(t *testing.T, claims ...*resourceapi.ResourceClaim) (
 	}
 	client := fake.NewSimpleClientset(toRuntimeObjects(objs)...)
 	d := &Driver{
-		driverName:        testDriver,
-		nodeName:          nodePool,
-		devices:           cxi.MockDevices(4), // cxi0..cxi3
-		store:             NewAllocationStore(),
-		kubeClient:        client,
-		notify:            make(chan struct{}, 1),
-		pending:           make(map[pendingKey]pendingEntry),
-		nsDeviceOccupancy: make(map[string]map[string]types.UID),
-		claimToOccupancy:  make(map[types.UID][]occupancyKey),
+		driverName: testDriver,
+		nodeName:   nodePool,
+		devices:    cxi.MockDevices(4), // cxi0..cxi3
+		store:      NewAllocationStore(),
+		kubeClient: client,
+		pending:    make(map[pendingKey]pendingEntry),
 	}
 	binder := NewClaimBinder(d, client, testDriver, nodePool)
 	return binder, d, client
@@ -119,8 +116,8 @@ func TestClaimBinder_EvaluateClaim_GrantsReady(t *testing.T) {
 	if cond.Reason != "DeviceCapacityAvailable" {
 		t.Errorf("Ready reason = %q, want DeviceCapacityAvailable", cond.Reason)
 	}
-	if got := d.nsDeviceOccupancy["ns1"]["cxi0"]; got != "c1" {
-		t.Errorf("occupancy[ns1][cxi0] = %q, want %q", got, "c1")
+	if !hasPend(d, "c1", "cxi0") {
+		t.Errorf("pending[c1, cxi0] not recorded after grant")
 	}
 }
 
@@ -128,8 +125,9 @@ func TestClaimBinder_EvaluateClaim_GrantsReady(t *testing.T) {
 // devices' Ready binding conditions to True — the scheduler will not bind the
 // pod until every allocated device is Ready. Before the multi-device fix the
 // binder only evaluated the first result, leaving cxi1 stuck in
-// BindingConditionsPending forever. Both occupancy slots must be held by the
-// claim; two distinct devices at the same namespace VNI do not violate SHS14.
+// BindingConditionsPending forever. Both devices' pending grants must be held
+// by the claim; two distinct devices at the same namespace VNI do not violate
+// SHS14.
 func TestClaimBinder_EvaluateClaim_MultiDeviceGrantsAllReady(t *testing.T) {
 	claim := makeClaim("c1", "ns1", "claim-1", "cxi0")
 	// Add a second allocated device to the same claim.
@@ -144,43 +142,42 @@ func TestClaimBinder_EvaluateClaim_MultiDeviceGrantsAllReady(t *testing.T) {
 		if cond == nil || cond.Status != metav1.ConditionTrue {
 			t.Fatalf("%s Ready condition = %+v, want Status=True", dev, cond)
 		}
-		if got := d.nsDeviceOccupancy["ns1"][dev]; got != "c1" {
-			t.Errorf("occupancy[ns1][%s] = %q, want %q", dev, got, "c1")
+		if !hasPend(d, "c1", dev) {
+			t.Errorf("pending[c1, %s] not recorded", dev)
 		}
-	}
-	if slots := d.claimToOccupancy["c1"]; len(slots) != 2 {
-		t.Errorf("claimToOccupancy[c1] = %+v, want 2 slots (cxi0, cxi1)", slots)
 	}
 }
 
-// Two claims from the same namespace allocated to the same device: the first
-// gets Ready=True; the second must get Unschedulable=True with reason
-// NamespaceDeviceOccupied so the scheduler reallocates it elsewhere. SHS14
-// would reject the second cxil_alloc_svc with -EEXIST (RX-profile
-// vni_overlap_test) since both claims share the namespace's VNI.
-func TestClaimBinder_EvaluateClaim_SameNsSameDeviceUnschedulable(t *testing.T) {
+// Two claims from the same namespace allocated to the same device: with the
+// SHS14 duplicate-VNI constraint lifted (kernel now permits multiple services
+// sharing a VNI on one device), BOTH claims must be granted Ready=True. The
+// namespace's VNI is reused for co-tenant services on the device; the driver
+// no longer refuses the second grant. Both claims hold a pending grant on the
+// device, independent of one another.
+func TestClaimBinder_EvaluateClaim_SameNsSameDeviceGrants(t *testing.T) {
 	first := makeClaim("c1", "ns1", "first", "cxi0")
 	second := makeClaim("c2", "ns1", "second", "cxi0")
-	binder, _, client := newClaimBinderHarness(t, first, second)
+	binder, d, client := newClaimBinderHarness(t, first, second)
 
 	binder.evaluateClaim(context.Background(), first)
 	binder.evaluateClaim(context.Background(), second)
 
-	// First claim still Ready=True.
-	if cond := conditionFor(t, client, first, "cxi0", "Ready"); cond == nil || cond.Status != metav1.ConditionTrue {
-		t.Fatalf("first Ready = %+v, want Status=True", cond)
+	// Both claims Ready=True: same-namespace co-location on one device.
+	for _, c := range []*resourceapi.ResourceClaim{first, second} {
+		cond := conditionFor(t, client, c, "cxi0", "Ready")
+		if cond == nil || cond.Status != metav1.ConditionTrue {
+			t.Fatalf("claim %s Ready = %+v, want Status=True", c.Name, cond)
+		}
 	}
-	// Second claim Unschedulable=True with the occupancy reason.
-	cond := conditionFor(t, client, second, "cxi0", "Unschedulable")
-	if cond == nil || cond.Status != metav1.ConditionTrue {
-		t.Fatalf("second Unschedulable = %+v, want Status=True", cond)
+	// Neither claim may be marked Unschedulable.
+	for _, c := range []*resourceapi.ResourceClaim{first, second} {
+		if cond := conditionFor(t, client, c, "cxi0", "Unschedulable"); cond != nil && cond.Status == metav1.ConditionTrue {
+			t.Errorf("claim %s Unschedulable=True; duplicate-VNI co-location must be permitted", c.Name)
+		}
 	}
-	if cond.Reason != "NamespaceDeviceOccupied" {
-		t.Errorf("second Unschedulable reason = %q, want NamespaceDeviceOccupied", cond.Reason)
-	}
-	// Second must NOT have been granted Ready=True.
-	if cond := conditionFor(t, client, second, "cxi0", "Ready"); cond != nil && cond.Status == metav1.ConditionTrue {
-		t.Errorf("second was granted Ready=True; SHS14 collision not enforced")
+	// Both claims hold a pending grant on cxi0: same-namespace co-location.
+	if !hasPend(d, "c1", "cxi0") || !hasPend(d, "c2", "cxi0") {
+		t.Errorf("both c1 and c2 must hold a pending grant on cxi0")
 	}
 }
 
@@ -203,11 +200,11 @@ func TestClaimBinder_EvaluateClaim_SameNsDifferentDeviceGrants(t *testing.T) {
 			t.Errorf("claim %s/%s Ready on %s = %+v, want Status=True", c.Namespace, c.Name, dev, cond)
 		}
 	}
-	if got := d.nsDeviceOccupancy["ns1"]["cxi0"]; got != "c1" {
-		t.Errorf("occupancy[ns1][cxi0] = %q, want %q", got, "c1")
+	if !hasPend(d, "c1", "cxi0") {
+		t.Errorf("pending[c1, cxi0] not recorded")
 	}
-	if got := d.nsDeviceOccupancy["ns1"]["cxi1"]; got != "c2" {
-		t.Errorf("occupancy[ns1][cxi1] = %q, want %q", got, "c2")
+	if !hasPend(d, "c2", "cxi1") {
+		t.Errorf("pending[c2, cxi1] not recorded")
 	}
 }
 
@@ -230,50 +227,50 @@ func TestClaimBinder_EvaluateClaim_DifferentNsSameDeviceGrants(t *testing.T) {
 	}
 }
 
-// After RemoveOccupancy frees a (ns, dev) slot (modelling the NRI
-// StopPodSandbox → DestroyService → RemoveOccupancy callback), a second
-// claim from the same namespace must be grantable on that device. This is
-// the unblocking path that prevents permanent stuck-Unschedulable loops.
-func TestClaimBinder_EvaluateClaim_GrantsAfterRemoveOccupancy(t *testing.T) {
+// RemovePending frees a claim's in-flight grant (modelling NRI creating the
+// service and calling RemovePending). A fresh same-namespace claim on the same
+// device still grants Ready=True — same-namespace co-location is permitted now
+// that SHS14's duplicate-VNI constraint is lifted.
+func TestClaimBinder_EvaluateClaim_GrantsAfterRemovePending(t *testing.T) {
 	first := makeClaim("c1", "ns1", "first", "cxi0")
 	second := makeClaim("c2", "ns1", "second", "cxi0")
 	binder, d, client := newClaimBinderHarness(t, first, second)
 
 	binder.evaluateClaim(context.Background(), first)
-	// Simulate the pod stopping: NRI fires RemovePending then RemoveOccupancy.
+	// Simulate the pod's service being created: NRI fires RemovePending.
 	d.RemovePending(types.UID("c1"))
-	d.RemoveOccupancy("ns1", "cxi0")
+
+	if hasPend(d, "c1", "cxi0") {
+		t.Errorf("pending[c1, cxi0] still present after RemovePending")
+	}
 
 	binder.evaluateClaim(context.Background(), second)
 
 	cond := conditionFor(t, client, second, "cxi0", "Ready")
 	if cond == nil || cond.Status != metav1.ConditionTrue {
-		t.Fatalf("second after RemoveOccupancy: Ready = %+v, want Status=True", cond)
+		t.Fatalf("second after RemovePending: Ready = %+v, want Status=True", cond)
 	}
-	if got := d.nsDeviceOccupancy["ns1"]["cxi0"]; got != "c2" {
-		t.Errorf("occupancy[ns1][cxi0] after second grant = %q, want %q", got, "c2")
+	if !hasPend(d, "c2", "cxi0") {
+		t.Errorf("pending[c2, cxi0] not recorded after second grant")
 	}
 }
 
 // When the scheduler clears Status.Allocation (e.g. PostFilter after a
 // PreBind failure, or Unschedulable=True deallocating the claim), the binder
-// must release BOTH pending and the (namespace, device) occupancy slot. NRI's
-// StopPodSandbox cannot be relied on: the pod may never have been admitted,
-// so NRI never sees it. Without this cleanup the slot leaks and the
-// namespace stays pinned to the device in active_namespaces, eventually
-// blocking the namespace from every device on the node as the scheduler
-// keeps retrying. This test reproduces the leak by re-evaluating the same
+// must release the claim's pending grant. NRI's StopPodSandbox cannot be
+// relied on: the pod may never have been admitted, so NRI never sees it.
+// Without this cleanup the pending grant leaks and understates the device's
+// effective capacity. This test reproduces the leak by re-evaluating the same
 // claim with Allocation=nil after the original grant, then verifies that
-// another claim in the same namespace is immediately grantable on the same
-// device.
-func TestClaimBinder_EvaluateClaim_AllocationNilCleansOccupancy(t *testing.T) {
+// another claim on the same device is immediately grantable.
+func TestClaimBinder_EvaluateClaim_AllocationNilCleansPending(t *testing.T) {
 	first := makeClaim("c1", "ns1", "first", "cxi0")
 	second := makeClaim("c2", "ns1", "second", "cxi0")
 	binder, d, client := newClaimBinderHarness(t, first, second)
 
 	binder.evaluateClaim(context.Background(), first)
-	if got := d.nsDeviceOccupancy["ns1"]["cxi0"]; got != "c1" {
-		t.Fatalf("setup: occupancy[ns1][cxi0] = %q, want %q", got, "c1")
+	if !hasPend(d, "c1", "cxi0") {
+		t.Fatalf("setup: pending[c1, cxi0] not recorded")
 	}
 
 	// Simulate the scheduler deallocating: Status.Allocation cleared.
@@ -285,20 +282,13 @@ func TestClaimBinder_EvaluateClaim_AllocationNilCleansOccupancy(t *testing.T) {
 	deallocated.Status.Allocation = nil
 	binder.evaluateClaim(context.Background(), deallocated)
 
-	if got, ok := d.nsDeviceOccupancy["ns1"]["cxi0"]; ok {
-		t.Errorf("ns1/cxi0 slot still present after Allocation=nil; held by %q (this is the leak)", got)
-	}
-	if _, ok := d.claimToOccupancy["c1"]; ok {
-		t.Errorf("claimToOccupancy[c1] still present after Allocation=nil")
-	}
 	if hasPend(d, "c1", "cxi0") {
-		t.Errorf("pending[c1] still present after Allocation=nil")
+		t.Errorf("pending[c1] still present after Allocation=nil (this is the leak)")
 	}
 
-	// Proof-of-life: a second claim in the same namespace on the same
-	// device must now grant cleanly. If the cleanup had been incomplete,
-	// checkAndAddPending would see ns1 still occupying cxi0 (by c1) and
-	// refuse the second grant with occupied=true.
+	// Proof-of-life: a second claim on the same device grants cleanly. The
+	// real assertion above is the leak check: c1's pending grant must be gone
+	// so the device's effective capacity is not understated.
 	binder.evaluateClaim(context.Background(), second)
 	cond := conditionFor(t, client, second, "cxi0", "Ready")
 	if cond == nil || cond.Status != metav1.ConditionTrue {
@@ -306,33 +296,26 @@ func TestClaimBinder_EvaluateClaim_AllocationNilCleansOccupancy(t *testing.T) {
 	}
 }
 
-// A ResourceClaim deletion event must release pending AND the (namespace,
-// device) occupancy slot. A claim can be deleted before NRI's
-// StopPodSandbox fires — force-delete, the pod was never admitted, the
-// scheduler deallocated during a retry — so the binder's watch.Deleted
-// handler is the sole reliable cleanup path. Without it, the slot leaks
-// and the namespace stays pinned to this device in active_namespaces.
-func TestClaimBinder_OnClaimDeleted_CleansOccupancy(t *testing.T) {
+// A ResourceClaim deletion event must release the claim's pending grant. A
+// claim can be deleted before NRI's StopPodSandbox fires — force-delete, the
+// pod was never admitted, the scheduler deallocated during a retry — so the
+// binder's watch.Deleted handler is the sole reliable cleanup path. Without
+// it, the pending grant leaks and understates the device's capacity.
+func TestClaimBinder_OnClaimDeleted_CleansPending(t *testing.T) {
 	first := makeClaim("c1", "ns1", "first", "cxi0")
 	second := makeClaim("c2", "ns1", "second", "cxi0")
 	binder, d, client := newClaimBinderHarness(t, first, second)
 
 	binder.evaluateClaim(context.Background(), first)
-	if got := d.nsDeviceOccupancy["ns1"]["cxi0"]; got != "c1" {
-		t.Fatalf("setup: occupancy[ns1][cxi0] = %q, want %q", got, "c1")
+	if !hasPend(d, "c1", "cxi0") {
+		t.Fatalf("setup: pending[c1, cxi0] not recorded")
 	}
 
 	// Simulate the watch.Deleted event for c1.
 	binder.onClaimDeleted(first)
 
-	if got, ok := d.nsDeviceOccupancy["ns1"]["cxi0"]; ok {
-		t.Errorf("ns1/cxi0 slot still present after onClaimDeleted; held by %q (this is the leak)", got)
-	}
-	if _, ok := d.claimToOccupancy["c1"]; ok {
-		t.Errorf("claimToOccupancy[c1] still present after onClaimDeleted")
-	}
 	if hasPend(d, "c1", "cxi0") {
-		t.Errorf("pending[c1] still present after onClaimDeleted")
+		t.Errorf("pending[c1] still present after onClaimDeleted (this is the leak)")
 	}
 
 	// Proof-of-life: the second claim must now grant on the same device.

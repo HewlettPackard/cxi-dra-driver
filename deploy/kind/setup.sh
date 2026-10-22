@@ -52,7 +52,7 @@ echo "==> Generating go.sum"
 (cd "${REPO_ROOT}" && go mod tidy)
 
 echo "==> Building driver image with ${CONTAINER_CLI}"
-"${CONTAINER_CLI}" build --no-cache -f "${REPO_ROOT}/Dockerfile.ci" -t "${IMAGE}" "${REPO_ROOT}"
+"${CONTAINER_CLI}" build --no-cache -f "${REPO_ROOT}/Dockerfile.mock" -t "${IMAGE}" "${REPO_ROOT}"
 
 echo "==> Loading driver image into kind"
 if [[ "${CONTAINER_CLI}" == "podman" ]]; then

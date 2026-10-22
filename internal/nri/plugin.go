@@ -48,11 +48,9 @@ type Plugin struct {
 	stub             stub.Stub
 	store            *driver.AllocationStore
 	svcMgr           cxi.ServiceManager
-	systemSvcIDs     map[int]bool                       // blessed system-service svc_ids (--system-svc-ids); destroyService refuses to delete these
-	republish        func()                             // triggers immediate ResourceSlice update
-	onServiceCreated func(types.UID)                    // called with claimUID after service creation
-	onServiceDeleted func()                             // called after any service is deleted, triggers binder retry
-	onOccupancyFreed func(namespace, deviceName string) // called per-(ns,dev) after DestroyService to release per-namespace occupancy
+	systemSvcIDs     map[int]bool    // blessed system-service svc_ids (--system-svc-ids); destroyService refuses to delete these
+	onServiceCreated func(types.UID) // called with claimUID after service creation
+	onServiceDeleted func()          // called after any service is deleted, triggers binder retry
 	recordSvcID      func(ctx context.Context, claimUID types.UID, claimNs, claimName, deviceName string, vni, svcID int)
 	netSysfsRoot     string // root dir for per-pod synthetic /sys/class/net trees; "" disables HSN sysfs injection
 	mu               sync.Mutex
@@ -62,21 +60,11 @@ type Plugin struct {
 
 // New creates a new NRI plugin.
 //
-// republish is called after each service create/delete so the ResourceSlice
-// immediately reflects updated avail_*.
-//
 // onServiceCreated(claimUID) is called after a service is successfully created
 // so the driver can remove the pending entry for that claim.
 //
 // onServiceDeleted is called after any service is deleted so the ClaimBinder
 // can immediately re-evaluate claims waiting in Ready=False.
-//
-// onOccupancyFreed(namespace, deviceName) is called for each (ns, device)
-// pair after a successful DestroyService so the driver releases its
-// per-namespace device-occupancy slot. The ClaimBinder uses this slot to
-// enforce SHS14's per-device VNI uniqueness constraint: two claims from
-// the same namespace cannot co-locate on the same device. See the
-// nsDeviceOccupancy field on Driver for details.
 //
 // recordSvcID is called per (claim, device) after CreateService succeeds, to
 // publish the VNI and svc_id on the claim's status for operator introspection
@@ -93,10 +81,8 @@ type Plugin struct {
 func New(
 	store *driver.AllocationStore,
 	mock bool,
-	republish func(),
 	onServiceCreated func(types.UID),
 	onServiceDeleted func(),
-	onOccupancyFreed func(namespace, deviceName string),
 	recordSvcID func(ctx context.Context, claimUID types.UID, claimNs, claimName, deviceName string, vni, svcID int),
 	systemSvcIDs []int,
 	netSysfsRoot string,
@@ -124,10 +110,8 @@ func New(
 		store:            store,
 		svcMgr:           svcMgr,
 		systemSvcIDs:     blessed,
-		republish:        republish,
 		onServiceCreated: onServiceCreated,
 		onServiceDeleted: onServiceDeleted,
-		onOccupancyFreed: onOccupancyFreed,
 		recordSvcID:      recordSvcID,
 		netSysfsRoot:     netSysfsRoot,
 		podStates:        make(map[types.UID]*podState),
@@ -319,9 +303,6 @@ func (p *Plugin) RunPodSandbox(ctx context.Context, pod *api.PodSandbox) error {
 	if claimUID := p.store.ClaimForPod(podUID); claimUID != "" {
 		p.onServiceCreated(claimUID)
 	}
-
-	// Update ResourceSlice immediately so avail_* reflects the new service.
-	p.republish()
 	return nil
 }
 
@@ -431,17 +412,6 @@ func (p *Plugin) StopPodSandbox(_ context.Context, pod *api.PodSandbox) error {
 		if err := p.destroyService(deviceName, svcID); err != nil {
 			fmt.Printf("cxi-nri: warning: deleting service for %s: %v\n", deviceName, err)
 		}
-		// Release the per-namespace occupancy slot for this device. We do
-		// this even if DeleteService returned an error: an undeletable
-		// service may indicate the kernel state diverged from our records,
-		// but holding the occupancy slot forever would permanently bar the
-		// namespace from this device on this driver process. NRI is the
-		// hot path; the ClaimBinder watch (on Allocation=nil or claim
-		// delete) and the driver's polling reconciler cover the
-		// scheduler-side and hardware-drift cases respectively — see
-		// Driver.RemoveOccupancy, RemoveOccupancyForClaim, and
-		// reconcileOccupancyFromHardware.
-		p.onOccupancyFreed(pod.GetNamespace(), deviceName)
 	}
 
 	// Remove the per-pod synthetic /sys/class/net tree. netSysfsDir is
@@ -458,8 +428,6 @@ func (p *Plugin) StopPodSandbox(_ context.Context, pod *api.PodSandbox) error {
 
 	// Tell the binder to re-evaluate Ready=False claims — capacity just freed.
 	p.onServiceDeleted()
-	// Update ResourceSlice immediately so avail_* reflects freed capacity.
-	p.republish()
 	return nil
 }
 
@@ -533,7 +501,7 @@ func netnsInode(pid uint32) (uint64, error) {
 	if err != nil {
 		return 0, fmt.Errorf("open %s: %w", path, err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	var st syscall.Stat_t
 	if err := syscall.Fstat(int(f.Fd()), &st); err != nil {
 		return 0, fmt.Errorf("fstat %s: %w", path, err)

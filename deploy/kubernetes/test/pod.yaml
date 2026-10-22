@@ -1,11 +1,11 @@
 # Single-pod smoke test for a cxi-small claim.
 #
-# Library injection is handled entirely by CDI (cdi_profiles: ["env"] on the
-# cxi-small template injects libfabric, libcxi, libxpmem + transitive deps
-# and updates ld.so.cache). NRI injects SLINGSHOT_DEVICES/VNIS/SVC_IDS env
+# Library injection is handled entirely by CDI (the env spec attached to every
+# CXI device injects libfabric, libcxi, libxpmem + transitive deps and updates
+# ld.so.cache). NRI injects SLINGSHOT_DEVICES/VNIS/SVC_IDS env
 # vars. The only hostPath here is the patched libfabric install carrying the
 # fi_* binaries — its /fi/lib/libfabric.so.1 is the same build CDI injects
-# at /usr/lib64/libfabric.so.1, so there is no ABI drift.
+# at /host/env/libfabric.so.1, so there is no ABI drift.
 #
 # Apply pre-requisites first:
 #   kubectl apply -f deploy/kubernetes/test/resourceclaim.yaml

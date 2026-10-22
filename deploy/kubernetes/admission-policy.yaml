@@ -1,33 +1,33 @@
 ---
-# MutatingAdmissionPolicy: inject CEL selectors into ResourceClaims that have
-# an explicit CXI opaque config, so the scheduler only places them on devices
-# with sufficient available capacity AND no co-tenant from the claim's own
-# namespace.
+# MutatingAdmissionPolicy: convert legacy CXI opaque resource config into
+# consumable-capacity requests, so claims written for the opaque-config API
+# keep working now that devices publish capacity.
+#
+# Devices publish txqs/tgqs/eqs/cts/ptes/acs/les/tles as consumable capacity
+# and the scheduler charges each allocation's requests against them. A claim
+# that only carries opaque config would otherwise consume the capacity
+# defaults, and the driver rejects it at prepare time because the opaque
+# config asks for more than was allocated.
 #
 # This runs in-process in the API server — no webhook, no TLS, no network routing.
 #
 # Logic:
 #   - Intercept ResourceClaim CREATE in any namespace except kube-system
-#   - Match only claims with exactly one request that has our driver's opaque config
-#   - Inject TWO CEL selectors:
-#       1. avail_* >= N capacity checks derived from the opaque parameters
-#       2. namespace exclusion: !active_namespaces.contains(",<claim-ns>,")
-#          steers the scheduler away from devices already occupied by another
-#          claim from this namespace, enforcing SHS14's per-device VNI
-#          uniqueness at scheduling time (the runtime ClaimBinder still acts
-#          as a safety net for the rare race where the ResourceSlice is stale)
-#   - Skip if selectors are already set (user-specified)
-#   - Skip if no opaque config (claim will be rejected at prepare time)
+#   - Match only claims whose first request is "exactly" with no capacity
+#     requests yet, and whose config[0] is this driver's opaque config
+#   - Add exactly.capacity.requests with one entry per resource field present
+#     in the opaque parameters; absent fields fall back to the device's
+#     requestPolicy default
 #
 # LE/TLE pool conversion (must match LEPoolSize/TLEPoolSize in internal/cxi/resources.go):
-#   le_pools  * 1024 = LEs   (LEPoolSize)
-#   tle_pools * 512  = TLEs  (TLEPoolSize)
+#   le_pools  * 1024 = les   (LEPoolSize)
+#   tle_pools * 512  = tles  (TLEPoolSize)
 apiVersion: admissionregistration.k8s.io/v1
 kind: MutatingAdmissionPolicy
 metadata:
-  name: cxi-dra-selector-injection
+  name: cxi-dra-capacity-conversion
 spec:
-  failurePolicy: Ignore  # never block scheduling if policy errors
+  failurePolicy: Ignore  # never block claim creation if the policy errors
   reinvocationPolicy: Never
   matchConstraints:
     resourceRules:
@@ -37,30 +37,18 @@ spec:
         resources:   ["resourceclaims"]
   matchConditions:
     # Only process claims with at least one device request.
-    # The mutation patches requests[0] only; the CXI request must be at index 0
-    # for selector injection to target the right request. With the namespace-
-    # scoped VNI model, claims now carry a single CXI-only request — this
-    # condition still tolerates >1 requests for forward compatibility, but the
-    # supported templates (cxi-small, cxi-medium, cxi-large, cxi-whole) are
-    # single-request.
     - name: has-requests
       expression: >
         object.spec.devices.requests.size() >= 1
 
-    # Only process claims whose first request has exactly set but no selectors yet.
-    # We require exactly to be present because the JSONPatch target path
-    # /spec/devices/requests/0/exactly/selectors requires the parent to exist.
-    - name: no-existing-selectors
+    # Only process claims whose first request has exactly set but no capacity
+    # requests yet (the user's own capacity requests win).
+    - name: no-existing-capacity
       expression: >
         has(object.spec.devices.requests[0].exactly) &&
-        (
-          !has(object.spec.devices.requests[0].exactly.selectors) ||
-          object.spec.devices.requests[0].exactly.selectors.size() == 0
-        )
+        !has(object.spec.devices.requests[0].exactly.capacity)
 
     # Only process claims where config[0] is our driver's opaque config.
-    # The mutation reads config[0] directly, so we assert it is the CXI entry
-    # rather than using exists() which would not guarantee config[0] matches.
     - name: has-cxi-config
       expression: >
         has(object.spec.devices.config) &&
@@ -71,73 +59,52 @@ spec:
   mutations:
     - patchType: JSONPatch
       jsonPatch:
-        # Two selector entries are injected. The DRA scheduler ANDs all
-        # selectors on a request, so each device must pass BOTH the capacity
-        # check (selector 1) AND the namespace exclusion (selector 2) to be
-        # eligible.
-        #
-        # Why a literal namespace string in selector 2 rather than referencing
-        # the claim at scheduling time: the DRA selector CEL context exposes
-        # only `device`. There is no `claim` or `namespace` variable available
-        # to the scheduler's selector evaluator. The only way to filter by the
-        # requesting namespace is to interpolate it at admission time, when
-        # `object.metadata.namespace` IS available — that is precisely what a
-        # MutatingAdmissionPolicy does.
         expression: >
-          [JSONPatch{
-            op: "add",
-            path: "/spec/devices/requests/0/exactly/selectors",
-            value: [
-              {
-                "cel": {
-                  "expression":
-                    (has(object.spec.devices.config[0].opaque.parameters.txqs)
-                      ? "device.attributes[\"cxi.slingshot.hpe.com\"][\"avail_txqs\"] >= " + string(int(object.spec.devices.config[0].opaque.parameters.txqs)) + " && "
-                      : "") +
-                    (has(object.spec.devices.config[0].opaque.parameters.tgqs)
-                      ? "device.attributes[\"cxi.slingshot.hpe.com\"][\"avail_tgqs\"] >= " + string(int(object.spec.devices.config[0].opaque.parameters.tgqs)) + " && "
-                      : "") +
-                    (has(object.spec.devices.config[0].opaque.parameters.eqs)
-                      ? "device.attributes[\"cxi.slingshot.hpe.com\"][\"avail_eqs\"] >= " + string(int(object.spec.devices.config[0].opaque.parameters.eqs)) + " && "
-                      : "") +
-                    (has(object.spec.devices.config[0].opaque.parameters.cts)
-                      ? "device.attributes[\"cxi.slingshot.hpe.com\"][\"avail_cts\"] >= " + string(int(object.spec.devices.config[0].opaque.parameters.cts)) + " && "
-                      : "") +
-                    (has(object.spec.devices.config[0].opaque.parameters.ptes)
-                      ? "device.attributes[\"cxi.slingshot.hpe.com\"][\"avail_ptes\"] >= " + string(int(object.spec.devices.config[0].opaque.parameters.ptes)) + " && "
-                      : "") +
-                    (has(object.spec.devices.config[0].opaque.parameters.acs)
-                      ? "device.attributes[\"cxi.slingshot.hpe.com\"][\"avail_acs\"] >= " + string(int(object.spec.devices.config[0].opaque.parameters.acs)) + " && "
-                      : "") +
-                    (has(object.spec.devices.config[0].opaque.parameters.le_pools)
-                      ? "device.attributes[\"cxi.slingshot.hpe.com\"][\"avail_les\"] >= " + string(int(object.spec.devices.config[0].opaque.parameters.le_pools) * 1024) + " && "
-                      : "") +
-                    (has(object.spec.devices.config[0].opaque.parameters.tle_pools)
-                      ? "device.attributes[\"cxi.slingshot.hpe.com\"][\"avail_tles\"] >= " + string(int(object.spec.devices.config[0].opaque.parameters.tle_pools) * 512) + " && "
-                      : "") +
-                    "true"
-                }
-              },
-              {
-                "cel": {
-                  "expression":
-                    "!device.attributes[\"cxi.slingshot.hpe.com\"][\"active_namespaces\"].contains(\","
-                    + object.metadata.namespace
-                    + ",\")"
-                }
-              }
-            ]
-          }]
+          [JSONPatch{op: "add", path: "/spec/devices/requests/0/exactly/capacity",
+                     value: {"requests": {}}}] +
+          (has(object.spec.devices.config[0].opaque.parameters.txqs)
+            ? [JSONPatch{op: "add", path: "/spec/devices/requests/0/exactly/capacity/requests/txqs",
+                         value: string(int(object.spec.devices.config[0].opaque.parameters.txqs))}]
+            : []) +
+          (has(object.spec.devices.config[0].opaque.parameters.tgqs)
+            ? [JSONPatch{op: "add", path: "/spec/devices/requests/0/exactly/capacity/requests/tgqs",
+                         value: string(int(object.spec.devices.config[0].opaque.parameters.tgqs))}]
+            : []) +
+          (has(object.spec.devices.config[0].opaque.parameters.eqs)
+            ? [JSONPatch{op: "add", path: "/spec/devices/requests/0/exactly/capacity/requests/eqs",
+                         value: string(int(object.spec.devices.config[0].opaque.parameters.eqs))}]
+            : []) +
+          (has(object.spec.devices.config[0].opaque.parameters.cts)
+            ? [JSONPatch{op: "add", path: "/spec/devices/requests/0/exactly/capacity/requests/cts",
+                         value: string(int(object.spec.devices.config[0].opaque.parameters.cts))}]
+            : []) +
+          (has(object.spec.devices.config[0].opaque.parameters.ptes)
+            ? [JSONPatch{op: "add", path: "/spec/devices/requests/0/exactly/capacity/requests/ptes",
+                         value: string(int(object.spec.devices.config[0].opaque.parameters.ptes))}]
+            : []) +
+          (has(object.spec.devices.config[0].opaque.parameters.acs)
+            ? [JSONPatch{op: "add", path: "/spec/devices/requests/0/exactly/capacity/requests/acs",
+                         value: string(int(object.spec.devices.config[0].opaque.parameters.acs))}]
+            : []) +
+          (has(object.spec.devices.config[0].opaque.parameters.le_pools)
+            ? [JSONPatch{op: "add", path: "/spec/devices/requests/0/exactly/capacity/requests/les",
+                         value: string(int(object.spec.devices.config[0].opaque.parameters.le_pools) * 1024)}]
+            : []) +
+          (has(object.spec.devices.config[0].opaque.parameters.tle_pools)
+            ? [JSONPatch{op: "add", path: "/spec/devices/requests/0/exactly/capacity/requests/tles",
+                         value: string(int(object.spec.devices.config[0].opaque.parameters.tle_pools) * 512)}]
+            : [])
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: MutatingAdmissionPolicyBinding
 metadata:
-  name: cxi-dra-selector-injection-binding
+  name: cxi-dra-capacity-conversion-binding
 spec:
-  policyName: cxi-dra-selector-injection
+  policyName: cxi-dra-capacity-conversion
   matchResources:
     namespaceSelector:
       matchExpressions:
         - key: kubernetes.io/metadata.name
           operator: NotIn
-          values: ["kube-system"]
+          values:
+            - kube-system

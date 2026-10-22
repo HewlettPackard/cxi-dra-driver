@@ -1,6 +1,5 @@
 {{- if .Values.resourceClaimTemplates.enabled }}
 {{- $root := . }}
-{{- $driver := include "cxi-dra.driverName" . }}
 {{- $deviceClass := include "cxi-dra.deviceClassName" . }}
 {{- $fullname := include "cxi-dra.fullname" . }}
 {{- $namespaces := .Values.resourceClaimTemplates.namespaces }}
@@ -12,8 +11,10 @@
 ---
 # {{ $fullname }}-{{ $tpl.name }} (ns: {{ $ns }}) — one ResourceClaim per pod
 # allocating CXI NIC(s). The fabric VNI is NOT part of the claim: it is assigned
-# per-namespace by the leader-elected allocator and read at prepare time. All
-# resource fields PLUS cdi_profiles are required — the driver has no defaults.
+# per-namespace by the leader-elected allocator and read at prepare time.
+# Resources are consumable-capacity requests charged against the device by the
+# scheduler; le_pools/tle_pools in values are converted to absolute LEs/TLEs.
+# A field left out of params consumes the device's requestPolicy default.
 apiVersion: resource.k8s.io/v1
 kind: ResourceClaimTemplate
 metadata:
@@ -32,12 +33,17 @@ spec:
             allocationMode: ExactCount
             count: {{ $tpl.count }}
             {{- end }}
-      config:
-        - requests: ["cxi"]
-          opaque:
-            driver: {{ $driver }}
-            parameters:
-              {{- toYaml $tpl.params | nindent 14 }}
+            capacity:
+              requests:
+                {{- range $k, $v := $tpl.params }}
+                {{- if eq $k "le_pools" }}
+                les: {{ mul $v 1024 | quote }}
+                {{- else if eq $k "tle_pools" }}
+                tles: {{ mul $v 512 | quote }}
+                {{- else }}
+                {{ $k }}: {{ $v | quote }}
+                {{- end }}
+                {{- end }}
 {{- end }}
 {{- end }}
 {{- end }}

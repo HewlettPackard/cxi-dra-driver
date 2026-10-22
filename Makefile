@@ -1,8 +1,15 @@
-IMAGE ?= ghcr.io/slingshot/cxi-dra-driver
+IMAGE ?= ghcr.io/bristol-supercomputing/cxi-dra
 TAG   ?= latest
 KIND_CLUSTER ?= cxi-dra-dev
 KIND_IMAGE   ?= localhost/cxi-dra-driver:dev
-CONTAINER_CLI ?= $(shell command -v docker 2>/dev/null || command -v podman-hpc)
+CONTAINER_CLI ?= $(shell command -v docker 2>/dev/null || command -v podman-hpc 2>/dev/null || command -v podman)
+
+# BUILD_ARGS is passed through to the container build. Use it to redirect the
+# base images at an internal mirror on air-gapped sites, or on a machine
+# without Docker Hub credentials:
+#   make image BUILD_ARGS='--build-arg GO_IMAGE=mirror.gcr.io/library/golang:1.24-bookworm \
+#                          --build-arg RUNTIME_IMAGE=mirror.gcr.io/library/debian:bookworm-slim'
+BUILD_ARGS ?=
 
 BINARY      = cxi-dra-driver
 CMD_PATH    = ./cmd/cxi-dra-driver
@@ -15,28 +22,39 @@ CNI_CMD_PATH = ./cmd/slingshot-cni
 # x86-64 nodes (or vice versa).
 GOARCH ?= $(shell go env GOARCH)
 
-.PHONY: build build-hook build-cni image push deploy clean kind-load kind-reload
+.PHONY: build build-mock build-hook build-cni image image-mock push deploy clean kind-load kind-reload
 
+# -buildvcs=false: the production binary is often built as root on a Slingshot
+# node from a tree owned by a different user, which makes git refuse VCS queries
+# ("dubious ownership", exit 128) and aborts the build. We don't need a VCS
+# stamp in the binary, so skip it.
 build: build-hook
-	CGO_ENABLED=1 GOOS=linux go build -tags cxi -o bin/$(BINARY) $(CMD_PATH)
+	CGO_ENABLED=1 GOOS=linux go build -tags cxi -buildvcs=false -o bin/$(BINARY) $(CMD_PATH)
 
 build-mock: build-hook
-	CGO_ENABLED=0 GOOS=linux go build -o bin/$(BINARY) $(CMD_PATH)
+	CGO_ENABLED=0 GOOS=linux go build -buildvcs=false -o bin/$(BINARY) $(CMD_PATH)
 
 # cxi-cdi-hook runs on the bare host (see internal/cdi.InstallHook), so it must
 # stay CGO-free regardless of how the driver binary itself is built.
 build-hook:
-	CGO_ENABLED=0 GOOS=linux go build -o bin/$(HOOK_BINARY) $(HOOK_CMD_PATH)
+	CGO_ENABLED=0 GOOS=linux go build -buildvcs=false -o bin/$(HOOK_BINARY) $(HOOK_CMD_PATH)
 
 # slingshot-cni is invoked directly by containerd/Multus on the host, so it
-# must also stay CGO-free. It is bundled into the driver image (see
-# Dockerfile) and optionally installed onto the node's CNI_PATH by the driver
-# at startup (--cni-install-dir), so `image` depends on it.
+# must also stay CGO-free. The image build compiles it itself (see Dockerfile);
+# this target is for building it standalone.
 build-cni:
-	CGO_ENABLED=0 GOOS=linux GOARCH=$(GOARCH) go build -o bin/$(CNI_BINARY) $(CNI_CMD_PATH)
+	CGO_ENABLED=0 GOOS=linux GOARCH=$(GOARCH) go build -buildvcs=false -o bin/$(CNI_BINARY) $(CNI_CMD_PATH)
 
-image: build-cni
-	$(CONTAINER_CLI) build --no-cache -t $(IMAGE):$(TAG) .
+# image: production image. Builds libcxi, the driver, cxi-cdi-hook and
+# slingshot-cni inside the container, so it needs no host libraries or staged
+# bin/ artifacts and works on any machine and either architecture. Layer caching
+# is safe here, so --no-cache is deliberately not used.
+image:
+	$(CONTAINER_CLI) build $(BUILD_ARGS) -t $(IMAGE):$(TAG) -f Dockerfile .
+
+# image-mock: no-hardware image for kind. See Dockerfile.mock.
+image-mock:
+	$(CONTAINER_CLI) build $(BUILD_ARGS) -t $(IMAGE):$(TAG)-mock -f Dockerfile.mock .
 
 push: image
 	$(CONTAINER_CLI) push $(IMAGE):$(TAG)
@@ -48,9 +66,11 @@ vet:
 	go vet ./...
 
 # kind-load: build dev image and load it into the kind cluster.
+# Uses the mock Dockerfile: kind nodes have no CXI hardware, so the driver runs
+# with --mock-devices and never reaches libcxi.
 # Removes the old image from the node's containerd first to prevent dedup no-ops.
-kind-load: build-cni
-	$(CONTAINER_CLI) build --no-cache -t $(KIND_IMAGE) .
+kind-load:
+	$(CONTAINER_CLI) build --no-cache $(BUILD_ARGS) -t $(KIND_IMAGE) -f Dockerfile.mock .
 	-$(CONTAINER_CLI) exec $(KIND_CLUSTER)-worker ctr -n k8s.io images rm $(KIND_IMAGE) 2>/dev/null
 	$(CONTAINER_CLI) save $(KIND_IMAGE) | $(CONTAINER_CLI) exec -i $(KIND_CLUSTER)-worker ctr -n k8s.io images import -
 

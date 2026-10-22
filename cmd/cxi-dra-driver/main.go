@@ -26,11 +26,13 @@ import (
 
 const defaultDriverName = "cxi.slingshot.hpe.com"
 
-// defaultLinkerSrc and defaultLibcSrc match this repo's own Dockerfile, which
-// today only bundles ARM64 binaries — override via flags on other arches.
+// defaultLdconfigSrc, defaultLinkerSrc and defaultLibcSrc match this repo's
+// Dockerfile, which copies the image's own ldconfig, dynamic linker and libc
+// there under arch-neutral names so one set of defaults serves amd64 and arm64.
 const (
-	defaultLinkerSrc = "/lib/ld-linux-aarch64.so.1"
-	defaultLibcSrc   = "/lib64/libc.so.6"
+	defaultLdconfigSrc = "/ldconfig-runtime/ldconfig"
+	defaultLinkerSrc   = "/ldconfig-runtime/ld.so"
+	defaultLibcSrc     = "/ldconfig-runtime/libc.so.6"
 )
 
 func main() {
@@ -73,7 +75,7 @@ func main() {
 		cniSrc = flag.String("cni-src", "/slingshot-cni", "Path to the slingshot-cni binary bundled in this image")
 
 		refreshInterval = flag.Duration("resource-refresh-interval", 10*time.Second,
-			"How often to republish the ResourceSlice with refreshed available-capacity attributes")
+			"How often the orphan-service reaper checks for CXI services whose pod is gone")
 
 		// Blessed system services: svc_ids the driver must never delete, and
 		// whose reserved resources are deducted from each device's usable
@@ -83,15 +85,16 @@ func main() {
 		systemSvcIDs = flag.String("system-svc-ids", "",
 			"Comma-separated svc_ids of blessed system services: never deleted, and their reserved resources are deducted from the per-device usable ceiling")
 
-		// CDI env spec configuration. When --enable-cdi-env is true, --env-config
-		// must point to a JSON file (typically mounted from a ConfigMap) that
-		// lists the library bind-mounts and env vars for the env/nccl/ofi specs.
-		enableCDIEnv         = flag.Bool("enable-cdi-env", false, "Write env/nccl/ofi CDI specs and inject their device IDs into pods")
+		// CDI env spec configuration. The env spec (kdreg2/gdrdrv/xpmem nodes, /dev/shm)
+		// is always attached to every CXI device; when --enable-cdi-env is true,
+		// --env-config must point to a JSON file (typically mounted from a
+		// ConfigMap) listing the host libraries and env vars it also injects.
+		enableCDIEnv         = flag.Bool("enable-cdi-env", false, "Inject the host libfabric/libcxi libs and env vars from --env-config via the env CDI spec")
 		containerdConfigPath = flag.String("containerd-config-path", "", "Path to write the containerd CDI config drop-in; empty disables")
 		envConfigPath        = flag.String("env-config", "", "Path to the JSON CDI env config file (required when --enable-cdi-env)")
 
-		// cxi-cdi-hook is the createContainer hook the env/nccl/ofi CDI specs
-		// use to refresh ldconfig's cache. It ships baked into this image at
+		// cxi-cdi-hook is the createContainer hook the env CDI spec
+		// uses to refresh ldconfig's cache. It ships baked into this image at
 		// cdiHookSrc and must be installed onto the host at cdiHookPath — CDI
 		// createContainer hooks run in the runtime (host) namespace, so the
 		// binary has to exist on the node filesystem, not just this image.
@@ -102,10 +105,9 @@ func main() {
 		// ldconfig rather than depending on one being pre-installed on the
 		// node. That ldconfig, and the dynamic linker + libc it needs, are
 		// bundled in this image and installed onto the host alongside
-		// cxi-cdi-hook. The linker/libc src paths default to this repo's own
-		// Dockerfile layout (ARM64); override on other architectures.
+		// cxi-cdi-hook. The src paths default to the Dockerfile's layout.
 		cdiLdconfigDir       = flag.String("cdi-ldconfig-dir", cdi.DefaultLdconfigDir, "Host directory to install the ldconfig runtime (ldconfig, its dynamic linker, and libc) into; referenced by generated CDI hooks")
-		cdiLdconfigSrc       = flag.String("cdi-ldconfig-src", "/ldconfig", "Path to the ldconfig binary bundled in this image")
+		cdiLdconfigSrc       = flag.String("cdi-ldconfig-src", defaultLdconfigSrc, "Path to the ldconfig binary bundled in this image")
 		cdiLdconfigLinkerSrc = flag.String("cdi-ldconfig-linker-src", defaultLinkerSrc, "Path to the dynamic linker bundled in this image, used to run the bundled ldconfig")
 		cdiLdconfigLibcSrc   = flag.String("cdi-ldconfig-libc-src", defaultLibcSrc, "Path to the libc bundled in this image, used to run the bundled ldconfig")
 	)
@@ -187,7 +189,6 @@ func main() {
 		MockDevices:          mockDevList,
 		SystemSvcIDs:         sysSvcIDs,
 		RefreshInterval:      *refreshInterval,
-		EnableCDIEnv:         *enableCDIEnv,
 		ContainerdConfigPath: *containerdConfigPath,
 		CDIEnvConfig:         envConfig,
 		CNIHintsDir:          *cniHintsDir,
@@ -216,7 +217,7 @@ func main() {
 
 	binder := driver.NewClaimBinder(d, kubeClient, *driverName, *nodeName)
 
-	nriPlugin, err := nri.New(d.Store(), mock, d.TriggerRepublish, d.RemovePending, binder.TriggerRetry, d.RemoveOccupancy, d.RecordSvcID, sysSvcIDs, *netnsSysfsRoot)
+	nriPlugin, err := nri.New(d.Store(), mock, d.RemovePending, binder.TriggerRetry, d.RecordSvcID, sysSvcIDs, *netnsSysfsRoot)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: failed to create NRI plugin: %v\n", err)
 		os.Exit(1)

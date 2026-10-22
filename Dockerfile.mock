@@ -1,0 +1,31 @@
+# syntax=docker/dockerfile:1
+
+# Mock image for kind / local development on machines with no CXI hardware.
+#
+# NOT FOR PRODUCTION. This builds without the `cxi` build tag, so it compiles
+# internal/cxi/*_stub.go: CreateService and DeleteService return errors, and
+# capacity reads return static fallbacks. Run it with --mock-devices N, which
+# selects cxi.MockServiceManager in internal/nri/plugin.go and keeps the driver
+# off the hardware paths entirely.
+#
+# The production image is Dockerfile -- it builds libcxi from source and needs
+# no host libraries, so it also builds fine on a laptop.
+
+ARG GO_IMAGE=golang:1.24-alpine
+ARG RUNTIME_IMAGE=alpine:3.21
+
+FROM ${GO_IMAGE} AS builder
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -buildvcs=false \
+      -o /cxi-dra-driver ./cmd/cxi-dra-driver
+RUN CGO_ENABLED=0 GOOS=linux go build -buildvcs=false -o /cxi-cdi-hook ./cmd/cxi-cdi-hook
+RUN CGO_ENABLED=0 GOOS=linux go build -buildvcs=false -o /slingshot-cni ./cmd/slingshot-cni
+
+FROM ${RUNTIME_IMAGE}
+COPY --from=builder /cxi-dra-driver /cxi-dra-driver
+COPY --from=builder /cxi-cdi-hook /cxi-cdi-hook
+COPY --from=builder /slingshot-cni /slingshot-cni
+ENTRYPOINT ["/cxi-dra-driver"]

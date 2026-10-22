@@ -20,5 +20,5 @@ Implements changes to the driver's Go source: `cmd/cxi-dra-driver`, `cmd/cxi-cdi
 
 1. Read `CONTEXT.md` for the domain model and anti-patterns before touching `internal/driver` or `internal/nri`.
 2. Match existing godoc comment depth for any new exported symbol (see `internal/driver/claimbinder.go` as the quality bar).
-3. Run `go test ./...`, `make vet`, and `golangci-lint run` before finishing — all three are enforced in CI.
+3. Run `go test ./...`, `make vet`, and `golangci-lint run` before finishing — CI enforces only the first two (`go vet`, `go test`); lint is a local check.
 4. If the change affects `internal/nri` or the real `internal/cxi` hardware path, note in the PR description that it needs live-cluster verification via the sibling `cxi-dra-integration-tests` repo (CI here cannot verify it).

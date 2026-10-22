@@ -4,54 +4,66 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"syscall"
 
 	specs "tags.cncf.io/container-device-interface/specs-go"
 )
 
-// MountSpec is one host→container bind mount in a CDI spec.
-type MountSpec struct {
-	HostPath      string `json:"hostPath"`
-	ContainerPath string `json:"containerPath"`
+// EnvName is the kind suffix and device name of the shared env CDI spec,
+// which is attached next to every prepared CXI device.
+const EnvName = "env"
+
+// EnvHostDir is the container directory the env spec's host libraries are
+// mounted under. Keeping injected files out of the image's own lib
+// directories makes them visible (ls /host/env) and means we never overwrite
+// a file the image ships.
+const EnvHostDir = "/host/env"
+
+// legacyProfileSpecs are the profile specs earlier releases wrote. NCCL and
+// aws-ofi-nccl are now injected by k8s-modules; WriteEnvSpec removes these
+// files so their device IDs stop resolving on nodes upgraded in place.
+var legacyProfileSpecs = []string{"nccl", "aws-ofi-nccl"}
+
+// LdcacheConfig controls the createContainer hook that refreshes the
+// container's ld.so.cache. cxi-cdi-hook writes the folders to
+// /etc/ld.so.conf.d/00-cxi-*.conf, so they are searched ahead of the image's
+// own ld.so.conf.d entries. It does not touch LD_LIBRARY_PATH, which the
+// loader consults first. The hook and ldconfig host paths are driver flags
+// (see CDIEnvConfig.HookPath), not part of this file.
+type LdcacheConfig struct {
+	// Enabled defaults to true when omitted.
+	Enabled *bool `json:"enabled,omitempty"`
 }
 
-// CDIEnvConfig holds the paths and env vars that populate the env, NCCL, and
-// aws-ofi-nccl CDI specs. It is loaded from a JSON file at driver startup
-// (see LoadConfig) so paths can be updated without rebuilding the binary.
+func (c LdcacheConfig) enabled() bool { return c.Enabled == nil || *c.Enabled }
+
+// CDIEnvConfig holds the host runtime the env spec injects. It is loaded from
+// a JSON file at driver startup (see LoadConfig) so paths can be updated
+// without rebuilding the binary. The zero value (--enable-cdi-env unset)
+// yields an env spec with only the side-device nodes and /dev/shm.
 type CDIEnvConfig struct {
-	// EnvMounts is the library bind-mount list for the env spec. Each entry
-	// becomes one ro bind mount. Required when env CDI injection is enabled.
-	EnvMounts []MountSpec `json:"envMounts,omitempty"`
+	Ldcache LdcacheConfig `json:"ldcache,omitzero"`
 
-	// EnvVars is the list of KEY=value env vars added to the env spec, so every
-	// pod that requests the "env" CDI profile receives them. This is the home
-	// for settings every libfabric/CXI container needs — notably
-	// CXIP_SKIP_AMA_CHECK=1, which makes stock libfabric accept the synthetic
-	// HSN netdev whose sysfs the driver overmounts (see internal/netsysfs);
-	// without it libfabric's AMA gate (cxip_if.c:580) drops the device.
-	EnvVars []string `json:"envVars,omitempty"`
+	// Libs are host files (libfabric, libcxi and their dependencies) mounted
+	// read-only at /host/env/<basename>.
+	Libs []string `json:"libs"`
 
-	// NCCLPrefix is the host path bind-mounted to /host/nccl in the NCCL
-	// spec. Empty disables the NCCL spec.
-	NCCLPrefix string `json:"ncclPrefix,omitempty"`
-
-	// AWSofiMounts is the bind-mount list for the aws-ofi-nccl spec
-	// (plugin .so, GDRCopy API, and Spack runtime dependency libs).
-	// Empty disables the aws-ofi-nccl spec.
-	AWSofiMounts []MountSpec `json:"awsOfiMounts,omitempty"`
-
-	// AWSofiEnv is the list of KEY=value env vars added to the
-	// aws-ofi-nccl spec (NCCL_NET, FI_CXI_*, etc).
-	AWSofiEnv []string `json:"awsOfiEnv,omitempty"`
+	// Env is the list of KEY=value env vars set in every CXI container —
+	// notably CXIP_SKIP_AMA_CHECK=1, which makes stock libfabric accept the
+	// synthetic HSN netdev whose sysfs the driver overmounts (see
+	// internal/netsysfs); without it libfabric's AMA gate (cxip_if.c:580)
+	// drops the device.
+	Env []string `json:"env,omitempty"`
 
 	// XpmemPath, GdrDrvPath, and KdReg2Path override device-node host paths in
 	// tests; when empty the standard /dev/xpmem, /dev/gdrdrv, and /dev/kdreg2
-	// are used. kdreg2 is libfabric's kernel-module MR cache monitor
-	// (FI_MR_CACHE_MONITOR=kdreg2); exposing /dev/kdreg2 here — paired with the
-	// libfabric mount — adds the cgroup BPF allowance an unprivileged pod needs
-	// to open it, the same way the userfaultfd monitor would otherwise require
-	// CAP_SYS_PTRACE on a host with vm.unprivileged_userfaultfd=0.
+	// are used. kdreg2 is
+	// libfabric's kernel-module MR cache monitor (FI_MR_CACHE_MONITOR=kdreg2);
+	// exposing /dev/kdreg2 adds the cgroup BPF allowance an unprivileged pod
+	// needs to open it, the same way the userfaultfd monitor would otherwise
+	// require CAP_SYS_PTRACE on a host with vm.unprivileged_userfaultfd=0.
 	XpmemPath  string `json:"-"`
 	GdrDrvPath string `json:"-"`
 	KdReg2Path string `json:"-"`
@@ -67,72 +79,73 @@ type CDIEnvConfig struct {
 	LdconfigDir string `json:"-"`
 }
 
+// EnvDeviceID returns the CDI device ID of the env spec, e.g.
+// "cxi.slingshot.hpe.com/env=env".
 func EnvDeviceID(driverName string) string {
-	return fmt.Sprintf("%s/env=env", driverName)
+	return fmt.Sprintf("%s/%s=%s", driverName, EnvName, EnvName)
 }
 
-func NCCLDeviceID(driverName string) string {
-	return fmt.Sprintf("%s/nccl=nccl", driverName)
+func profileSpecPath(cdiRoot, driverName, name string) string {
+	return filepath.Join(cdiRoot, driverName+"-"+name+".json")
 }
 
-func AWSofiNCCLDeviceID(driverName string) string {
-	return fmt.Sprintf("%s/aws-ofi-nccl=aws-ofi-nccl", driverName)
-}
-
-// WriteEnvSpec writes the shared CXI environment CDI spec containing device
-// nodes, library bind-mounts from cfg.EnvMounts, and the ldcache hook that
-// every CXI container needs. xpmem and gdrdrv device nodes are included only
-// when present on the host.
+// WriteEnvSpec writes the env CDI spec: the xpmem/gdrdrv/kdreg2 device nodes (each
+// only when present on the host), /dev/shm, read-only bind mounts of cfg.Libs
+// under /host/env, cfg.Env, and the ldcache hook. It also removes the spec
+// files of the legacy nccl/aws-ofi-nccl profiles.
 func WriteEnvSpec(cdiRoot, driverName string, cfg CDIEnvConfig) error {
 	if err := os.MkdirAll(cdiRoot, 0o755); err != nil {
 		return err
 	}
-
-	xpmemPath := cfg.XpmemPath
-	if xpmemPath == "" {
-		xpmemPath = "/dev/xpmem"
-	}
-	gdrDrvPath := cfg.GdrDrvPath
-	if gdrDrvPath == "" {
-		gdrDrvPath = "/dev/gdrdrv"
-	}
-	kdreg2Path := cfg.KdReg2Path
-	if kdreg2Path == "" {
-		kdreg2Path = "/dev/kdreg2"
+	for _, name := range legacyProfileSpecs {
+		if err := removeSpec(profileSpecPath(cdiRoot, driverName, name)); err != nil {
+			return fmt.Errorf("removing legacy CDI %s spec: %w", name, err)
+		}
 	}
 
 	var deviceNodes []*specs.DeviceNode
-	for _, p := range []string{xpmemPath, gdrDrvPath, kdreg2Path} {
-		if dn := optionalDeviceNode(p); dn != nil {
+	for _, np := range []struct{ override, def string }{
+		{cfg.XpmemPath, "/dev/xpmem"},
+		{cfg.GdrDrvPath, "/dev/gdrdrv"},
+		{cfg.KdReg2Path, "/dev/kdreg2"},
+	} {
+		hostPath := np.override
+		if hostPath == "" {
+			hostPath = np.def
+		}
+		if dn := optionalDeviceNode(hostPath); dn != nil {
 			deviceNodes = append(deviceNodes, dn)
 		}
 	}
 
-	mounts := []*specs.Mount{
-		{
-			HostPath:      "/dev/shm",
-			ContainerPath: "/dev/shm",
-			Options:       []string{"bind", "rw", "nosuid", "nodev", "private"},
-		},
-	}
-	for _, m := range cfg.EnvMounts {
+	mounts := []*specs.Mount{{
+		HostPath:      "/dev/shm",
+		ContainerPath: "/dev/shm",
+		Options:       []string{"bind", "rw", "nosuid", "nodev", "private"},
+	}}
+	for _, l := range cfg.Libs {
 		mounts = append(mounts, &specs.Mount{
-			HostPath:      m.HostPath,
-			ContainerPath: m.ContainerPath,
-			Options:       []string{"bind", "ro", "nosuid", "private"},
+			HostPath:      l,
+			ContainerPath: path.Join(EnvHostDir, filepath.Base(l)),
+			Options:       []string{"bind", "ro", "nosuid", "nodev", "private"},
 		})
+	}
+
+	var hooks []*specs.Hook
+	if cfg.Ldcache.enabled() && len(cfg.Libs) > 0 {
+		hooks = append(hooks, ldcacheHook(cfg.HookPath, cfg.LdconfigDir, EnvHostDir))
 	}
 
 	spec := &specs.Spec{
 		Version: cdiVersion,
-		Kind:    driverName + "/env",
+		Kind:    driverName + "/" + EnvName,
 		Devices: []specs.Device{{
-			Name: "env",
+			Name: EnvName,
 			ContainerEdits: specs.ContainerEdits{
-				Env:         append([]string(nil), cfg.EnvVars...),
+				Env:         append([]string(nil), cfg.Env...),
 				DeviceNodes: deviceNodes,
 				Mounts:      mounts,
-				Hooks:       []*specs.Hook{ldcacheHook(cfg.HookPath, cfg.LdconfigDir, "/usr/lib64")},
+				Hooks:       hooks,
 			},
 		}},
 	}
@@ -141,12 +154,7 @@ func WriteEnvSpec(cdiRoot, driverName string, cfg CDIEnvConfig) error {
 	if err != nil {
 		return fmt.Errorf("marshalling CDI env spec: %w", err)
 	}
-	return os.WriteFile(filepath.Join(cdiRoot, driverName+"-env.json"), data, 0o644)
-}
-
-// RemoveEnvSpec deletes the env CDI spec file.
-func RemoveEnvSpec(cdiRoot, driverName string) error {
-	return removeSpec(filepath.Join(cdiRoot, driverName+"-env.json"))
+	return os.WriteFile(profileSpecPath(cdiRoot, driverName, EnvName), data, 0o644)
 }
 
 // optionalDeviceNode stats hostPath and returns a DeviceNode if the path exists.
@@ -197,83 +205,4 @@ func removeSpec(path string) error {
 		return err
 	}
 	return nil
-}
-
-// WriteNCCLSpec writes the NCCL CDI spec, mounting cfg.NCCLPrefix into
-// /host/nccl so the container's ldcache can find the NCCL libraries.
-func WriteNCCLSpec(cdiRoot, driverName string, cfg CDIEnvConfig) error {
-	if err := os.MkdirAll(cdiRoot, 0o755); err != nil {
-		return err
-	}
-
-	spec := &specs.Spec{
-		Version: cdiVersion,
-		Kind:    driverName + "/nccl",
-		Devices: []specs.Device{{
-			Name: "nccl",
-			ContainerEdits: specs.ContainerEdits{
-				Mounts: []*specs.Mount{
-					{
-						HostPath:      cfg.NCCLPrefix,
-						ContainerPath: "/host/nccl",
-						Options:       []string{"bind", "ro", "nosuid", "nodev", "private"},
-					},
-				},
-				Hooks: []*specs.Hook{ldcacheHook(cfg.HookPath, cfg.LdconfigDir, "/host/nccl/lib")},
-			},
-		}},
-	}
-
-	data, err := json.MarshalIndent(spec, "", "  ")
-	if err != nil {
-		return fmt.Errorf("marshalling CDI NCCL spec: %w", err)
-	}
-	return os.WriteFile(filepath.Join(cdiRoot, driverName+"-nccl.json"), data, 0o644)
-}
-
-// RemoveNCCLSpec deletes the NCCL CDI spec file.
-func RemoveNCCLSpec(cdiRoot, driverName string) error {
-	return removeSpec(filepath.Join(cdiRoot, driverName+"-nccl.json"))
-}
-
-// WriteAWSofiNCCLSpec writes the AWS OFI NCCL CDI spec, bind-mounting the
-// plugin library, GDRCopy API library, and Spack dependency libs from
-// cfg.AWSofiMounts, and setting the env vars from cfg.AWSofiEnv.
-func WriteAWSofiNCCLSpec(cdiRoot, driverName string, cfg CDIEnvConfig) error {
-	if err := os.MkdirAll(cdiRoot, 0o755); err != nil {
-		return err
-	}
-
-	mounts := make([]*specs.Mount, 0, len(cfg.AWSofiMounts))
-	for _, m := range cfg.AWSofiMounts {
-		mounts = append(mounts, &specs.Mount{
-			HostPath:      m.HostPath,
-			ContainerPath: m.ContainerPath,
-			Options:       []string{"bind", "ro", "nosuid", "nodev", "private"},
-		})
-	}
-
-	spec := &specs.Spec{
-		Version: cdiVersion,
-		Kind:    driverName + "/aws-ofi-nccl",
-		Devices: []specs.Device{{
-			Name: "aws-ofi-nccl",
-			ContainerEdits: specs.ContainerEdits{
-				Env:    append([]string(nil), cfg.AWSofiEnv...),
-				Mounts: mounts,
-				Hooks:  []*specs.Hook{ldcacheHook(cfg.HookPath, cfg.LdconfigDir, "/usr/lib", "/usr/lib64")},
-			},
-		}},
-	}
-
-	data, err := json.MarshalIndent(spec, "", "  ")
-	if err != nil {
-		return fmt.Errorf("marshalling CDI aws-ofi-nccl spec: %w", err)
-	}
-	return os.WriteFile(filepath.Join(cdiRoot, driverName+"-aws-ofi-nccl.json"), data, 0o644)
-}
-
-// RemoveAWSofiNCCLSpec deletes the AWS OFI NCCL CDI spec file.
-func RemoveAWSofiNCCLSpec(cdiRoot, driverName string) error {
-	return removeSpec(filepath.Join(cdiRoot, driverName+"-aws-ofi-nccl.json"))
 }

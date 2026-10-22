@@ -7,7 +7,7 @@ description: >-
   The driver name is parameterized so multiple versions can be installed
   side-by-side: pod anti-affinity keeps each install's pods on distinct nodes.
 type: application
-version: 0.1.0
+version: 0.2.0
 appVersion: "dev"
 keywords:
   - dra

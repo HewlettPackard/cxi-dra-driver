@@ -18,10 +18,10 @@ node_boot: {
   os -> main: "DaemonSet pod scheduled\n(NODE_NAME, POD_UID, POD_NAMESPACE injected as env)"
 
   main -> cxi_pkg: "Discover() [mock or sysfs]"
-  cxi_pkg -> cxi_pkg: "walk /sys/class/cxi_user/*\nread NUMANode, PCIeRoot per device"
+  cxi_pkg -> cxi_pkg: "walk /sys/class/cxi_user/*\nread NUMANode, PCIBusID per device"
   cxi_pkg -> cxi_pkg: "DiscoverHSN(): match HSN iface by PCIe root"
-  cxi_pkg -> cxi_pkg: "GPU co-location: find NUMA-local NVIDIA GPU\n→ republish its PCIe root as resource.kubernetes.io/pcieRoot"
-  cxi_pkg -> cxi_pkg: "ReadAvailableCapacity (-tags cxi: libcxi ioctls)"
+  cxi_pkg -> cxi_pkg: "publish standard attrs:\nresource.kubernetes.io/{numaNode, pciBusID}"
+  cxi_pkg -> cxi_pkg: "read hardware totals + blessed system-service reservation\n(-tags cxi: libcxi ioctls)"
   cxi_pkg -> main: "[]Device{cxi0(hsn2), cxi1(hsn0), ...}"
 
   main -> driver: "driver.New(Config{devices, kubeClient, overhead, ...})"
@@ -35,17 +35,17 @@ node_boot: {
 
   driver -> kubelet: "kubeletplugin.Start (DRA gRPC)\n(plugin socket + registrar)"
   kubelet -> driver: "ACK"
-  driver -> apiserver: "PublishResources (ResourceSlice CXI)\ncxi0..3 with capacity + initial avail_* + active_namespaces=\"\""
+  driver -> apiserver: "PublishResources (ResourceSlice CXI, once)\ncxi0..3: allowMultipleAllocations,\ncapacity txqs…tles = usable ceiling"
 
   main -> binder: "NewClaimBinder(driver, kubeClient)"
   main -> binder: "go binder.Run(ctx) → watch ResourceClaims"
 
   main -> vni_allocator: "StartNamespaceVNIAllocator(KubeClient, Namespace, Identity, VNIStart, VNIEnd)"
-  vni_allocator -> apiserver: "leader-election Lease (cxi-vni-allocator-leader)"
+  vni_allocator -> apiserver: "leader-election Lease (<driverName>-vni-allocator-leader)"
   apiserver -> vni_allocator: "lease acquired / waiting"
   vni_allocator -> apiserver: "(leader) informer watches Namespaces\nqueue.Add for each, patch with VNI"
 
-  driver -> driver: "loop: refresh ticker + d.notify\n→ reconcileOccupancyFromHardware\n→ PublishResources (refresh avail_* + active_namespaces)"
+  driver -> driver: "loop: reaper ticker\n→ reapOrphanServices"
 }
 
 # ── SEQUENCE 2: Namespace Creation → VNI Assignment ──────────────────────────
@@ -96,49 +96,40 @@ pod_lifecycle: {
   user -> apiserver: "kubectl apply -f pod.yaml\n(refs ResourceClaimTemplate cxi-small)"
 
   apiserver -> admission: "ResourceClaim CREATE intercepted"
-  admission -> admission: "CEL: inject opaque CXI config\n(all 8 fields present? injected if not)"
-  admission -> admission: "CEL: inject 2 selectors:\n  (1) avail_* >= request (capacity headroom)\n  (2) !active_namespaces.contains(\",<NS>,\")\n      (per-ns device exclusion; <NS> interpolated literal)"
-  admission -> apiserver: "patched ResourceClaim persisted"
+  admission -> admission: "legacy claim (opaque config, no capacity)?\n  add exactly.capacity.requests\n  (le_pools×1024 → les, tle_pools×512 → tles)\nnative capacity.requests → untouched"
+  admission -> apiserver: "ResourceClaim persisted"
 
   apiserver -> scheduler: "Pod pending\n(resourceClaims: [cxi-template])"
   scheduler -> apiserver: "GET ResourceSlices(driver=cxi.slingshot.hpe.com)"
-  apiserver -> scheduler: "ResourceSlice CXI: cxi0..3 per node\n(avail_txqs, avail_les, ..., active_namespaces)"
-  scheduler -> scheduler: "filter via BOTH CEL selectors\nscore filtered devices\n→ pick node=worker-1, device=cxi0"
-  scheduler -> apiserver: "patch claim.status.allocation\n+ allocation.bindingConditions=[Ready]"
+  apiserver -> scheduler: "ResourceSlice CXI: cxi0..3 per node\n(capacity txqs…tles + requestPolicy)"
+  scheduler -> scheduler: "round request up by requestPolicy\n(les → ×1024, tles → ×512; defaults for unrequested)\nΣ consumedCapacity on device + request ≤ capacity?\n→ pick node=worker-1, device=cxi0"
+  scheduler -> apiserver: "patch claim.status.allocation\n+ consumedCapacity + shareID\n+ bindingConditions=[Ready]"
 
   apiserver -> binder: "watch event: claim allocated to worker-1/cxi0"
-  binder -> binder: "resolve requested ResourceSet from claim config"
+  binder -> binder: "requested = allocation consumedCapacity"
   binder -> binder: "hwAvail = ReadAvailableCapacity(cxi0)"
-  binder -> binder: "checkAndAddPending(claimUID, ns, cxi0, requested, hwAvail) under pendingMu:\n  - nsDeviceOccupancy[ns][cxi0] held by another UID? → occupied=true\n    (SHS14 -EEXIST guard; rare with CEL pre-filter)\n  - else: requested ≤ hwAvail − pending? → granted=true\n  - else → both false (hardware full)"
+  binder -> binder: "checkAndAddPending(claimUID, cxi0, requested, hwAvail) under pendingMu:\n  - requested ≤ hwAvail − pending? → granted=true\n  - else → false (hardware full)"
 
-  # — Happy path: capacity fits AND ns not yet on this device
-  binder -> binder: "granted=true →\n  pending[uid] = {ns, cxi0, resources}\n  nsDeviceOccupancy[ns][cxi0] = uid\n  claimToOccupancy[uid] = {ns, cxi0}"
+  # — Happy path: capacity fits (same-namespace co-location permitted)
+  binder -> binder: "granted=true →\n  pending[(uid,cxi0)] = {cxi0, resources}"
   binder -> apiserver: "patch claim: BindingCondition Ready=True"
-  binder -> binder: "TriggerRepublish (notify chan)"
-  binder -> apiserver: "ResourceSlice republish (avail_* reduced; active_namespaces gains <NS>)"
 
-  # — Alternate A: hardware truly full
-  binder -> binder: "(hardware full) Unschedulable=True\nreason=DeviceAtCapacity"
+  # — Alternate: hardware truly full (only with consumption the scheduler cannot see)
+  binder -> binder: "(hardware full: out-of-band services /\npre-upgrade claims) Unschedulable=True\nreason=DeviceAtCapacity"
   binder -> apiserver: "patch claim: Unschedulable=True (DeviceAtCapacity)"
   binder -> scheduler: "scheduler deallocates + retries"
-
-  # — Alternate B: namespace already on this device (SHS14 guard)
-  binder -> binder: "(occupied) Unschedulable=True\nreason=NamespaceDeviceOccupied"
-  binder -> apiserver: "patch claim: Unschedulable=True (NamespaceDeviceOccupied)"
-  binder -> scheduler: "scheduler deallocates + retries on different device"
 
   # — Scheduler-side cleanup: Allocation cleared (PostFilter / Unschedulable / manual edit)
   scheduler -> apiserver: "patch claim.status.allocation = nil"
   apiserver -> binder: "watch event: claim.status.allocation = nil"
-  binder -> binder: "evaluateClaim(Allocation=nil):\n  RemovePending(uid)\n  RemoveOccupancyForClaim(uid)\n    → removeOccupancyLocked: clears nsDeviceOccupancy[ns][cxi0]\n      and claimToOccupancy[uid]"
-  binder -> binder: "TriggerRepublish (other claims in <NS> can now target cxi0)"
+  binder -> binder: "evaluateClaim(Allocation=nil):\n  RemovePending(uid)"
 
   # Pod binds, kubelet calls prepare
   scheduler -> apiserver: "bind pod to worker-1"
   apiserver -> kubelet: "pod assigned"
   kubelet -> prepare: "NodePrepareResources(claims)"
 
-  prepare -> prepare: "for each device allocated to this driver:\n  resolve ResourceSet from opaque config\n  fast-fail if request > usableCeiling"
+  prepare -> prepare: "for each device allocated to this driver:\n  ResourceSet from consumedCapacity\n  (opaque config fallback; reject if opaque > consumed)\n  fast-fail if request > usableCeiling"
   prepare -> apiserver: "Get namespace/<podNs>\nread annotation cxi.slingshot.hpe.com/vni"
   apiserver -> prepare: "vni = 3"
   prepare -> store: "Set(podUID, [{Device:cxi0, HSN:hsn2, VNI:3, Resources}])"
@@ -156,7 +147,7 @@ pod_lifecycle: {
   cxi_svc -> nri: "serviceID=7"
   nri -> nri: "buildNetSysfs: build synthetic /sys/class/net\n  (host path; HSN BDF + speed read from host /sys/class/net/hsn2)"
   nri -> nri: "podStates[podUID] = {cxi0: svcID=7, netSysfsDir}"
-  nri -> binder: "(via driver) RemovePending(uid)\n  → NOTE: does NOT touch nsDeviceOccupancy"
+  nri -> binder: "(via driver) RemovePending(uid)\n  → grant now reflected in live hardware capacity"
 
   containerd -> nri: "NRI hook: CreateContainer(podUID, container)"
   nri -> nri: "AddEnv SLINGSHOT_DEVICES=cxi0,\n  SLINGSHOT_VNIS=3, SLINGSHOT_SVC_IDS=7"
@@ -169,54 +160,43 @@ pod_lifecycle: {
   containerd -> nri: "NRI hook: StopPodSandbox"
   nri -> cxi_svc: "DestroyService(cxi0, svcID=7)"
   nri -> nri: "RemoveAll netns sysfs tree (<root>/<podUID>)"
-  nri -> binder: "(via driver) RemoveOccupancy(ns, cxi0)\n  → removeOccupancyLocked: clears slot + reverse index\n  → unblocks future claims from same ns on cxi0"
   nri -> binder: "TriggerRetry (unblock Ready=False waiters)"
-  nri -> binder: "TriggerRepublish (active_namespaces loses <NS>)"
 
   kubelet -> prepare: "NodeUnprepareResources(claims)"
-  prepare -> store: "Delete(podUID)\n  → AllocationStore only; does NOT touch occupancy"
+  prepare -> store: "Delete(podUID)\n  → AllocationStore only; does NOT touch pending"
 
   # Claim cleanup (binder catches scheduler-side / force-delete)
   apiserver -> binder: "watch event: ResourceClaim DELETED"
-  binder -> binder: "onClaimDeleted:\n  RemovePending(uid)\n  RemoveOccupancyForClaim(uid)\n    → idempotent no-op if NRI already released"
+  binder -> binder: "onClaimDeleted:\n  RemovePending(uid)\n    → idempotent no-op if NRI already released"
 }
 
-# ── SEQUENCE 4: Polling Reconciler (drift backstop) ──────────────────────────
+# ── SEQUENCE 4: Orphan-service Reaper (drift backstop) ───────────────────────
 
-reconcile_drift: {
+reap_orphans: {
   shape: sequence_diagram
-  title: "Polling Reconciler — Drift Recovery (driver restart, missed events, force-delete)"
+  title: "Orphan-service Reaper — Service Recovery (driver restart, force-delete, NRI short-circuit)"
 
   driver
-  reconciler
+  reaper
   cxi_pkg
-  apiserver
-  pending_state
+  nri
+  svcmgr
 
-  driver -> reconciler: "ticker fires (--resource-refresh-interval)"
-  reconciler -> reconciler: "skip if mockDevices != nil (test build)"
+  driver -> reaper: "ticker fires (--resource-refresh-interval)"
+  reaper -> reaper: "skip if mockDevices != nil (test build)"
 
-  reconciler -> apiserver: "Namespaces().List() [paged]"
-  apiserver -> reconciler: "[{name: alice, annotations[cxi.../vni]: 3},\n {name: bob,   annotations[cxi.../vni]: 7}, ...]"
-  reconciler -> reconciler: "build vniToNS map; filter invalid (missing/0/out-of-range)"
+  reaper -> nri: "LiveSvcIDs() → svc_ids the NRI plugin still owns\n  for live pods, grouped by device"
+  nri -> reaper: "map[dev][]svcID"
 
-  reconciler -> cxi_pkg: "for each advertised device:\n  ReadActiveServiceVNIs(cxiN)"
-  cxi_pkg -> cxi_pkg: "cxil_get_svc_list(dev) →\n  for each svc: cxil_svc_get_vni_range\n  → vmin (== vmax under SHS14 single-VNI services)\n  skip vmin == 0 (system / non-DRA services)"
-  cxi_pkg -> reconciler: "[]uint16 per device: live VNIs"
+  reaper -> cxi_pkg: "for each advertised device:\n  ReadActiveServices(cxiN)"
+  cxi_pkg -> cxi_pkg: "cxil_get_svc_list(dev) →\n  for each svc: {svc_id, vni, is_system_svc}"
+  cxi_pkg -> reaper: "[]ServiceInfo per device (incl. system + VNI-less)"
 
-  reconciler -> reconciler: "build hwSet: {(ns, dev): {} }\n  by joining vniToNS × per-device VNI list"
+  reaper -> reaper: "for each service, PRESERVE if ANY:\n  - svc_id blessed (--system-svc-ids)\n  - is_system_svc bit set\n  - owned by a live pod (LiveSvcIDs)\n  - recorded netns still live on node\n  - netns indeterminate (read error / 0)"
+  reaper -> cxi_pkg: "ReadServiceNetns(dev, svcID) for candidates"
+  cxi_pkg -> reaper: "netns inode (low 32 bits) or error"
 
-  reconciler -> pending_state: "applyReconcile(hwSet) under pendingMu:"
-  pending_state -> pending_state: "for each (ns,dev) in nsDeviceOccupancy with UID u:\n  KEEP if u in pending OR (ns,dev) in hwSet\n  else removeOccupancyLocked(ns, dev)\n        + log 'released leaked occupancy slot'"
-  pending_state -> pending_state: "for each (ns,dev) in hwSet NOT yet in nsDeviceOccupancy:\n  syntheticUID = 'hw:' + dev + '/' + ns\n  nsDeviceOccupancy[ns][dev] = syntheticUID\n  claimToOccupancy[syntheticUID] = {ns, dev}\n  + log 'discovered hardware occupancy (synthetic uid)'"
-  pending_state -> reconciler: "changed = true|false"
-
-  reconciler -> driver: "TriggerRepublish if changed\n  (coalesced with the upcoming publish())"
-  driver -> driver: "publish() — same tick reflects the reconciler's state changes"
-
-  # Self-cleaning case: synthetic entry released after hardware service goes away
-  reconciler -> reconciler: "(next tick after service teardown)"
-  reconciler -> cxi_pkg: "ReadActiveServiceVNIs(cxiN)"
-  cxi_pkg -> reconciler: "(VNI absent — service was destroyed)"
-  reconciler -> pending_state: "applyReconcile(hwSet without (ns,dev)):\n  synthetic UID not in pending AND (ns,dev) not in hwSet\n  → removeOccupancyLocked → slot released, reverse index cleared"
+  reaper -> reaper: "candidate orphaned N consecutive cycles?\n  (grace period — avoids racing a just-created service)"
+  reaper -> svcmgr: "DeleteService(dev, svcID) for confirmed orphans"
+  svcmgr -> cxi_pkg: "cxil_destroy_svc(dev, svcID)"
 }

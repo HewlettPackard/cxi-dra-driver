@@ -14,9 +14,13 @@
 # in a partially-allocated state, so the DRA Score plugin cannot hit the
 # "number of allocations N is smaller than number of claims" mismatch.
 #
-# All resource fields PLUS cdi_profiles are required — the driver has no
-# defaults. Claims without opaque config (or with any missing field) will
-# be rejected at prepare time with a clear error.
+# Resources are consumable-capacity requests: each device publishes txqs,
+# tgqs, eqs, cts, ptes, acs, les and tles as capacity, and the scheduler
+# charges every allocation's requests against it. A resource left out of
+# capacity.requests consumes the device default (the cxi-small queue sizes,
+# 0 LEs/TLEs). LEs and TLEs are absolute counts; the scheduler rounds them up
+# to whole pools (1024 LEs, 512 TLEs). Claims still using the old opaque
+# config (le_pools/tle_pools etc.) are converted by the admission policy.
 #
 # Parameter reference (concise — see README "Resource field reference" for
 # the source-grounded explanation of what each field actually controls):
@@ -33,32 +37,30 @@
 #               RX) plus memory regions / rendezvous / collectives on demand.
 #   acs       — Address contexts (memory protection / IOMMU); reused via the
 #               libfabric MR cache so typical jobs need only a few.
-#   le_pools  — List-entry pools (1 pool = 1024 LEs). 0 = use the shared
-#               default pool (best effort); >0 = reserve N pools exclusively
+#   les       — List entries, in pools of 1024. 0 = use the shared
+#               default pool (best effort); >0 = reserve whole pools exclusively
 #               for guaranteed capacity under contention.
-#   tle_pools — Triggered list-entry pools (1 pool = 512 TLEs). 0 = shared
+#   tles      — Triggered list entries, in pools of 512. 0 = shared
 #               default; only triggered operations (NCCL allreduce trees,
 #               counter-triggered MPI collectives) consume TLEs.
 #
-# cdi_profiles — required list of optional CDI specs to inject into the pod
-#                alongside the per-device /dev/cxiN node:
-#   "env"          — libcxi / libfabric / userspace runtime libraries
-#   "nccl"         — NCCL libraries from the configured Spack prefix
-#   "aws-ofi-nccl" — AWS-OFI NCCL plugin and tuning env vars
-#   []             — no injection; use when the container image already
-#                    carries libfabric/libcxi (BYO runtime)
+# CDI injection needs no parameter: every device also gets the driver's env
+# spec (/dev/kdreg2, /dev/gdrdrv, /dev/xpmem, /dev/shm, and with
+# --enable-cdi-env the host libfabric/libcxi under /host/env plus
+# CXIP_SKIP_AMA_CHECK=1). NCCL and aws-ofi-nccl come from k8s-modules (pod
+# annotation modules.brics.ac.uk/load, e.g. "aws-ofi-nccl-1.18.0"). The old
+# cdi_profiles field is deprecated: only ["env"] is still accepted.
 #
 # Per-device resources visible to claims under the daemonset's current
 # --system-svc-ids policy (see deploy/kubernetes/daemonset.yaml):
 #   TXQs 1019 · TGQs 507 · EQs 2037 · CTs 2047 · PTEs 2036 · ACs 1018
-#   le_pools 14 (14336 LEs) · tle_pools 3 (1536 TLEs)
+#   LEs 14336 (14 pools) · TLEs 1536 (3 pools)
 # --system-svc-ids names the blessed system services already running on the
 # node; their reserved resources are deducted from the usable ceiling. Adjust
 # the list in daemonset.yaml if your node's actual system services differ.
 #
 ---
 # cxi-small — benchmarks, fi_pingpong, development, simple single-threaded tools.
-# Injects libfabric/libcxi only; add nccl/aws-ofi-nccl if the workload needs them.
 apiVersion: resource.k8s.io/v1
 kind: ResourceClaimTemplate
 metadata:
@@ -71,20 +73,16 @@ spec:
         - name: cxi
           exactly:
             deviceClassName: cxi-device
-      config:
-        - requests: ["cxi"]
-          opaque:
-            driver: cxi.slingshot.hpe.com
-            parameters:
-              txqs: 4
-              tgqs: 2
-              eqs: 8
-              cts: 4
-              ptes: 4
-              acs: 2
-              le_pools: 1
-              tle_pools: 1
-              cdi_profiles: ["env"]
+            capacity:
+              requests:
+                txqs: "4"
+                tgqs: "2"
+                eqs: "8"
+                cts: "4"
+                ptes: "4"
+                acs: "2"
+                les: "1024"
+                tles: "512"
 ---
 # cxi-medium — standard MPI jobs, NCCL at moderate scale, typical HPC workloads.
 apiVersion: resource.k8s.io/v1
@@ -99,20 +97,16 @@ spec:
         - name: cxi
           exactly:
             deviceClassName: cxi-device
-      config:
-        - requests: ["cxi"]
-          opaque:
-            driver: cxi.slingshot.hpe.com
-            parameters:
-              txqs: 16
-              tgqs: 8
-              eqs: 32
-              cts: 32
-              ptes: 16
-              acs: 8
-              le_pools: 2
-              tle_pools: 1
-              cdi_profiles: ["env", "nccl", "aws-ofi-nccl"]
+            capacity:
+              requests:
+                txqs: "16"
+                tgqs: "8"
+                eqs: "32"
+                cts: "32"
+                ptes: "16"
+                acs: "8"
+                les: "2048"
+                tles: "512"
 ---
 # cxi-large — multi-threaded MPI, NCCL at scale, collectives-heavy workloads,
 #             or jobs that generate many concurrent unexpected messages.
@@ -128,20 +122,16 @@ spec:
         - name: cxi
           exactly:
             deviceClassName: cxi-device
-      config:
-        - requests: ["cxi"]
-          opaque:
-            driver: cxi.slingshot.hpe.com
-            parameters:
-              txqs: 64
-              tgqs: 32
-              eqs: 128
-              cts: 256
-              ptes: 64
-              acs: 32
-              le_pools: 4
-              tle_pools: 2
-              cdi_profiles: ["env", "nccl", "aws-ofi-nccl"]
+            capacity:
+              requests:
+                txqs: "64"
+                tgqs: "32"
+                eqs: "128"
+                cts: "256"
+                ptes: "64"
+                acs: "32"
+                les: "4096"
+                tles: "1024"
 ---
 # cxi-whole — exclusive device access; for a single demanding workload that
 #             needs the full NIC (all resources remaining after the daemonset's
@@ -158,20 +148,16 @@ spec:
         - name: cxi
           exactly:
             deviceClassName: cxi-device
-      config:
-        - requests: ["cxi"]
-          opaque:
-            driver: cxi.slingshot.hpe.com
-            parameters:
-              txqs: 1019
-              tgqs: 507
-              eqs: 2037
-              cts: 2047
-              ptes: 2036
-              acs: 1018
-              le_pools: 14
-              tle_pools: 3
-              cdi_profiles: ["env", "nccl", "aws-ofi-nccl"]
+            capacity:
+              requests:
+                txqs: "1019"
+                tgqs: "507"
+                eqs: "2037"
+                cts: "2047"
+                ptes: "2036"
+                acs: "1018"
+                les: "14336"
+                tles: "1536"
 ---
 # cxi-2-small — two devices (ExactCount) with the small profile; for ranks that
 #               drive a pair of NICs but only need lightweight per-device state.
@@ -189,20 +175,16 @@ spec:
             deviceClassName: cxi-device
             allocationMode: ExactCount
             count: 2
-      config:
-        - requests: ["cxi"]
-          opaque:
-            driver: cxi.slingshot.hpe.com
-            parameters:
-              txqs: 4
-              tgqs: 2
-              eqs: 8
-              cts: 4
-              ptes: 4
-              acs: 2
-              le_pools: 1
-              tle_pools: 1
-              cdi_profiles: ["env"]
+            capacity:
+              requests:
+                txqs: "4"
+                tgqs: "2"
+                eqs: "8"
+                cts: "4"
+                ptes: "4"
+                acs: "2"
+                les: "1024"
+                tles: "512"
 ---
 # cxi-2-whole — two devices (ExactCount), each the full post-reservation NIC;
 #               for a single workload that saturates a pair of NICs.
@@ -220,17 +202,13 @@ spec:
             deviceClassName: cxi-device
             allocationMode: ExactCount
             count: 2
-      config:
-        - requests: ["cxi"]
-          opaque:
-            driver: cxi.slingshot.hpe.com
-            parameters:
-              txqs: 1019
-              tgqs: 507
-              eqs: 2037
-              cts: 2047
-              ptes: 2036
-              acs: 1018
-              le_pools: 14
-              tle_pools: 3
-              cdi_profiles: ["env", "aws-ofi-nccl"]
+            capacity:
+              requests:
+                txqs: "1019"
+                tgqs: "507"
+                eqs: "2037"
+                cts: "2047"
+                ptes: "2036"
+                acs: "1018"
+                les: "14336"
+                tles: "1536"

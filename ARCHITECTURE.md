@@ -9,8 +9,8 @@ For the AI-session domain-model summary (terminology, anti-patterns, known gaps)
 `cxi-dra-driver` is a Kubernetes **Dynamic Resource Allocation (DRA)** node driver. It runs as a DaemonSet (one pod per Slingshot-equipped node) and is responsible for:
 
 1. Discovering CXI (HPE Slingshot NIC) hardware on the node.
-2. Advertising that hardware to the Kubernetes scheduler via `ResourceSlice` objects.
-3. Deciding, for each `ResourceClaim` the scheduler allocates to this node, whether the node actually has room (a second, authoritative fit-check beyond the scheduler's stale view).
+2. Advertising that hardware to the Kubernetes scheduler via a `ResourceSlice` carrying per-device **consumable capacity**, so the scheduler itself does the capacity accounting.
+3. Checking, for each `ResourceClaim` the scheduler allocates to this node, that live hardware actually has room — a safety net for consumption the scheduler cannot see (CXI services created outside Kubernetes).
 4. Programming the hardware (a CXI "service" — effectively a virtual NIC scoped to a VNI and network namespace) when a claiming pod starts.
 5. Injecting the device, libraries, and environment variables the pod's container needs to use the hardware, via CDI and NRI.
 6. Tearing all of the above down when the pod stops, and cleaning up anything that leaks.
@@ -23,16 +23,16 @@ It does **not** implement scheduling itself (that's the Kubernetes DRA scheduler
 
 | Component | Source path | Responsibility |
 |-----------|-------------|-----------------|
-| Driver entry point | `cmd/cxi-dra-driver/main.go` | Parses ~23 CLI flags, builds the Kubernetes client, and wires every other component together (see §5, Initialization ordering) |
-| CDI hook binary | `cmd/cxi-cdi-hook/main.go` | Standalone binary, installed onto the host by `internal/cdi`, that refreshes the container's ldconfig cache after CDI bind-mounts libraries in |
+| Driver entry point | `cmd/cxi-dra-driver/main.go` | Parses ~26 CLI flags, builds the Kubernetes client, and wires every other component together (see §5, Initialization ordering) |
+| CDI hook binary | `cmd/cxi-cdi-hook/main.go` | Standalone binary, installed onto the host by the driver, that refreshes the container's ldconfig cache after CDI bind-mounts libraries in. Execs the bundled `ldconfig` directly when it is statically linked, otherwise through the bundled `ld.so` |
 | Slingshot CNI binary | `cmd/slingshot-cni/main.go` | CGO-free host CNI plugin (`make build-cni`), bundled in the driver image and optionally installed onto nodes by the driver (`--cni-install-dir`, reusing `internal/cdi.InstallHook`); exec'd by containerd/Multus — wires `internal/cni`'s `CmdAdd`/`CmdDel`/`CmdCheck` into `skel.PluginMainFuncs` |
-| Hardware layer | `internal/cxi/` | Device discovery (`device.go`), capacity reads (`capacity_cgo.go`/`capacity_stub.go`), HSN pairing (`hsn.go`), GPU co-location (`gpu.go`), CXI service CRUD (`service*.go`) — see [internal/cxi/README.md](internal/cxi/README.md) |
-| DRA plugin core | `internal/driver/` | `ClaimBinder`, `ResourceSlice` publishing, `Prepare`/`UnprepareResourceClaims`, `AllocationStore`, VNI allocator, reconciler, reaper, CNI hint-file writer (`cnihints.go`) — see [internal/driver/README.md](internal/driver/README.md) |
-| CDI integration | `internal/cdi/` | Generates CDI specs (`spec.go`, `env.go`), loads the env config (`config.go`), installs the hook binary and ldconfig runtime onto the host (`hookinstall.go`), writes the containerd drop-in config (`containerd.go`) |
+| Hardware layer | `internal/cxi/` | Device discovery incl. NUMA node and PCI bus ID (`device.go`), capacity reads (`capacity_cgo.go`/`capacity_stub.go`), HSN pairing (`hsn.go`), CXI service CRUD (`service*.go`) — see [internal/cxi/README.md](internal/cxi/README.md) |
+| DRA plugin core | `internal/driver/` | `ClaimBinder`, consumable-capacity model (`capacity.go`) and static `ResourceSlice` publishing (`resourceslice.go`), `Prepare`/`UnprepareResourceClaims`, `AllocationStore`, VNI allocator, orphan-service reaper, CNI hint-file writer (`cnihints.go`) — see [internal/driver/README.md](internal/driver/README.md) |
+| CDI integration | `internal/cdi/` | Generates CDI specs (`spec.go`, `env.go`), loads the env config (`config.go`), installs files onto the host with `InstallHook` (`hookinstall.go`; used for `cxi-cdi-hook`, the ldconfig runtime and `slingshot-cni`), writes the containerd drop-in config (`containerd.go`) |
 | Synthetic network sysfs | `internal/netsysfs/` | Builds a per-pod replacement `/sys/class/net` tree (`build.go`) and bind-mounts it over the pod's own (`netns_linux.go`) so stock libfabric can discover the HSN interface |
 | NRI plugin | `internal/nri/` | `Plugin` (`plugin.go`) — hooks into containerd's pod lifecycle (`RunPodSandbox`, `CreateContainer`, `StopPodSandbox`) to create/destroy the CXI service and inject env vars |
 | Slingshot CNI logic | `internal/cni/` | CNI `ADD`/`DEL`/`CHECK` orchestration (`cmd.go`), hint-file read/validate (`hint.go`, `podargs.go`), stdin config (`config.go`), L2 IPVLAN link management behind the `linkManager` seam (`network.go`, `network_linux.go`, `network_other.go`), Whereabouts IPAM delegation behind `ipamDelegate` (`ipam.go`) — see [docs/cni/cni-plugin.md](docs/cni/cni-plugin.md) |
-| Kubernetes admission | `deploy/kubernetes/admission-policy.yaml` | `MutatingAdmissionPolicy`, evaluated in-process by the API server — injects CEL capacity selectors into `ResourceClaim` requests at CREATE time |
+| Kubernetes admission | `deploy/kubernetes/admission-policy.yaml`, `deploy/kubernetes/cni/admission-policy.yaml` | `MutatingAdmissionPolicy`s, evaluated in-process by the API server — the first converts legacy opaque resource config into `exactly.capacity.requests` on `ResourceClaim`s at CREATE time; the second (opt-in, Helm `cni.nad.create`) adds the Multus `slingshot-hsn` network annotation to pods that reference a CXI claim template |
 | Deployment | `deploy/helm/cxi-dra-driver/` (recommended), `deploy/kubernetes/` (raw manifests) | DaemonSet/Deployment, RBAC, `DeviceClass`, admission policy, `ResourceClaimTemplate`s |
 
 ## 3. Data flow: pod lifecycle end-to-end
@@ -41,29 +41,28 @@ This section is the prose equivalent of [docs/pod-lifecycle-flow.txt](docs/pod-l
 
 ### 3.1 Admission (API server, in-process)
 
-A user (or a `ResourceClaimTemplate`-backed Deployment) creates a `ResourceClaim`. The `MutatingAdmissionPolicy` (`deploy/kubernetes/admission-policy.yaml`) intercepts the CREATE and injects CEL selectors derived from the claim's opaque `parameters` block (e.g. `avail_txqs >= 256 && avail_tles >= 512`) directly into `requests[0]`. This means the scheduler's normal device-selector matching does the first-pass capacity filtering — no driver code runs at this stage.
+A user (or a `ResourceClaimTemplate`-backed Deployment) creates a `ResourceClaim`. The `MutatingAdmissionPolicy` (`deploy/kubernetes/admission-policy.yaml`) intercepts the CREATE and, for a claim whose first request has no `capacity` yet, converts the opaque `parameters` block into `exactly.capacity.requests` (`txqs`, `tgqs`, `eqs`, `cts`, `ptes`, `acs`; `le_pools × 1024` → `les`, `tle_pools × 512` → `tles`). Absent fields fall back to each capacity's `requestPolicy` default. No driver code runs at this stage; claims that already carry `capacity.requests` are left untouched.
 
 ### 3.2 Scheduling (kube-scheduler, out of tree)
 
-The DRA "structured parameters" scheduler plugin reads every node's `ResourceSlice` (published by this driver — see §3.6), applies the CEL selectors from §3.1, and picks a node + device. It writes the allocation into the claim's status and waits for the driver's `BindingConditions` to report `Ready=True` before letting the pod bind.
+The DRA "structured parameters" scheduler plugin reads every node's `ResourceSlice` (published once by this driver at startup — see §5). Each device is published with `allowMultipleAllocations: true`, topology attributes (`type`, `hsn_iface`, `resource.kubernetes.io/numaNode`, `resource.kubernetes.io/pciBusID`) and one consumable capacity per CXI resource (`txqs`, `tgqs`, `eqs`, `cts`, `ptes`, `acs`, `les`, `tles`) valued at the device's usable ceiling (`internal/driver/capacity.go`). The scheduler allocates a claim to a device only if the request, plus what earlier allocations already consumed, fits within every capacity, and records the result in the allocation's `consumedCapacity`. It then waits for the driver's `BindingConditions` to report `Ready=True` before letting the pod bind. Requires the `DRAConsumableCapacity` feature gate (Kubernetes 1.36+).
 
 ### 3.3 Binding gate (`internal/driver/claimbinder.go`)
 
-`ClaimBinder` watches `ResourceClaim`s cluster-wide (not just ones on this node) and, for any claim the scheduler tentatively allocated to a device on this node, re-checks capacity against this node's **live** occupancy — the `ResourceSlice` the scheduler read might already be stale. Based on that check it sets one of:
+The scheduler's consumable-capacity accounting is the primary capacity check, but it only sees what Kubernetes allocated. `ClaimBinder` is the safety net for the rest — CXI services created outside Kubernetes, and claims allocated before the device published capacity. It watches `ResourceClaim`s cluster-wide (not just ones on this node) and, for any claim allocated to a device on this node, checks the allocation's `consumedCapacity` against this node's **live** hardware capacity. It makes a three-way decision:
 
-- `Ready=True` — the pod may proceed to kubelet binding.
-- `Ready=False` — not yet decided; the claim stays pending.
-- `Unschedulable=True` (`DeviceAtCapacity`) — the device genuinely has no room; the scheduler must pick another device/node.
-- `Unschedulable=True` (`NamespaceDeviceOccupied`) — another pod in the same namespace already holds this device (the per-namespace occupancy invariant — see CONTEXT.md).
+- `Ready=True` — the request fits live capacity minus in-flight pending grants; the pod may proceed to kubelet binding.
+- `Ready=False` (`InsufficientCapacity`) — live capacity would fit the request, but in-flight pending grants (not yet backed by a CXI service) are blocking it. A hold, not a deallocation: re-evaluated every 2s and immediately on `TriggerRetry` when a service is torn down.
+- `Unschedulable=True` (`DeviceAtCapacity`) — the device's live capacity cannot fit the request even without pending grants; the scheduler deallocates the claim and retries.
 
-`ClaimBinder` maintains a pending map and a per-namespace occupancy map in memory to make this decision without round-tripping to the kernel on every event.
+There is no per-namespace device exclusion: SHS 14.0.1 lifted the one-VNI-per-device constraint, so any number of claims from one namespace may share a device while capacity allows. The pending-grant map lives on `Driver` (guarded by its own mutex, released by NRI `RunPodSandbox` or the binder's watch); `ClaimBinder` itself tracks the `Ready=False` claims awaiting re-evaluation.
 
 ### 3.4 Kubelet prepare hook (`internal/driver/prepare.go`)
 
 Once bound, kubelet calls this driver's `PrepareResourceClaims` gRPC hook (via the `k8s.io/dynamic-resource-allocation` kubelet-plugin framework wired up in `driver.go`). This function:
 
 1. Reads the pod's namespace `cxi.slingshot.hpe.com/vni` annotation (written by the VNI allocator — see §3.8). It does **not** read a per-claim VNI; VNIs are namespace-scoped.
-2. Performs a static ceiling check against the requested `ResourceSet` (from the claim's opaque config) and the device's total capacity.
+2. Resolves the requested `ResourceSet` from the allocation's `consumedCapacity` (falling back to the claim's opaque config only for claims allocated before the device published capacity) and performs a static ceiling check against the device's usable capacity (hardware total minus `--system-svc-ids` reservations). If legacy opaque config asks for more than was consumed, the claim is rejected rather than silently given less.
 3. Stores a `PodAllocation` (device, HSN interface, VNI, resources) in the in-memory `AllocationStore` (`internal/driver/store.go`), keyed by pod UID.
 4. Writes the pod's **CNI hint file** `<--cni-hints-dir>/<podUID>.json` (`cnihints.go`) — a JSON array with one `{device, hsn_iface, vni}` entry per claimed device — atomically (temp file + rename). This is the only handoff to `slingshot-cni` (§3.5b), which runs as a separate process and cannot see the `AllocationStore`. A write failure fails the claim so kubelet retries rather than starting a sandbox with no hint. Contract: [docs/cni/cnidra-cni-hint-contract.md](docs/cni/cnidra-cni-hint-contract.md).
 5. Returns the CDI device IDs kubelet should ask the container runtime to attach — these reference the CDI specs `internal/cdi` already wrote (see §3.5).
@@ -72,7 +71,7 @@ Because kubelet waits for this hook to return before calling CRI `RunPodSandbox`
 
 ### 3.5 CDI (container runtime, driven by specs this driver wrote ahead of time)
 
-Before any of the above, at driver startup (see §5) and per-device as devices are discovered, `internal/cdi` writes CDI spec files to `/var/run/cdi/` (`spec.go`) describing: the `/dev/cxiN` device node plus its `/sys/class/cxi_user/<name>` sysfs path, and — if `--enable-cdi-env=true` — additional "profile" specs (`env.go`) bundling libcxi/libfabric runtime libraries and environment variables (notably `CXIP_SKIP_AMA_CHECK=1`). The container runtime (containerd, with CDI support enabled) reads the CDI IDs returned by `PrepareResourceClaims` and performs the actual bind-mounts/device-node creation as part of standard OCI container creation — no driver code runs at this exact step, but the specs it wrote are what makes it possible.
+Before any of the above, at driver startup (see §5) and per-device as devices are discovered, `internal/cdi` writes CDI spec files to `/var/run/cdi/` describing: the `/dev/cxiN` device node plus its `/sys/class/cxi_user/<name>` sysfs path, and a single shared `env` spec (`env.go`) that is **always** attached to every CXI device (referenced once per claim). The `env` spec carries the `/dev/kdreg2`, `/dev/gdrdrv` and `/dev/xpmem` nodes (each only when present on the host) and a `/dev/shm` bind; with `--enable-cdi-env=true` it additionally bind-mounts the host libraries listed in `--env-config` read-only at `/host/env/<basename>`, sets the configured env vars (notably `CXIP_SKIP_AMA_CHECK=1`), and adds a `createContainer` hook that runs `cxi-cdi-hook update-ldcache --folder /host/env`. The hook binary and a bundled `ldconfig` runtime are installed onto the node by the driver itself at startup (`--cdi-hook-path`, `--cdi-ldconfig-dir`), so nothing needs to be pre-installed. NCCL and aws-ofi-nccl are no longer injected here — k8s-modules provides them, and the old `nccl`/`aws-ofi-nccl` spec files are deleted on startup. The container runtime (containerd, with CDI support enabled) reads the CDI IDs returned by `PrepareResourceClaims` and performs the actual bind-mounts/device-node creation as part of standard OCI container creation — no driver code runs at this exact step, but the specs it wrote are what makes it possible.
 
 ### 3.5b CNI `ADD` (`slingshot-cni`, exec'd by containerd/Multus during `RunPodSandbox`)
 
@@ -104,10 +103,9 @@ Immediately before the container process starts, the plugin injects `SLINGSHOT_D
 
 Independently of any single pod's lifecycle, `internal/driver/vniallocator.go` runs as a leader-elected controller (via `vnipool.go`'s lease management) watching `Namespace` objects. For every namespace that claims a CXI device but has no VNI annotation yet, it assigns the lowest free VNI from the configured `--vni-range-start`/`--vni-range-end` pool and writes it as the `cxi.slingshot.hpe.com/vni` annotation. This is what §3.4 reads. Only one VNI is ever assigned per namespace — every pod in that namespace shares it.
 
-### 3.9 Continuous safety nets (run on a timer, not part of the request-response flow above)
+### 3.9 Continuous safety net (runs on a timer, not part of the request-response flow above)
 
-- **Reconciler** (`internal/driver/reconciler.go`): on `--resource-refresh-interval` (default 10s), re-reads live CXI service state from the hardware and rebuilds the in-memory occupancy map and `ResourceSlice`, closing the gap between event-driven updates and reality — chiefly relevant after a driver restart or a missed Kubernetes event.
-- **Reaper** (`internal/driver/reaper.go`): periodically scans for CXI services that have no corresponding live pod (owner UID doesn't exist / doesn't match) and deletes them — cleans up after pods that were force-deleted or otherwise didn't get a clean `StopPodSandbox`.
+- **Reaper** (`internal/driver/reaper.go`): every `--resource-refresh-interval` (default 10s), scans CXI services whose recorded pod netns is no longer live on the node and destroys them after several consecutive confirmations (`reapGraceCycles`, so a pod mid-start is never reaped). It never touches blessed (`--system-svc-ids`) or kernel-system services, services the NRI plugin still owns for a live pod, or any service whose netns cannot be determined. It cleans up after force-deleted pods, driver restarts, and out-of-band services that never got a clean `StopPodSandbox`. Inert in mock mode.
 
 ### 3.10 Pod teardown (`internal/nri/plugin.go`, `StopPodSandbox`)
 
@@ -118,15 +116,17 @@ Independently, containerd invokes CNI `DEL` for the sandbox, and `internal/cni.C
 ## 4. Component interaction diagram
 
 ```
-Scheduler ──allocates──► ResourceSlice (cxi0, cxi1, …)
+Scheduler ──allocates──► ResourceSlice (cxi0, cxi1, …; static, consumable capacity per device)
                               │
                          DaemonSet (this driver)
                          ├── internal/cxi        discovers /sys/class/cxi_user/*, pairs CXI↔HSN
-                         ├── internal/cdi         writes CDI specs → /var/run/cdi/
+                         ├── internal/cdi         writes CDI specs → /var/run/cdi/; installs cxi-cdi-hook + ldconfig runtime
+                         ├── internal/driver/resourceslice.go + capacity.go
+                         │     publish the ResourceSlice once at startup
                          ├── internal/driver/claimbinder.go
-                         │     gates pod binding via DRA BindingConditions
-                         ├── internal/driver/reconciler.go + reaper.go
-                         │     poll-driven occupancy safety nets
+                         │     live-capacity safety net via DRA BindingConditions
+                         ├── internal/driver/reaper.go
+                         │     poll-driven orphan-service cleanup
                          ├── internal/driver/vniallocator.go   (leader-elected)
                          │     assigns one VNI per namespace via annotation
                          ├── internal/nri (RunPodSandbox)
@@ -145,7 +145,7 @@ Scheduler ──allocates──► ResourceSlice (cxi0, cxi1, …)
                          └── CHECK verify link up + IPAM state
 
 MutatingAdmissionPolicy (in-process in API server)
-    injects CEL selectors (avail_txqs >= N && avail_tles >= M) from claim opaque config
+    converts opaque resource config into exactly.capacity.requests (txqs…tles) on claim CREATE
 ```
 
 See [dra-architecture.d2.txt](dra-architecture.d2.txt) and [dra-current-state.d2](dra-current-state.d2) for the rendered diagram form (the latter also color-codes implemented vs. not-yet-implemented components).
@@ -154,16 +154,14 @@ See [dra-architecture.d2.txt](dra-architecture.d2.txt) and [dra-current-state.d2
 
 At process startup, `main.go` performs, in order:
 
-1. Parse CLI flags (node name, pod UID/namespace, driver name, VNI range, CDI config, mock-device count, etc.).
-2. Build the Kubernetes client (in-cluster config, or `--kubeconfig` for local/dev use).
-3. `internal/cxi.Discover()` — walk sysfs, read hardware capacity (or generate `--mock-devices` synthetic devices), pair each device with its HSN interface, resolve NUMA-local GPU co-location.
-4. `internal/driver.New(...)` — construct the `Driver`, which in turn writes the initial CDI specs for every discovered device (and, if `--enable-cdi-env=true`, the env/NCCL/AWS-OFI-NCCL profile specs).
-5. `internal/nri.NewPlugin(...)` — connect to containerd's NRI socket.
-6. `driver.kubeletplugin.Start()` — start the DRA gRPC server and the kubelet plugin registrar.
-7. `driver.PublishResources()` — publish the initial `ResourceSlice`(s) for this node.
-8. `ClaimBinder.Run()` — start watching `ResourceClaim`s cluster-wide.
-9. If `--vni-range-start`/`-end` are non-zero: start the namespace VNI allocator (leader election + namespace informer).
-10. Register signal handlers (SIGTERM/SIGINT) for graceful shutdown of all of the above.
+1. Parse CLI flags (node name, pod UID/namespace, driver name, VNI range, CDI config, mock-device count, etc.) and call `driver.SetDriverName`, which derives the namespace-annotation key and the VNI allocator's Lease name (`<driverName>-vni-allocator-leader`) from `--driver-name`.
+2. Build the Kubernetes client (in-cluster config, or `--kubeconfig` for local/dev use), install the SIGTERM/SIGINT-cancelled context, require `--node-name`, parse `--system-svc-ids`, and generate `--mock-devices` synthetic devices if requested.
+3. With `--enable-cdi-env=true`: load `--env-config` and install `cxi-cdi-hook` and the ldconfig runtime onto the host.
+4. With `--cni-install-dir` set (requires `--cni-hints-dir`): install the bundled `slingshot-cni` onto the host.
+5. `internal/driver.New(...)` — construct the `Driver`.
+6. If `--vni-range-start`/`-end` are non-zero: validate the range and start the namespace VNI allocator (leader election + namespace informer).
+7. `driver.NewClaimBinder(...)` and `internal/nri.New(...)` (connect to containerd's NRI socket); wire the NRI plugin's live-service view into the reaper; start the NRI plugin and `ClaimBinder.Run()` (cluster-wide `ResourceClaim` watch) in goroutines.
+8. `Driver.Run(ctx)`, which in order: runs `internal/cxi.Discover()` (walk sysfs, read hardware capacity, reserved (blessed) service consumption, NUMA node and PCI bus ID, pair each device with its HSN interface — or uses the mock devices); writes the per-device CDI specs plus the always-present shared `env` spec; writes the containerd CDI drop-in (SIGHUPing containerd only if it changed); starts the kubelet plugin (DRA gRPC server + registrar); publishes the `ResourceSlice` once — it holds only static attributes and capacities, so it is never republished; then drives the orphan-service reaper every `--resource-refresh-interval` until shutdown.
 
 See [dra-sequences.d2](dra-sequences.d2) for this same sequence rendered as a diagram, with the exact actor names (`os`, `main`, `cxi_pkg`, `driver`, `nri`, `binder`, `vni_allocator`, `kubelet`, `apiserver`).
 
@@ -174,39 +172,40 @@ Two install paths render the same logical objects (see README § Deployment for 
 - **Helm** (`deploy/helm/cxi-dra-driver/`) — recommended; every object name is parameterized by `driverName`, so multiple driver versions can be installed side-by-side (e.g. for A/B testing) without collision. Supports `workload.kind: DaemonSet` (default) or `Deployment`.
 - **Raw manifests** (`deploy/kubernetes/`) — a lighter-weight alternative applied via `make deploy`; also used for [mock mode](README.md#mock-mode-kind--no-hardware) in kind clusters. `configmap.yaml` (the `--enable-cdi-env` env config) is **not** applied by `make deploy` and must be applied separately first.
 
-Both paths render: the DaemonSet/Deployment, `ClusterRole`/RBAC, `DeviceClass`, the `MutatingAdmissionPolicy`, and `ResourceClaimTemplate`s (`cxi-small`/`cxi-medium`/`cxi-large`/`cxi-whole`).
+Both paths render: the DaemonSet/Deployment, `ClusterRole`/RBAC (including the Lease role for the VNI allocator), `DeviceClass`, the capacity-conversion `MutatingAdmissionPolicy`, and `ResourceClaimTemplate`s (`cxi-small`/`cxi-medium`/`cxi-large`/`cxi-whole`, plus the two-device `cxi-2-small`/`cxi-2-whole`). The optional Slingshot CNI pieces — a `NetworkAttachmentDefinition` and the pod network-injection `MutatingAdmissionPolicy` (Helm `cni.nad.create`; `deploy/kubernetes/cni/` for the raw path) — and the host install of `slingshot-cni` (`--cni-install-dir` / Helm `cni.install`) are all off by default.
 
 ## 7. Concurrency model
 
 | Component | Mechanism | Why |
 |-----------|-----------|-----|
 | `internal/nri.Plugin` | One mutex per device | Serializes concurrent `RunPodSandbox`/`StopPodSandbox` calls that target the same CXI device, so service creation, the live fit-check, and synthetic-sysfs construction never race for the same hardware |
-| `internal/driver.AllocationStore` | Single `sync.RWMutex`-guarded map | Multiple goroutines (kubelet prepare/unprepare hooks, NRI hooks, reconciler) read and write `PodAllocation`s concurrently |
-| `internal/driver.ClaimBinder` | In-memory pending map + per-namespace occupancy map, both mutex-guarded | Claim-watch events, the reconciler, and the reaper all need a consistent view of "what's currently occupying this device" without round-tripping to the kernel per decision |
+| `internal/driver.AllocationStore` | Single `sync.RWMutex`-guarded map | Multiple goroutines (kubelet prepare/unprepare hooks, NRI hooks) read and write `PodAllocation`s concurrently |
+| `internal/driver.ClaimBinder` / `Driver` pending map | `ClaimBinder`'s `falseClaims` map and the `Driver`'s pending-grant map, each behind its own mutex | Claim-watch events, the 2s re-evaluation ticker, and NRI's `RemovePending`/`TriggerRetry` callbacks all need a consistent view of in-flight grants on a device without round-tripping to the kernel per decision |
 | `internal/driver/vniallocator.go` | Kubernetes lease-based leader election (`vnipool.go`) | Only one driver replica across the whole cluster may assign VNIs at a time — this is a cluster-wide decision, not a per-node one, even though the driver itself runs as a per-node DaemonSet |
 
 ## 8. Failure modes and recovery
 
 | Scenario | What happens | Recovery mechanism |
 |----------|---------------|---------------------|
-| Driver pod restarts (crash, node drain, upgrade) | In-memory `AllocationStore`, pending map, and occupancy map are lost | The reconciler (`internal/driver/reconciler.go`) re-reads live CXI service state from the hardware on the next `--resource-refresh-interval` tick and rebuilds occupancy; already-running pods are unaffected since their CXI services are still live on the node |
-| Kubernetes event missed (informer resync gap, API server hiccup) | `ClaimBinder`'s in-memory view of a claim can drift from the API server's | The reconciler's periodic hardware re-read is the ground truth, not the event stream — drift self-heals on the next tick |
-| Pod force-deleted (`kubectl delete --force`, node failure) | `StopPodSandbox` never runs, so the CXI service and synthetic sysfs tree for that pod are never explicitly torn down | The reaper (`internal/driver/reaper.go`) periodically finds CXI services with no live owning pod and deletes them |
-| Live fit-check fails at `RunPodSandbox` (§3.6) after `PrepareResourceClaims`'s static check (§3.4) already passed | A concurrent pod on the same node consumed the remaining capacity between the two checks | `RunPodSandbox` fails the sandbox creation; kubelet retries pod creation, by which point `ResourceSlice`/`ClaimBinder` should reflect the new occupancy and the scheduler can pick a different device/node |
+| Driver pod restarts (crash, node drain, upgrade) | In-memory `AllocationStore` and pending-grant map are lost | The `ResourceSlice` is static and re-published at startup; the scheduler's accounting lives in the claims' `consumedCapacity`, so it survives; `ClaimBinder` re-lists every `ResourceClaim` on start and re-evaluates them. Already-running pods are unaffected since their CXI services are still live on the node, and the reaper preserves them because their pod netns is still live |
+| Kubernetes event missed (watch disconnect, API server hiccup) | `ClaimBinder`'s in-memory view of a claim can drift from the API server's | `ClaimBinder.Run` restarts the watch with a fresh full `List` on error, and a 2s ticker re-evaluates every `Ready=False` claim against fresh copies from the API server |
+| Pod force-deleted (`kubectl delete --force`, node failure) | `StopPodSandbox` never runs, so the CXI service and synthetic sysfs tree for that pod are never explicitly torn down | The reaper (`internal/driver/reaper.go`) finds CXI services whose pod netns is gone and destroys them after several consecutive confirmations |
+| Device fills up through consumption the scheduler cannot see (service created outside Kubernetes) | The scheduler still thinks the device has room | `ClaimBinder` sets `Unschedulable=True` (`DeviceAtCapacity`); the scheduler deallocates the claim and retries, though its accounting may pick the same device again until the out-of-band consumption goes away |
+| Live fit-check fails at `RunPodSandbox` (§3.6) after `PrepareResourceClaims`'s static check (§3.4) already passed | Live capacity was consumed between `Ready=True` and service creation (e.g. by an out-of-band service) | `RunPodSandbox` fails the sandbox creation; kubelet retries pod creation, and `ClaimBinder` re-evaluates against live capacity |
 | Two namespaces need VNIs simultaneously | Race on VNI assignment | Leader election on the VNI allocator ensures only one process assigns VNIs cluster-wide; the underlying namespace annotation write is a single atomic API server update |
 | CNI `ADD` fails partway through a multi-device pod (IPVLAN creation, IPAM, or address application) | Some devices already have an interface and a Whereabouts reservation | `internal/cni.CmdAdd` unwinds every interface and reservation it created in that invocation before returning the error; containerd fails `RunPodSandbox` and kubelet retries from a clean slate |
 | Driver removed the hint file before CNI `DEL` ran (or crashed and restarted mid-teardown) | `CmdDel` cannot map devices to interfaces | `DEL` logs and returns success rather than wedging pod teardown; the pod netns is destroyed with the sandbox (taking the IPVLAN links with it) and Whereabouts's `ip-reconciler` garbage-collects any reservation left behind |
 
 ## 9. Extension points — "how to add X"
 
-- **Add a new hardware quota field** (alongside `txqs`/`tgqs`/`eqs`/etc.): extend `ResourceSet` in `internal/cxi/resources.go` (`Fits`/`Minus`), the opaque `parameters` schema claims supply, the static ceiling check in `internal/driver/prepare.go`, and the README's § Resource field reference table. This is the most common kind of change and touches exactly these four places.
-- **Add a new CDI profile** (alongside `env`, `nccl`, `aws-ofi-nccl`): add a spec-writer function in `internal/cdi/env.go` following the existing profile functions, register it so `cdi_profiles` in a `ResourceClaimTemplate` can select it, and document the new profile in the README's CDI Profiles table.
+- **Add a new hardware quota field** (alongside `txqs`/`tgqs`/`eqs`/etc.): extend `ResourceSet` in `internal/cxi/resources.go` (`Fits`/`Minus`), the consumable-capacity names, defaults and `buildCapacity`/`resourceSetFromConsumed` in `internal/driver/capacity.go`, the opaque-config-to-capacity conversion in the `MutatingAdmissionPolicy` (`deploy/kubernetes/` and the Helm template), the ceiling check in `internal/driver/prepare.go`, and the README's § Resource field reference table.
+- **Inject more host libraries or env vars into every CXI container**: add them to the `libs`/`env` fields of the env config (`envConfig.json` Helm value / `deploy/kubernetes/configmap.yaml`) — no code change. There are no per-claim CDI profiles any more; workload-specific stacks (NCCL, aws-ofi-nccl) belong in k8s-modules, not this driver.
 - **Add a new build mode to `internal/cxi`** (beyond `_cgo`/`mock`/`_stub`): create `<name>_<mode>.go` files following the existing suffix convention (see `.github/instructions/code-style.instructions.md`) rather than adding runtime branching to an existing file — this keeps CGO-only code out of builds that don't need it.
 - **Add a new specialist Copilot agent**: see `.github/agents/*.agent.md` for the existing pattern (role, key constraints, workflow) and register it in `AGENTS.md` and the customization index in `.github/copilot-instructions.md`.
 
 ## 10. Observability
 
-Logging is the only observability signal today (structured via the standard library and the Kubernetes client-go logger conventions) — there is no metrics endpoint (e.g. Prometheus `/metrics`) and no tracing integration. Driver DaemonSet logs (`kubectl -n kube-system logs ds/cxi-dra-driver`) are the primary debugging surface; see [.github/prompts/debug-driver.prompt.md](.github/prompts/debug-driver.prompt.md) for the most common triage flows. This is a known gap, not a design choice — adding a metrics endpoint for occupancy, fit-check outcomes, and reconciler/reaper activity would be a reasonable first observability improvement.
+Logging is the only observability signal today (structured via the standard library and the Kubernetes client-go logger conventions) — there is no metrics endpoint (e.g. Prometheus `/metrics`) and no tracing integration. Driver DaemonSet logs (`kubectl -n kube-system logs ds/cxi-dra-driver`) are the primary debugging surface; see [.github/prompts/debug-driver.prompt.md](.github/prompts/debug-driver.prompt.md) for the most common triage flows. This is a known gap, not a design choice — adding a metrics endpoint for fit-check outcomes and reaper activity would be a reasonable first observability improvement.
 
 ## 11. Package complexity summary
 
@@ -215,10 +214,10 @@ Logging is the only observability signal today (structured via the standard libr
 | `cmd/cxi-dra-driver` | 1 | Package-level only (it's `main`) | None (integration-tested via CI image + sibling repo) | Wiring/orchestration only, no business logic |
 | `cmd/cxi-cdi-hook` | 2 | Yes | `main_test.go` | Small, standalone, CGO-free by design |
 | `cmd/slingshot-cni` | 1 | Package-level only (it's `main`) | None (logic lives in `internal/cni`) | Thin `skel.PluginMainFuncs` wiring; CGO-free (`make build-cni`) |
-| `internal/cxi` | 11 | Yes | None | Hardware-dependent; see [internal/cxi/README.md](internal/cxi/README.md) |
-| `internal/driver` | 14 | Yes | 7 of 14 files | Strongest test coverage in the repo; see [internal/driver/README.md](internal/driver/README.md) |
+| `internal/cxi` | 10 | Yes | None | Hardware-dependent; see [internal/cxi/README.md](internal/cxi/README.md) |
+| `internal/driver` | 22 | Yes | 9 of 22 files | Strongest test coverage in the repo; see [internal/driver/README.md](internal/driver/README.md) |
 | `internal/cdi` | 8 | Yes | 3 of 8 files | Spec generation and host installation logic |
-| `internal/cni` | 10 (+ `testdata/fakewhereabouts`) | Yes, including package-level rationale | 6 of 10 files | Three test layers: orchestration with fakes (any platform), real IPAM delegate exec'ing a fake `whereabouts` binary (any platform), real netlink against a throwaway netns (`network_linux_test.go`, Linux root only — skips otherwise) |
+| `internal/cni` | 14 (+ `testdata/fakewhereabouts`) | Yes, including package-level rationale | 6 of 14 files | Three test layers: orchestration with fakes (any platform), real IPAM delegate exec'ing a fake `whereabouts` binary (any platform), real netlink against a throwaway netns (`network_linux_test.go`, Linux root only — skips otherwise) |
 | `internal/netsysfs` | 4 | Yes, including package-level rationale | 1 of 4 files (`build_test.go`) | `netns_linux.go` is platform-specific and untested by design |
 | `internal/nri` | 1 | Yes | None | Integration-tested only, by the sibling `cxi-dra-integration-tests` repo |
 
@@ -226,13 +225,13 @@ Logging is the only observability signal today (structured via the standard libr
 
 | Type | File | Key fields | Purpose |
 |------|------|-----------|---------|
-| `Device` | `internal/cxi/device.go` | Name, index, dev path, sysfs path, NUMA node, PCIe root, HSN interface, GPU PCIe root | The in-memory representation of one discovered CXI NIC; produced by `Discover()` and consumed by every other package |
-| `ResourceSet` | `internal/cxi/resources.go` | `txqs`, `tgqs`, `eqs`, `cts`, `ptes`, `le_pools`, `tle_pools`, `acs` | The hardware quota a claim requests or a device has available; see §12 for how it flows through the system |
+| `Device` | `internal/cxi/device.go` | Name, index, dev path, sysfs path, NUMA node, PCI bus ID, HSN interface, `Capacity`, `Reserved` | The in-memory representation of one discovered CXI NIC; produced by `Discover()` and consumed by every other package |
+| `ResourceSet` | `internal/cxi/resources.go` | `txqs`, `tgqs`, `eqs`, `cts`, `ptes`, `le_pools`, `tle_pools`, `acs` | The hardware quota a claim requests or a device has available; see §13 for how it flows through the system |
 | `PodAllocation` | `internal/driver/store.go` | Device, HSN interface, VNI, `ResourceSet` | What `PrepareResourceClaims` decided for one pod; keyed by pod UID in `AllocationStore` |
-| `AllocationStore` | `internal/driver/store.go` | `map[types.UID]PodAllocation` + `sync.RWMutex` | Thread-safe lookup shared by the kubelet prepare/unprepare hooks, the NRI plugin, and the reconciler |
+| `AllocationStore` | `internal/driver/store.go` | `map[types.UID]PodAllocation` + `sync.RWMutex` | Thread-safe lookup shared by the kubelet prepare/unprepare hooks and the NRI plugin |
 | `CNIHint` / `cni.Hint` | `internal/driver/cnihints.go` / `internal/cni/hint.go` | `device`, `hsn_iface`, `vni` | One claimed device's entry in the per-pod hint file. Deliberately two separate Go types that agree only on the JSON schema — the writer (driver daemon) and reader (`slingshot-cni` process) are different binaries on different lifecycles and must not share code |
 | `linkManager` / `ipamDelegate` | `internal/cni/network.go` / `internal/cni/ipam.go` | interfaces | The two seams `CmdAdd`/`CmdDel`/`CmdCheck` are written against: kernel-facing netlink operations and IPAM plugin exec. Real implementations are Linux-only / exec-based; tests substitute fakes so orchestration runs on any platform |
-| `Driver` | `internal/driver/driver.go` | Devices, pending grants, occupancy, references to `ClaimBinder`/`AllocationStore` | Top-level type wiring every other `internal/driver` file together |
+| `Driver` | `internal/driver/driver.go` | Devices, pending grants, references to `AllocationStore` and the reaper's live-service source | Top-level type wiring every other `internal/driver` file together |
 | CDI `Spec` (from `tags.cncf.io/container-device-interface`) | `internal/cdi/spec.go`, `env.go` | Device nodes, mounts, env vars | The on-disk `/var/run/cdi/*.json` contract between this driver and the container runtime |
 
 ## 13. Resource field implementation reference
@@ -242,16 +241,16 @@ The hardware quota fields a `ResourceClaimTemplate` requests (`txqs`, `tgqs`, `e
 ```
 ResourceClaimTemplate.spec.devices.config[].opaque.parameters   (user-authored YAML)
         │
-        ▼  read by the MutatingAdmissionPolicy at claim CREATE (§3.1)
-CEL selector on requests[0]   (avail_txqs >= N && avail_tles >= M && …)
+        ▼  converted by the MutatingAdmissionPolicy at claim CREATE (§3.1)
+exactly.capacity.requests   (txqs, tgqs, eqs, cts, ptes, acs, les = le_pools×1024, tles = tle_pools×512)
         │
-        ▼  matched against ResourceSlice attributes at schedule time (§3.2)
-Scheduler allocation
+        ▼  charged against the device's consumable capacity at schedule time (§3.2)
+Scheduler allocation → status.allocation.devices.results[].consumedCapacity
         │
-        ▼  re-verified against live occupancy (§3.3)
-ClaimBinder.Fits(ResourceSet)   — internal/cxi/resources.go
+        ▼  safety-net check against live hardware capacity (§3.3)
+ClaimBinder   — ResourceSet.Fits, internal/cxi/resources.go
         │
-        ▼  static ceiling check at kubelet prepare time (§3.4)
+        ▼  ResourceSet resolved from consumedCapacity + ceiling check at kubelet prepare time (§3.4)
 PrepareResourceClaims → AllocationStore.PodAllocation.ResourceSet
         │
         ▼  live re-check at NRI RunPodSandbox (§3.6)
@@ -264,25 +263,24 @@ Every field is a hard cap enforced by the kernel's per-service quota **except** 
 
 This repository sits at the bottom of a two-repository test pyramid:
 
-1. **Unit tests** (this repo, `go test ./...`) — fast, offline, no cluster or hardware. Cover `internal/driver` (state machines: claim binding, VNI allocation, occupancy reconciliation), `internal/cdi` (spec generation, config parsing), `internal/netsysfs` (synthetic tree construction), and `cmd/cxi-cdi-hook` (ldcache refresh logic). Run automatically in CI (`.github/workflows/build.yaml`).
+1. **Unit tests** (this repo, `go test ./...`) — fast, offline, no cluster or hardware. Cover `internal/driver` (state machines: claim binding, consumable-capacity publishing, VNI allocation), `internal/cdi` (spec generation, config parsing, hook installation), `internal/cni` (`ADD`/`DEL`/`CHECK` orchestration with fakes, the IPAM delegate contract, and — Linux root only — real netlink), `internal/netsysfs` (synthetic tree construction), and `cmd/cxi-cdi-hook` (ldcache refresh logic). Run automatically in CI (`.github/workflows/build.yaml`).
 2. **Integration / end-to-end tests** (sibling `cxi-dra-integration-tests` repo, not present in this workspace by default) — deploy this driver's built image to a live Kubernetes cluster and exercise `internal/nri`, the real (`tags cxi`) hardware path of `internal/cxi`, and the full pod-lifecycle flow from §3. This repo's own CI **cannot** run these — there is no live-cluster access from GitHub Actions.
 
 There is no in-repo `examples/` directory or smoke-test harness; `deploy/kubernetes/test/` (a sample `ResourceClaim` + pod) plays that role for manual verification during development, not as an automated example suite.
 
 ## 15. CI/CD pipeline
 
-`.github/workflows/build.yaml` runs on every push to `main`, every `v*` tag, and every PR touching `Dockerfile`, `go.mod`, `go.sum`, `cmd/**`, or `internal/**`:
+`.github/workflows/build.yaml` runs on every push to `main`, every `v*` tag, and every PR touching `Dockerfile`, `Dockerfile.mock`, `.dockerignore`, the workflow itself, `go.mod`, `go.sum`, `cmd/**`, or `internal/**`, as three jobs:
 
-1. Checkout, set up Go (version read from `go.mod`).
-2. `go vet ./...`.
-3. `go test ./...`.
-4. `golangci-lint run` (config: `.golangci.yml`, includes `gosec`).
-5. Set up Docker Buildx + QEMU (for cross-arch emulation).
-6. Log in to `ghcr.io` (skipped on PRs — no push credentials needed to just build).
-7. Compute image tags/labels from git ref, semver tag, and short SHA (`docker/metadata-action`).
-8. Build (and, outside of PRs, push) a multi-arch (`linux/amd64` + `linux/arm64`) image from `Dockerfile.ci`, with GitHub Actions layer caching.
+1. **`check`** — checkout, set up Go (version read from `go.mod`), `go vet ./...`, `go test ./...` (untagged build, so no libcxi needed). `golangci-lint` is **not** run in CI.
+2. **`build`** — a matrix of one native job per architecture (`linux/amd64` on `ubuntu-24.04`, `linux/arm64` on `ubuntu-24.04-arm`, no QEMU), each running a Docker Buildx build of `Dockerfile` with GitHub Actions layer caching scoped per arch. Same-repo runs log in to `ghcr.io` and push by digest; fork PRs build without pushing.
+3. **`merge`** — combines the per-arch digests into one multi-arch manifest list on `ghcr.io/<repository>`, tagged from the branch, PR number (`pr-<n>`), semver tag, and short SHA (`docker/metadata-action`). Skipped for fork PRs.
 
-Steps 2–4 are the only automated correctness gates; the image build itself does not run any tests inside the container.
+`Dockerfile` is self-contained (it builds libcxi from pinned SHS sources and also builds `cxi-cdi-hook` and `slingshot-cni`), so nothing is staged in `bin/` first. `Dockerfile.mock` is the no-hardware image for kind and is not built by this workflow.
+
+`.github/workflows/release-chart.yaml` handles the Helm chart: a `lint` job (`helm lint` plus `helm template` for the DaemonSet default and a Deployment with an alternate driver name), a `pr-chart` job that pushes a `<version>-pr.<n>` prerelease chart (pinned to the `pr-<n>` image when the PR changes image inputs) for same-repo PRs, and a `release` job on non-PR runs that publishes the chart as an OCI artifact on `ghcr.io` and creates a GitHub release unless that chart version is already tagged.
+
+The `check` job is the only automated correctness gate; the image build does not run any tests inside the container.
 
 ## 16. Historical note
 
@@ -296,14 +294,29 @@ CDI env integration (§3.5) and namespace VNI allocation (§3.8) were once track
 
 | File | Purpose |
 |------|---------|
-| `config.go` | `LoadConfig()` — reads and validates the JSON CDI env config mounted from a ConfigMap (`envMounts`/`awsOfiMounts`) |
+| `config.go` | `LoadConfig()` — reads and validates the JSON CDI env config mounted from a ConfigMap (`libs`, `env`, `ldcache`) |
 | `containerd.go` | Writes the containerd CDI plugin drop-in config so the runtime auto-discovers specs under `/var/run/cdi/` |
 | `containerd_test.go` | Tests for `containerd.go` |
-| `env.go` | Writes the optional `env`/`nccl`/`aws-ofi-nccl` CDI profile specs (shared device nodes, library mounts, the ldcache-refresh hook) |
+| `env.go` | Writes the shared `env` CDI spec attached to every CXI device (kdreg2/gdrdrv/xpmem device nodes, `/dev/shm`, host-library mounts under `/host/env`, env vars, the ldcache-refresh hook) and removes the legacy `nccl`/`aws-ofi-nccl` spec files |
 | `env_test.go` | Tests for spec writers and device-ID helpers |
-| `hookinstall.go` | `InstallHook()` copies the `cxi-cdi-hook` binary from this container onto the host; `InstallLdconfigRuntime()` installs ldconfig + the dynamic linker + libc onto the host |
+| `hookinstall.go` | `InstallHook()` copies a binary from this container onto the host atomically; used for `cxi-cdi-hook`, each file of the ldconfig runtime (ldconfig + dynamic linker + libc, installed by `installLdconfigRuntime` in `cmd/cxi-dra-driver/main.go`), and `slingshot-cni`. Also holds `DefaultHookPath`/`DefaultLdconfigDir` |
 | `hookinstall_test.go` | Tests for hook and ldconfig-runtime installation |
 | `spec.go` | `WriteSpec()`/`RemoveSpec()` — the per-device CDI spec exposing `/dev/cxiN` and its sysfs path |
+
+### `internal/cni/`
+
+| File | Purpose |
+|------|---------|
+| `cmd.go` | `CmdAdd`/`CmdDel`/`CmdCheck` — orchestration over the `linkManager` and `ipamDelegate` seams, with full unwind on partial `ADD` failure |
+| `config.go` | Parses the CNI stdin config (`ipam.type` required; `hintsDir`, `retryInterval`, `retryTimeout` optional) |
+| `hint.go` | Reads and validates the driver's per-pod hint file, with bounded retry |
+| `podargs.go` | Extracts `K8S_POD_UID` from `CNI_ARGS` |
+| `network.go` | `linkManager` interface — the kernel-facing netlink seam |
+| `network_linux.go` / `network_other.go` | Real `vishvananda/netlink` IPVLAN implementation (Linux) / non-Linux stub |
+| `ipam.go` | `ipamDelegate` — execs the IPAM plugin (Whereabouts) with a per-device `CNI_IFNAME` override |
+| `*_test.go`, `testdata/fakewhereabouts/` | Unit tests per file; `network_linux_test.go` needs Linux + root; the fake `whereabouts` binary backs `ipam_test.go` |
+
+See [docs/cni/cni-plugin.md](docs/cni/cni-plugin.md) for the full reference.
 
 ### `internal/netsysfs/`
 
@@ -327,6 +340,7 @@ CDI env integration (§3.5) and namespace VNI allocation (§3.8) were once track
 | `cmd/cxi-dra-driver/main.go` | Driver entry point; see §5 for the full initialization sequence it performs |
 | `cmd/cxi-cdi-hook/main.go` | The `update-ldcache` OCI hook subcommand, installed onto hosts by `internal/cdi.InstallHook` |
 | `cmd/cxi-cdi-hook/main_test.go` | Tests the ldcache-refresh logic against a mocked OCI state |
+| `cmd/slingshot-cni/main.go` | Host CNI plugin entry point; wires `internal/cni` into `skel.PluginMainFuncs` |
 
 ## Appendix B: Related documents
 

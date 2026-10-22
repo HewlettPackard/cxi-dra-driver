@@ -17,12 +17,12 @@ Reviews a pending or open diff against this repository's conventions and flags i
 
 ## Checklist
 
-1. **Style & lint**: matches `.github/instructions/code-style.instructions.md`; would pass `.golangci.yml` (run `golangci-lint run` if available, otherwise reason from the config).
+1. **Style & lint**: matches `.github/instructions/code-style.instructions.md`; `gofmt -l cmd internal` is clean and it would pass `golangci-lint run` (CI runs neither, so run them locally; there is no `.golangci.yml`, so default linters apply).
 2. **Build-tag discipline**: any new hardware-facing code in `internal/cxi` follows the `_cgo`/`_mock`/`_stub` file-split convention rather than runtime branching in one file (`.github/instructions/build-test.instructions.md`).
-3. **Domain gotchas**: no violation of `.github/instructions/domain-patterns.instructions.md` (e.g. a per-pod VNI instead of reading the namespace annotation, treating `le_pools`/`tle_pools: 0` as "no capacity", building the real `tags cxi` binary off an ARM64 Slingshot node assumption, missing opaque `ResourceClaimTemplate` fields).
+3. **Domain gotchas**: no violation of `.github/instructions/domain-patterns.instructions.md` (e.g. a per-pod VNI instead of reading the namespace annotation, treating `le_pools`/`tle_pools: 0` as "no capacity", building the real `tags cxi` binary without libcxi headers, missing capacity requests on a `ResourceClaimTemplate`, reintroducing `avail_*` attributes / per-namespace occupancy / nccl CDI profiles).
 4. **Test coverage**: new behavior in `internal/driver` or `internal/cdi` has a corresponding unit test; no test file was deleted/weakened without justification. Changes to `internal/cxi` or `internal/nri` cannot be unit-tested in isolation — flag that live-cluster verification via the sibling `cxi-dra-integration-tests` repo is needed instead.
 5. **Security**: no secrets/credentials committed, no unsafe host-path handling in `internal/cdi` (hook installation, ldconfig runtime), no new destructive commands in `Makefile`/CI.
-6. **Docs in sync**: check the maintenance matrix in `.github/copilot-instructions.md` — a changed driver flag, `make` target, or public `internal/driver`/`internal/cxi` API should have a matching `README.md`/`CONTEXT.md`/`ARCHITECTURE.md` update.
+6. **Docs in sync**: check the maintenance matrix in `.github/copilot-instructions.md` — a changed driver flag, `make` target, or public `internal/driver`/`internal/cxi` API should have a matching `README.md`/`CONTEXT.md`/`ARCHITECTURE.md` update; RBAC/DeviceClass/admission-policy changes must land in both `deploy/helm/` and `deploy/kubernetes/`.
 7. **Scope**: diff matches its stated intent — flag unrelated or accidental changes.
 
 ## Workflow

@@ -3,8 +3,15 @@ cxi-dra-driver — Pod Lifecycle Flow
 
 This document describes the mechanisms used during pod scheduling and
 de-scheduling, annotated with the driver component responsible for each step.
-It also covers the polling reconciler that closes the gap between event-driven
-state and live hardware state.
+It also covers the orphan-service reaper that closes the gap between
+event-driven teardown and live hardware state.
+
+Capacity is accounted with DRA consumable capacity: every CXI device publishes
+txqs, tgqs, eqs, cts, ptes, acs, les and tles as capacity (valued at the usable
+ceiling = hardware total − blessed system services), and the scheduler charges
+each claim's capacity.requests against it. The ResourceSlice is static —
+published once at driver startup — and the scheduler tracks consumption in each
+claim's status.allocation.devices.results[].consumedCapacity.
 
 
 ══════════════════════════════════════════════════════════════════════════════════════
@@ -14,141 +21,142 @@ state and live hardware state.
   User / controller
       │  kubectl apply replicaset / pod
       ▼
-  API Server ──► MutatingAdmissionPolicy ─────────────────────────────────────────┐
-  (ResourceClaim                          intercepts ResourceClaim CREATE          │
-   CREATE)                                reads opaque config params               │
-                                          injects TWO CEL selectors:               │
-                                            1. avail_txqs >= 256 &&                │
-                                               avail_tles >= 512 && …              │
-                                              (capacity headroom steering)         │
-                                            2. !active_namespaces.contains(",NS,") │
-                                              (per-namespace device exclusion;     │
-                                               literal NS interpolated at admit)   │
-                                          into requests[0] (CXI request)           │
-      │ claim now has selectors           ◄───────────────────────────────────────┘
+  API Server ──► MutatingAdmissionPolicy (legacy claims only) ─────────────────────┐
+  (ResourceClaim                          intercepts ResourceClaim CREATE           │
+   CREATE)                                if requests[0] has no capacity yet and    │
+                                          config[0] is CXI opaque config:           │
+                                            adds exactly.capacity.requests          │
+                                            (txqs…acs as-is, le_pools×1024 → les,   │
+                                             tle_pools×512 → tles)                  │
+                                          claims already using capacity.requests    │
+                                          pass through untouched                    │
+      │ claim carries capacity.requests   ◄────────────────────────────────────────┘
       ▼
   DRA Scheduler
-      │  reads ResourceSlice: avail_* + active_namespaces per device
-      │  applies BOTH injected CEL selectors to filter eligible devices
-      │  scores / bin-packs across filtered devices
-      │  allocates: CXI device → claim.status.allocation
+      │  reads ResourceSlice: per-device capacity + requestPolicy (static)
+      │  for each candidate device and each capacity:
+      │    request rounded up by requestPolicy (les → ×1024, tles → ×512;
+      │      unrequested capacities consume the policy default)
+      │    Σ consumedCapacity of claims already on the device + request ≤ value?
+      │  applies selectors / matchAttribute constraints (e.g. numaNode with GPU)
+      │  allocates: CXI device → claim.status.allocation, recording
+      │    consumedCapacity and a per-allocation shareID
+      │  ▲ accounting is atomic inside the scheduler, so a batch of claims
+      │    cannot over-concentrate on one NIC
       │  ┌──────────────────────────────────────────────────────────────┐
       │  │  WAITS: BindingConditions ["Ready"] = True before binding    │
       │  └──────────────────────────────────────────────────────────────┘
       │ (allocation written to claim.status)
       ▼
   ClaimBinder  ◄── watch event (ResourceClaim MODIFIED, allocation set)
+      │  safety net for consumption the scheduler cannot see: services created
+      │  outside Kubernetes, claims allocated before devices published capacity
+      │  (their consumedCapacity is empty, so the scheduler counts them as 0)
       │
+      │  requested = consumedCapacity (opaque config for pre-upgrade claims)
       │  ReadAvailableCapacity(device)           ← real hardware counters
       │  pendingSum = Σ resources in pending map for this device
-      │  occupancy[(ns,dev)]?                    ← per-namespace SHS14 guard
       │
-      ├─ (ns,dev) NOT occupied AND
-      │  hwAvail − pendingSum ≥ requested ────────────────────── READY=TRUE
+      ├─ hwAvail − pendingSum ≥ requested ─────────────────────── READY=TRUE
       │       │
-      │       ├─► pending map[claimUID] = {ns, device, resources}
-      │       │     prevents double-grant while service not yet created
-      │       ├─► nsDeviceOccupancy[ns][dev] = claimUID
-      │       │   claimToOccupancy[claimUID] = {ns, dev}  (reverse index)
-      │       │     UID-valued so binder can release a slot when scheduler
-      │       │     clears Allocation without knowing the device
-      │       └─► TriggerRepublish ──────────────────────────────────────────────┐
-      │                                                                           │
-      ├─ (ns,dev) already occupied by another claim ───── UNSCHEDULABLE          │
-      │       │                                            (NamespaceDeviceOccupied)│
-      │       └─► (rare with CEL selector in place;                                │
-      │            kept as defense against admission bypass / ResourceSlice race) │
-      │                                                                           │
-      ├─ fits hardware but pendingSum blocks ───────────────────── READY=FALSE   │
-      │       │                                                                   │
-      │       └─► falseClaims map                                                 │
-      │              ▲            ▲                                               │
-      │              │            └── 10 s ticker (safety-net poll)               │
-      │              └─────────────── TriggerRetry  (primary, event-driven)       │
-      │                               fired by NRI after service create/delete    │
-      │                                                                           │
-      └─ hwAvail < requested (device truly full) ──────────── UNSCHEDULABLE      │
-              │                                                (DeviceAtCapacity) │
-              ├─► TriggerRepublish ─────────────────────────────────────────────┐│
-              │                                                                  ││
-              └─► Scheduler sees Unschedulable in BindingFailureConditions      ││
-                  deallocates the CXI claim                                     ││
-                  ▲ single claim (CXI only); namespace VNI lives in annotation, ││
-                  │ not in the claim                                            ││
-                  └── retry at DRA Scheduler (above) on a different device      ││
-      │                                                                          ││
-      │ Ready=True set                                                           ││
-      ▼                                                                          ││
-  Scheduler binds pod to node                                                    ││
-      │                                                                          ││
-      ▼                                                                     ResourceSlice
-  Kubelet: PrepareResourceClaims                                            (re)published with
-      │  static ceiling check: requested ≤ (hardware_total − svc reserved)   avail_* +
-      │    └─ rejects here if request can never fit regardless of load       active_namespaces
-      │  reads VNI from namespace annotation cxi.slingshot.hpe.com/vni           ││
-      │    (10-retry: allocator may not have annotated yet)                       ││
-      │  stores PodAllocation in AllocationStore                                  ││
-      │    (device path, HSN interface, VNI, requested resources)                 ││
-      │  writes CNI hint file <--cni-hints-dir>/<podUID>.json (atomic)            ││
-      │    one {device, hsn_iface, vni} per claimed device — read by slingshot-cni││
-      │    ▲ kubelet waits for this hook before RunPodSandbox, so CNI ADD always  ││
-      │      finds the file; a write failure fails the claim (kubelet retries)     ││
-      │  returns CDI device IDs to kubelet                                        ││
-      │                                                                          ││
-      ▼                                                                          ││
-  containerd + CDI                                                               ││
-      │  injects /dev/cxiN into container filesystem                             ││
-      │  programs cgroup BPF allowance for major:minor                           ││
-      │  ▲ must happen before cgroup policy is locked in;                        ││
-      │    NRI alone fires too late for cgroup — CDI handles this                ││
-      ▼                                                                          ││
-  CNI ADD: slingshot-cni  (separate host process, exec'd by containerd/Multus)  ││
-      │  reads hint file for K8S_POD_UID (bounded retry)                         ││
-      │  per device:                                                             ││
-      │    L2 IPVLAN sub-interface on host <hsn_iface> → moved into pod netns     ││
-      │      renamed <hsn_iface>  (fallback <hsn_iface>_inet if taken), set up   ││
-      │    DelegateAdd(ipam.type=whereabouts, CNI_IFNAME=<in-pod name>)          ││
-      │      ▲ per-device CNI_IFNAME: Whereabouts keys on (containerID, ifname)  ││
-      │    apply returned address + routes                                       ││
-      │  any failure → unwind every interface/reservation made this invocation   ││
-      │  ▲ L3 only — complementary to the NRI sysfs injection below, which is    ││
-      │    what stock libfabric's HSN discovery depends on                       ││
-      ▼                                                                          ││
-  NRI: RunPodSandbox                                                             ││
-      │  netns inode via /proc/<sandbox-pid>/ns/net + fstat                      ││
-      │  ▲ os.Stat on bind-mount path gives wrong (tmpfs) inode — not nsfs      ││
-      │                                                                          ││
-      │  per-device mutex.Lock()  ◄── serialises concurrent pods on same device ││
-      │                                                                          ││
-      │  ══ LIVE FIT-CHECK ══════════════════════════════════════════════════    ││
-      │  ReadAvailableCapacity(device)                                           ││
-      │  requested.Fits(hwAvail)?                                                ││
-      │    no → unlock, return error  (safety net for TOCTOU window             ││
-      │                                between Ready=True and service create)    ││
-      │  ═════════════════════════════════════════════════════════════════════   ││
-      │                                                                          ││
-      │  cxil_alloc_svc (VNI in descriptor) → cxil_svc_enable(off) →            ││
-      │    cxil_svc_set_netns → cxil_svc_enable(on)                              ││
-      │     ▲ Kernel RX-profile vni_overlap_test rejects overlap on a device    ││
-      │       with -EEXIST; CEL selector + per-ns occupancy gate above prevent  ││
-      │       this from being hit. SHS14 requires the service to be disabled    ││
-      │       before cxil_svc_set_netns and re-enabled after.                   ││
-      │                                                                          ││
-      │  per-device mutex.Unlock()                                               ││
-      │                                                                          ││
-      │  buildNetSysfs: host /sys/class/net/<hsn> → per-pod synthetic tree       ││
-      │    <root>/<podUID>/net = real-iface symlinks (setns+private mountns+     ││
-      │      fresh sysfs mount in pod netns) + hsnN/{operstate=up, carrier=1,    ││
-      │      speed, device→…/<BDF>}                                              ││
-      │    ▲ stock (unpatched) libfabric reads HSN link metadata from here;      ││
-      │      a hard error rolls the services back so a pod where libfabric       ││
-      │      cannot bootstrap never starts. Skipped in mock mode.                ││
-      │                                                                          ││
-      │  RemovePending(claimUID) ─── pending map entry released                 ││
-      │     ▲ does NOT touch nsDeviceOccupancy — service is alive on the        ││
-      │       device until DestroyService runs; the (ns,dev) slot stays held    ││
-      │  TriggerRetry ──────────────────────── re-evaluates falseClaims ────────┘│
-      │  TriggerRepublish ─────────────────────────────────────────────────────── ┘
+      │       └─► pending map[(claimUID,dev)] = {device, resources}
+      │             prevents double-grant while service not yet created.
+      │             Same-namespace claims may co-locate on one device —
+      │             SHS14's duplicate-VNI constraint has been lifted.
+      │
+      ├─ fits hardware but pendingSum blocks ───────────────────── READY=FALSE
+      │       │
+      │       └─► falseClaims map
+      │              ▲            ▲
+      │              │            └── 2 s ticker (safety-net poll)
+      │              └─────────────── TriggerRetry  (primary, event-driven)
+      │                               fired by NRI after service create/delete
+      │
+      └─ hwAvail < requested (device truly full) ──────────── UNSCHEDULABLE
+              │                                                (DeviceAtCapacity)
+              └─► Scheduler sees Unschedulable in BindingFailureConditions
+                  deallocates the CXI claim and retries
+                  ▲ single claim (CXI only); namespace VNI lives in annotation,
+                  │ not in the claim
+                  ▲ the scheduler's accounting does not include the out-of-band
+                    consumption that filled the device, so the retry may pick the
+                    same device until that consumption goes away. With only
+                    Kubernetes-managed services on the NIC this branch never fires.
+      │
+      │ Ready=True set
+      ▼
+  Scheduler binds pod to node
+      │
+      ▼
+  Kubelet: PrepareResourceClaims
+      │  resolves requested resources per device:
+      │    consumedCapacity (authoritative; what the scheduler charged)
+      │    ├─ legacy opaque config present and asks for more → reject
+      │    │    (claim was never converted; would be under-provisioned)
+      │    └─ no consumedCapacity (pre-upgrade allocation) → opaque config
+      │  static ceiling check: requested ≤ (hardware_total − svc reserved)
+      │    └─ rejects here if request can never fit regardless of load
+      │  reads VNI from namespace annotation cxi.slingshot.hpe.com/vni
+      │    (10-retry: allocator may not have annotated yet)
+      │  stores PodAllocation in AllocationStore
+      │    (device path, HSN interface, VNI, requested resources)
+      │  writes CNI hint file <--cni-hints-dir>/<podUID>.json (atomic)
+      │  returns CDI device IDs to kubelet
+      │
+      ▼
+  containerd + CDI
+      │  injects /dev/cxiN into container filesystem
+      │  programs cgroup BPF allowance for major:minor
+      │  ▲ must happen before cgroup policy is locked in;
+      │    NRI alone fires too late for cgroup — CDI handles this
+      ▼
+  CNI ADD: slingshot-cni  (separate host process, exec'd by containerd/Multus)
+      │  reads hint file for K8S_POD_UID (bounded retry)
+      │  per device:
+      │    L2 IPVLAN sub-interface on host <hsn_iface> → moved into pod netns
+      │      renamed <hsn_iface>  (fallback <hsn_iface>_inet if taken), set up
+      │    DelegateAdd(ipam.type=whereabouts, CNI_IFNAME=<in-pod name>)
+      │      ▲ per-device CNI_IFNAME: Whereabouts keys on (containerID, ifname)
+      │    apply returned address + routes
+      │  any failure → unwind every interface/reservation made this invocation
+      │  ▲ L3 only — complementary to the NRI sysfs injection below, which is
+      │    what stock libfabric's HSN discovery depends on
+      ▼
+  NRI: RunPodSandbox
+      │  netns inode via /proc/<sandbox-pid>/ns/net + fstat
+      │  ▲ os.Stat on bind-mount path gives wrong (tmpfs) inode — not nsfs
+      │
+      │  per-device mutex.Lock()  ◄── serialises concurrent pods on same device
+      │
+      │  ══ LIVE FIT-CHECK ══════════════════════════════════════════════════
+      │  ReadAvailableCapacity(device)
+      │  requested.Fits(hwAvail)?
+      │    no → unlock, return error  (safety net for TOCTOU window
+      │                                between Ready=True and service create)
+      │  ═════════════════════════════════════════════════════════════════════
+      │
+      │  cxil_alloc_svc (VNI in descriptor) → cxil_svc_enable(off) →
+      │    cxil_svc_set_netns → cxil_svc_enable(on)
+      │     ▲ SHS14 now permits multiple services sharing a VNI on one device,
+      │       so co-tenant pods from the same namespace allocate cleanly.
+      │       SHS14 requires the service to be disabled before
+      │       cxil_svc_set_netns and re-enabled after.
+      │
+      │  per-device mutex.Unlock()
+      │
+      │  buildNetSysfs: host /sys/class/net/<hsn> → per-pod synthetic tree
+      │    <root>/<podUID>/net = real-iface symlinks (setns+private mountns+
+      │      fresh sysfs mount in pod netns) + hsnN/{operstate=up, carrier=1,
+      │      speed, device→…/<BDF>}
+      │    ▲ stock (unpatched) libfabric reads HSN link metadata from here;
+      │      a hard error rolls the services back so a pod where libfabric
+      │      cannot bootstrap never starts. Skipped in mock mode.
+      │
+      │  RemovePending(claimUID) ─── pending map entry released
+      │     ▲ the service is now live on the device, so its resources are
+      │       already reflected in the live hardware counters; the pending
+      │       reservation is no longer needed
+      │  TriggerRetry ──────────────────────── re-evaluates falseClaims
       │
       ▼
   NRI: CreateContainer
@@ -171,9 +179,12 @@ state and live hardware state.
   DE-SCHEDULE PATH (three cleanup paths, all idempotent)
 ══════════════════════════════════════════════════════════════════════════════════════
 
-Three independent cleanup paths cover the de-schedule cases. All converge on
-removeOccupancyLocked, which keeps nsDeviceOccupancy and claimToOccupancy
-strictly in lockstep and only triggers a republish on real state change.
+Scheduler-side capacity is released by the scheduler itself: once a claim is
+deallocated or deleted its consumedCapacity no longer counts against the
+device. The driver's paths below only clean up its own state — two
+event-driven paths release the in-flight pending grant, and a third
+hardware-aware path reaps CXI services whose owning pod is gone. All are
+idempotent.
 
 
 ┌─── Path A: NRI StopPodSandbox (normal pod termination) ─────────────────────┐
@@ -188,22 +199,19 @@ strictly in lockstep and only triggers a republish on real state change.
       │  os.RemoveAll(<root>/<podUID>) ← per-pod synthetic /sys/class/net tree│
       │  per-device mutex.Unlock()                                            │
       │                                                                       │
-      │  RemoveOccupancy(ns, dev) ─── releases the (ns,dev) slot             │
-      │                               (idempotent; safe under double-fire)    │
-      │  TriggerRetry ───────────────── re-evaluates falseClaims immediately │
-      │  TriggerRepublish ─────────────────────────────────────────────────►  │
-      │                                                              ResourceSlice
-      ▼                                                              republished with
-  Kubelet: UnprepareResourceClaims                                   avail_* restored
-      │  AllocationStore cleanup only                                 + ns removed
-      │  (does NOT touch occupancy — covered by NRI above and          from active_namespaces
-      │   reconciler below; calling RemoveOccupancyForClaim here    
-      │   would race the kernel service in the rare NRI-failed case  
-      │   and cause -EEXIST on the next claim)                       
-      │  best-effort removal of the CNI hint file (never blocks release)     │
+      │  TriggerRetry ───────────────── re-evaluates falseClaims immediately  │
+      │                                                                       │
+      ▼                                                                       │
+  Kubelet: UnprepareResourceClaims                                            │
+      │  AllocationStore cleanup only                                         │
+      │  best-effort removal of the CNI hint file (never blocks release)      │
+      │  (does NOT destroy the kernel service — that is owned by NRI above    │
+      │   and the reaper below; racing the service in the rare NRI-failed     │
+      │   case would churn resources on the next claim)                       │
       │                                                                       │
       ▼                                                                       │
   ResourceClaim garbage-collected  (ephemeral template claim)                 │
+      ▲ its consumedCapacity stops counting against the device                │
                                                                               │
   In parallel, containerd runs CNI DEL: slingshot-cni                         │
       │  per device: Whereabouts DelegateDel under the in-pod name ADD used, │
@@ -228,55 +236,40 @@ strictly in lockstep and only triggers a republish on real state change.
       │  (or onClaimDeleted fires on watch.Deleted event)                     │
       │                                                                       │
       │  RemovePending(claimUID)                                              │
-      │  RemoveOccupancyForClaim(claimUID)                                    │
-      │    ▲ resolves UID → (ns,dev) via reverse index, then releases slot    │
-      │      no-op if claim never held a slot                                 │
-      │                                                                       │
-      │  Republish if state changed → other claims in same ns can now         │
-      │  target this device                                                   │
+      │    ▲ clears every pending entry for the claim; no-op if the claim     │
+      │      never held a grant or NRI already released it                    │
                                                                               │
 └─────────────────────────────────────────────────────────────────────────────┘
 
 
-┌─── Path C: Polling reconciler (drift backstop, hardware-aware) ─────────────┐
+┌─── Path C: Orphan-service reaper (drift backstop, hardware-aware) ──────────┐
                                                                               │
-  10 s ticker (driver.Run loop)                                               │
+  reaper ticker (driver.Run loop, --resource-refresh-interval)                │
       │                                                                       │
       ▼                                                                       │
-  reconcileOccupancyFromHardware                                              │
+  reapOrphanServices                                                          │
       │  skip if mockDevices != nil                                           │
       │                                                                       │
-      │  listNamespaceVNIs → {vni → ns} from namespace annotations            │
+      │  LiveSvcIDs() → svc_ids the NRI plugin still owns for live pods       │
       │  for each device:                                                     │
-      │    cxi.ReadActiveServiceVNIs(dev) → [vmin, vmin, …]                   │
-      │    map each vmin → ns → build hwSet of (ns, dev) pairs                │
+      │    cxi.ReadActiveServices(dev) → [{svc_id, vni, is_system_svc}, …]    │
+      │    for each service, PRESERVE if ANY of:                              │
+      │      - svc_id is blessed (--system-svc-ids)                           │
+      │      - is_system_svc bit set (Ethernet/default services)              │
+      │      - owned by a live pod (LiveSvcIDs)                               │
+      │      - the netns the kernel recorded is still live on the node        │
+      │      - that netns cannot be determined (read error / 0)               │
+      │    otherwise it is a candidate orphan                                 │
       │                                                                       │
-      │  applyReconcile(hwSet) under pendingMu:                               │
-      │    for each existing nsDeviceOccupancy entry:                         │
-      │      KEEP if UID in pending OR (ns,dev) in hwSet                      │
-      │      else RELEASE via removeOccupancyLocked                           │
-      │    for each (ns,dev) in hwSet not yet covered:                        │
-      │      ADD with synthetic UID "hw:<dev>/<ns>"                           │
-      │        ▲ "hw:" prefix can never collide with a K8s UUID, so the       │
-      │          claimToOccupancy reverse index stays safe; the binder        │
-      │          never tries to release a synthetic entry via                 │
-      │          RemoveOccupancyForClaim (it doesn't know the synth UID)      │
-      │                                                                       │
-      │  TriggerRepublish if anything changed                                 │
-      │                                                                       │
-      ▼                                                                       │
-  publish()  (ticker also drives the periodic ResourceSlice refresh)          │
+      │  a candidate is deleted only after it has looked orphaned for N        │
+      │  consecutive cycles (grace period avoids racing a just-created svc)   │
+      │    → cxil_destroy_svc(dev, svcID)                                     │
                                                                               │
   Drift sources this path covers:                                             │
-    - Driver restart adopting live services from a prior process              │
-    - Missed watch events between restart and informer cache warm-up          │
+    - Driver restart leaving services from a prior process                    │
     - Force-deleted pods whose NRI StopPodSandbox never fired                 │
     - containerd StopPodSandbox short-circuits (len(allocs)==0, etc.)         │
-                                                                              │
-  Synthetic entries are self-cleaning: the next reconcile after the hardware  │
-  service goes away sees UID not in pending AND (ns,dev) not in hwSet, then   │
-  releases. NRI's RemoveOccupancy(ns,dev) also cleans synthetic entries       │
-  because it matches by (ns,dev), not by UID.                                 │
+    - Out-of-band service creation                                            │
                                                                               │
 └─────────────────────────────────────────────────────────────────────────────┘
 
@@ -287,46 +280,37 @@ strictly in lockstep and only triggers a republish on real state change.
 
   Component               Role
   ─────────────────────   ──────────────────────────────────────────────────────────
-  MutatingAdmissionPolicy Injects TWO CEL selectors at admission time:
-                            (1) per-resource capacity headroom (avail_* >= request)
-                            (2) per-namespace device exclusion
-                                (!active_namespaces.contains(",<NS>,"))
-  ResourceSlice           Per-node avail_* attributes + active_namespaces;
-                            rebuilt on every capacity or occupancy change
-  active_namespaces attr  Comma-padded sorted string ",ns1,ns2," published per
-                            device; empty when the device holds no service.
-                            Drives the per-ns CEL exclusion selector.
-  DRA Scheduler           Allocates devices; waits on BindingConditions; compacts
-                            on Unschedulable
-  ClaimBinder             Primary capacity + per-ns occupancy gate; 4-way decision:
+  MutatingAdmissionPolicy Converts legacy opaque resource config on requests[0]
+                            into exactly.capacity.requests at claim CREATE
+  ResourceSlice           Static, published once at startup: per-device
+                            consumable capacity (txqs…tles, valued at the usable
+                            ceiling, LE/TLE pool steps) + topology attributes
+                            (type, hsn_iface, numaNode, pciBusID)
+  DRA Scheduler           Primary capacity gate: charges each claim's
+                            capacity.requests against device capacity, records
+                            consumedCapacity + shareID; waits on
+                            BindingConditions; retries on Unschedulable
+  ClaimBinder             Safety net against live hardware for consumption the
+                            scheduler cannot see; 3-way decision:
                             Ready=True / Ready=False /
-                            Unschedulable: DeviceAtCapacity /
-                            Unschedulable: NamespaceDeviceOccupied
-  nsDeviceOccupancy       map[ns]map[dev]claimUID — one UID per (ns, device) slot.
-                            UID-valued so the binder can release a slot by UID
-                            without knowing the device.
-  claimToOccupancy        Reverse index claimUID → (ns, dev). Kept in lockstep
-                            with nsDeviceOccupancy by removeOccupancyLocked.
-  Pending map             Bridges gap between Ready=True grant and service
+                            Unschedulable: DeviceAtCapacity
+  Pending map             map[(claimUID,dev)]pendingEntry{dev, resources}.
+                            Bridges gap between Ready=True grant and service
                             creation; prevents double-grant on same device
-  Polling Reconciler      10 s backstop that reconciles in-memory occupancy
-                            against live CXI services via
-                            cxi.ReadActiveServiceVNIs + namespace annotations.
-                            Adds synthetic "hw:<dev>/<ns>" entries on restart,
-                            releases leaked slots when neither pending nor live.
-  TriggerRepublish        Event-driven ResourceSlice rebuild after any capacity
-                            or active_namespaces change
+  Orphan-service Reaper   Ticker-driven backstop that destroys CXI services whose
+                            owning pod is gone, via cxi.ReadActiveServices +
+                            LiveSvcIDs + per-service netns liveness. Recovers from
+                            driver restart, force-deleted pods, NRI short-circuits
   TriggerRetry            Event-driven re-evaluation of Ready=False queue
                             (primary path)
-  10 s ticker             Drives reconcileOccupancyFromHardware THEN publish();
-                            also a safety-net re-eval of Ready=False queue
-  PrepareResourceClaims   Static ceiling check; VNI lookup from namespace
-                            annotation; AllocationStore write; atomic CNI
-                            hint-file write (handoff to slingshot-cni)
+  reaper ticker           Drives reapOrphanServices (--resource-refresh-interval)
+  PrepareResourceClaims   Resolves resources from consumedCapacity (opaque config
+                            fallback); static ceiling check; VNI lookup from
+                            namespace annotation; AllocationStore write;
+                            atomic CNI hint-file write (handoff to slingshot-cni)
   UnprepareResourceClaims AllocationStore cleanup + best-effort CNI hint-file
-                            removal — occupancy release is
-                            owned by NRI (Path A) + binder watch (Path B) +
-                            reconciler (Path C)
+                            removal — service teardown is owned by NRI (Path A)
+                            + the reaper (Path C)
   CDI                     /dev/cxiN injection + cgroup BPF allowance
                             (pre-cgroup-lock)
   CNI ADD / DEL           slingshot-cni (cmd/slingshot-cni + internal/cni),
@@ -345,9 +329,8 @@ strictly in lockstep and only triggers a republish on real state change.
                             bind-mounts the synthetic /sys/class/net over the
                             container's so stock libfabric discovers the HSN
                             device (AMA bypass supplied via the CDI env config)
-  NRI StopPodSandbox      Hardware service destroy; RemoveOccupancy(ns, dev);
-                            per-pod synthetic sysfs tree removal;
-                            unblocks waiting pods via TriggerRetry
+  NRI StopPodSandbox      Hardware service destroy; per-pod synthetic sysfs
+                            tree removal; unblocks waiting pods via TriggerRetry
   HSN sysfs injection     internal/netsysfs: builds <root>/<podUID>/net with a
                             symlink per real pod NIC (read by entering the pod
                             netns and mounting a fresh sysfs) plus an hsnN dir

@@ -16,17 +16,17 @@ Scheduler ──allocates──► ResourceSlice (cxi0, cxi1, …)
                          ├── pairs CXI↔HSN via sysfs PCIe topology
                          ├── writes CDI specs → /var/run/cdi/
                          │     ├── DeviceNodes: /dev/cxiN  (cgroup BPF allowance)
-                         │     └── env/nccl/aws-ofi-nccl profile specs (libraries + env
-                         │         vars incl. CXIP_SKIP_AMA_CHECK; opt-in via cdi_profiles)
+                         │     └── env spec, attached to every device: kdreg2/gdrdrv/xpmem,
+                         │         /dev/shm, host libfabric/libcxi under /host/env and
+                         │         CXIP_SKIP_AMA_CHECK (libs/env with --enable-cdi-env)
                          ├── ClaimBinder
                          │     └── gates pod binding via DRA BindingConditions
-                         │         (Ready=True only when capacity is confirmed
-                         │          and (namespace, device) slot is free)
-                         ├── Polling reconciler
-                         │     └── reconciles in-memory occupancy with live
-                         │         CXI services every refresh tick — recovers
-                         │         from driver restart, missed events, and
-                         │         force-deleted pods
+                         │         (Ready=True only when capacity is confirmed)
+                         ├── Orphan-service reaper
+                         │     └── destroys CXI services whose owning pod is
+                         │         gone every refresh tick — recovers from
+                         │         driver restart, missed events, and
+                         │         force-deleted pods that bypassed NRI
                          ├── Namespace VNI allocator (leader-elected)
                          │     └── assigns one VNI per namespace via annotation
                          ├── NRI plugin (RunPodSandbox)
@@ -50,52 +50,64 @@ slingshot-cni (host CNI plugin, invoked by containerd/Multus — see docs/cni/cn
     (owns L3 addressing only — complementary to the NRI sysfs injection above,
      which is what stock libfabric's HSN discovery depends on)
 
+kube-scheduler (DRA consumable capacity)
+    └── charges each claim's capacity.requests (txqs … tles) against the device's
+          published capacity, so claims share a NIC without overcommitting it
+
 MutatingAdmissionPolicy (in-process in API server)
     └── intercepts ResourceClaim CREATE
-    │      └── injects CEL selectors from opaque config parameters
-    │            (e.g. avail_txqs >= 256 && avail_tles >= 512)
-    │          so the scheduler bin-packs onto devices with sufficient │headroom   
+          └── converts legacy opaque config (txqs …, le_pools, tle_pools)
+                into capacity.requests
     └── intercepts Pod CREATE
-           └── injects Multus slingshot-hsn network annotation
+          └── injects Multus slingshot-hsn network annotation
                 for Pods referencing CXI ResourceClaimTemplates
 ```
 
 ## Requirements
 
-- Kubernetes 1.34+ (stable `resource.k8s.io/v1` DRA API; `MutatingAdmissionPolicy` requires 1.32+)
+- Kubernetes 1.36+ (DRA consumable capacity — the `DRAConsumableCapacity` feature gate — is beta and on by default from 1.36; on 1.34/1.35 enable it, along with `DRADeviceBindingConditions`, on the API server, scheduler and kubelet). `MutatingAdmissionPolicy` requires 1.32+
 - Nodes labelled `feature.node.kubernetes.io/cxi=true`
 - Container runtime with CDI and NRI support (containerd ≥ 2.0)
 - NRI enabled in containerd config (see below)
-- Go 1.24+ and CGo toolchain with libcxi headers (to build with real hardware support)
+- Docker or Podman (to build the image); Go 1.24+ only if building the binary outside a container
 
 ## Building
 
-The driver binary must be built on a Slingshot node of the **same architecture as your target nodes** (the examples below are from an ARM64 node, e.g. `nid001040`; x86-64 Slingshot nodes exist too) because it links against libcxi via CGo.
+CI publishes multi-arch (`linux/amd64` + `linux/arm64`) images to
+`ghcr.io/bristol-supercomputing/cxi-dra` on every push to `main` and every
+`v*` tag, so most users never need to build anything.
 
-### 1. Copy host libraries into `bin/`
-
-The image is built `FROM scratch` and bundles all required shared libraries. Copy them from the host before each build:
-
-```bash
-cp /usr/lib64/libcxi.so.1       bin/
-cp /usr/lib64/libnl-3.so.200    bin/
-cp /lib64/libresolv.so.2        bin/
-cp /lib64/libc.so.6             bin/
-cp /lib/ld-linux-aarch64.so.1   bin/
-cp /usr/sbin/ldconfig           bin/
-```
-
-These paths are for RHEL/SUSE-based Slingshot nodes with glibc 2.38 on ARM64. Adjust if your node layout differs. `ldconfig` is bundled in the image so cxi-dra-driver can install it onto the host at startup for its own createContainer hook to run — see [internal/cdi/hookinstall.go](internal/cdi/hookinstall.go) — instead of depending on the node already having it installed.
-
-### 2. Build the binary
+### Container image (recommended)
 
 ```bash
-CGO_ENABLED=1 GOOS=linux GOARCH=arm64 go build -tags cxi -o bin/cxi-dra-driver ./cmd/cxi-dra-driver
+make image                       # production image, both hardware paths real
+make push
 ```
 
-### 2b. Build the Slingshot CNI plugin
+[Dockerfile](Dockerfile) is self-contained: it clones and builds libcxi from
+public HPE Slingshot sources in a builder stage, then compiles the driver with
+`-tags cxi` against it. There is nothing to stage in `bin/` and no dependency
+on the host's Slingshot install, so this builds on a laptop or in CI just as
+well as on a Slingshot node, for either architecture.
 
-`slingshot-cni` is a CGO-free host binary **bundled into the driver image** (the `Dockerfile` copies `bin/slingshot-cni`), so it must exist before step 3. `make image` builds it automatically; to build it alone:
+On a machine with no Docker Hub access, redirect the base images:
+
+```bash
+make image BUILD_ARGS='--build-arg GO_IMAGE=mirror.gcr.io/library/golang:1.24-bookworm \
+                       --build-arg RUNTIME_IMAGE=mirror.gcr.io/library/debian:bookworm-slim'
+```
+
+> **Keeping libcxi in step with the nodes.** libcxi talks to the `cxi` kernel
+> driver over a versioned ioctl ABI. The `CASSINI_HEADERS_REF`, `CXI_DRIVER_REF`
+> and `LIBCXI_REF` build args in [Dockerfile](Dockerfile) pin
+> `release/shs-14.0` (libcxi API 1.8.0, the first release carrying
+> `cxil_svc_set_netns`). **When the nodes move to a new SHS release, repin
+> these.** A skew does not fail the build — it surfaces at runtime as
+> `cxil_open_device` or `cxil_svc_*` errors.
+
+### Slingshot CNI plugin
+
+`slingshot-cni` is a CGO-free host binary **bundled into the driver image** (the `Dockerfile` builds it in the builder stage, alongside `cxi-cdi-hook`). To build it standalone:
 
 ```bash
 make build-cni                 # → bin/slingshot-cni for the build host's arch
@@ -104,19 +116,30 @@ make build-cni GOARCH=amd64    # cross-build, e.g. from an arm64 workstation for
 
 Bundling it does **not** install it on nodes — that is opt-in at deploy time (`cni.install=true`, see [Optional: Slingshot CNI](#optional-slingshot-cni)). Sites that use `hostNetwork` (or, in future, SR-IOV VFs) for HSN access simply leave it off.
 
-### 3. Build and push the container image
-
-```bash
-podman-hpc build -t docker.io/<your-registry>/cxi-dra-driver:dev .
-podman-hpc push docker.io/<your-registry>/cxi-dra-driver:dev
-```
 
 Reference this image at install time — `--set image.repository=…,image.tag=…` for Helm, or the `image:` field in [deploy/kubernetes/daemonset.yaml](deploy/kubernetes/daemonset.yaml) for the kubectl path.
 
-> **Note:** The `Dockerfile` uses `FROM scratch` with a linker-based entrypoint to avoid glibc version conflicts between build and runtime environments:
-> ```
-> ENTRYPOINT ["/lib/ld-linux-aarch64.so.1", "--library-path", "/usr/lib64:/lib64", "/cxi-dra-driver"]
-> ```
+### Mock image (kind / no hardware)
+
+```bash
+make kind-reload                 # build mock image, load into kind, restart DS
+```
+
+[Dockerfile.mock](Dockerfile.mock) builds without the `cxi` tag, so the service
+calls are stubs. Run the driver with `--mock-devices N` so it uses
+`cxi.MockServiceManager` and stays off the hardware paths.
+
+### Binary directly on a Slingshot node
+
+Requires the CGo toolchain and `cray-libcxi-devel` installed:
+
+```bash
+make build                       # CGO_ENABLED=1, -tags cxi
+```
+
+The cgo directives in [internal/cxi/service_cgo.go](internal/cxi/service_cgo.go)
+expect the node layout (`-I/usr/include`, `-L/usr/lib64 -lcxi`); the container
+build installs libcxi to those same paths so both routes compile identically.
 
 ## Deployment
 
@@ -178,7 +201,7 @@ Most-used values (full list in the [chart README](deploy/helm/cxi-dra-driver/REA
 | `driverName` | `cxi.slingshot.hpe.com` | DRA driver name; drives every owned object name |
 | `workload.kind` | `DaemonSet` | `DaemonSet` (one pod per node) or `Deployment` |
 | `workload.replicas` | `10` | replica count (Deployment only) |
-| `image.repository` / `image.tag` | `docker.io/pirese/cxi-dra-driver` / `dev` | driver image |
+| `image.repository` / `image.tag` | `ghcr.io/bristol-supercomputing/cxi-dra` / `main` | driver image (pin a commit-sha or `v*` tag for a reproducible install) |
 | `driver.vniRange.start` / `.end` | `100` / `300` | per-namespace VNI pool |
 | `driver.systemSvcIDs` | `[1,2,3,4]` | blessed system services (never reaped; their usage is reserved) |
 | `admissionPolicy.excludedNamespaces` | `[kube-system]` | namespaces the policy ignores |
@@ -245,7 +268,7 @@ Pods then opt in with `k8s.v1.cni.cncf.io/networks: <namespace>/slingshot-hsn`; 
 kubectl get resourceslices -o wide
 ```
 
-You should see one slice per node with devices `cxi0`, `cxi1`, … and attributes including `avail_txqs`, `avail_tles`, etc. which are refreshed periodically.
+You should see one slice per node with devices `cxi0`, `cxi1`, …, each with `allowMultipleAllocations: true` and a `capacity` entry per CXI resource (`txqs` … `tles`, sized to the usable ceiling). The slice is static: it is published once at driver startup, and how much of each device is in use is tracked by the scheduler in each claim's `consumedCapacity`, not in the slice.
 
 ### 5. Run a test workload
 
@@ -270,18 +293,20 @@ The test pod claims one CXI device via the `cxi-small` template. Its fabric VNI 
 
 Each pod that uses a CXI device needs a `ResourceClaimTemplate` that requests one CXI device. Pods do **not** request a VNI — VNIs are assigned per namespace by the leader-elected namespace VNI allocator and shared across every pod in the namespace, so each tenant gets exactly one cluster allocation that all of its pods communicate over.
 
-Four templates are provided in [deploy/kubernetes/test/resourceclaim.yaml](deploy/kubernetes/test/resourceclaim.yaml):
+Six templates are provided in [deploy/kubernetes/test/resourceclaim.yaml](deploy/kubernetes/test/resourceclaim.yaml) (and rendered by the Helm chart). The four single-device sizes are:
 
-| Template | TXQs | TGQs | LE pools | TLE pools | Pods/device | Use case |
+| Template | TXQs | TGQs | LEs | TLEs | Pods/device | Use case |
 |---|---|---|---|---|---|---|
-| `cxi-small`  | 4    | 2   | 1 (1024 LEs)  | 1 (512 TLEs)  | 3 | Benchmarks, `fi_pingpong`, development, single-threaded tools |
-| `cxi-medium` | 16   | 8   | 2 (2048 LEs)  | 1 (512 TLEs)  | 3 | Standard MPI, NCCL at moderate scale, typical HPC workloads |
-| `cxi-large`  | 64   | 32  | 4 (4096 LEs)  | 2 (1024 TLEs) | 1 | Multi-threaded MPI, NCCL at scale, collectives-heavy workloads |
-| `cxi-whole`  | 1019 | 507 | 14 (14336 LEs) | 3 (1536 TLEs) | 1 | Exclusive device — single demanding workload taking the whole NIC |
+| `cxi-small`  | 4    | 2   | 1024 (1 pool)  | 512 (1 pool)  | 3 | Benchmarks, `fi_pingpong`, development, single-threaded tools |
+| `cxi-medium` | 16   | 8   | 2048 (2 pools) | 512 (1 pool)  | 3 | Standard MPI, NCCL at moderate scale, typical HPC workloads |
+| `cxi-large`  | 64   | 32  | 4096 (4 pools) | 1024 (2 pools) | 1 | Multi-threaded MPI, NCCL at scale, collectives-heavy workloads |
+| `cxi-whole`  | 1019 | 507 | 14336 (14 pools) | 1536 (3 pools) | 1 | Exclusive device — single demanding workload taking the whole NIC |
 
-The `Pods/device` column assumes the device's blessed system services (declared via `--system-svc-ids`) reserve roughly one of its 4 TLE pools, leaving 3 available to claims, and the template values shown above. For mixed-template workloads the binding constraint is whichever resource saturates first; with the current templates `tle_pools` is the first to saturate. If your workloads follow Slingshot's "don't reserve LEs/TLEs unless you need them" guidance and use templates with `tle_pools: 0`, the per-device pod ceiling is set by some other resource (typically TXQs).
+`cxi-2-small` and `cxi-2-whole` request two devices (`count: 2`) with the `small` and `whole` resource profiles respectively.
 
-All resource fields **plus `cdi_profiles`** are required — the driver has no defaults. Claims without an opaque config block (or with any field missing) will be rejected at prepare time with a clear error.
+The `Pods/device` column assumes the device's blessed system services (declared via `--system-svc-ids`) reserve roughly one of its 4 TLE pools, leaving 3 available to claims, and the template values shown above. For mixed-template workloads the binding constraint is whichever resource saturates first; with the current templates `tles` is the first to saturate. If your workloads follow Slingshot's "don't reserve LEs/TLEs unless you need them" guidance and use templates with `tles: "0"`, the per-device pod ceiling is set by some other resource (typically TXQs).
+
+Resources are requested as DRA **consumable capacity**: every device publishes `txqs`, `tgqs`, `eqs`, `cts`, `ptes`, `acs`, `les` and `tles` as capacity, and the scheduler charges each allocation's `capacity.requests` against it, so it never places more on a NIC than its usable ceiling. A resource left out of the request consumes the device default (`txqs` 4, `tgqs` 2, `eqs` 8, `cts` 4, `ptes` 4, `acs` 2, `les`/`tles` 0). Claims written for the old opaque-config API are converted to capacity requests by the `MutatingAdmissionPolicy`; with the policy disabled, the driver rejects any whose opaque config asks for more than was allocated, rather than under-provision them. There are no CDI parameters: every device gets the env spec (see [Host runtime injection](#host-runtime-injection-env)).
 
 ### Claim template structure
 
@@ -295,36 +320,28 @@ spec:
   spec:
     devices:
       requests:
-        # CXI device request. The MutatingAdmissionPolicy injects avail_*
-        # capacity selectors into requests[0].
         - name: cxi
           exactly:
             deviceClassName: cxi-device
-      config:
-        - requests: ["cxi"]
-          opaque:
-            driver: cxi.slingshot.hpe.com
-            parameters:
-              txqs: 4
-              tgqs: 2
-              eqs: 8
-              cts: 4
-              ptes: 4
-              acs: 2
-              le_pools: 1               # 1 pool = 1024 LEs
-              tle_pools: 1              # 1 pool = 512 TLEs
-              cdi_profiles: ["env"]     # see "CDI Profiles" below
+            capacity:
+              requests:
+                txqs: "4"
+                tgqs: "2"
+                eqs: "8"
+                cts: "4"
+                ptes: "4"
+                acs: "2"
+                les: "1024"             # 1 pool
+                tles: "512"             # 1 pool
 ```
 
-LEs and TLEs are expressed as **pool counts** due to hardware allocation granularity:
-- `le_pools: 1` reserves 1024 LEs
-- `tle_pools: 1` reserves 512 TLEs
+LEs and TLEs are absolute counts, but the hardware allocates them in **pools** (1024 LEs, 512 TLEs). The devices publish a `requestPolicy` step of one pool, so the scheduler rounds a request up to whole pools — `les: "1500"` consumes 2048 — and the allocation's `consumedCapacity` (what the CXI service is programmed with) records the rounded amount.
 
-A value of `0` for `le_pools` or `tle_pools` does **not** mean "no LEs/TLEs available" — the service is mapped to a shared default pool (`DEFAULT_LE_POOL_ID` / `DEFAULT_TLE_POOL_ID` in the kernel rgroup, see `cxi_rgroup.c:425`) which has `max_alloc` set to the device-wide total and `num_reserved=0`. The service can still consume LEs/TLEs from the default pool on a best-effort basis, but has no guaranteed capacity under contention. A value `>0` carves out exclusive reservation for the service. Slingshot's general guidance is to leave both at `0` for ordinary workloads and raise them only when the workload specifically depends on guaranteed receive-buffer capacity (large MPI with steady unexpected traffic) or triggered operations (NCCL allreduce, counter-driven MPI collectives).
+A value of `0` for `les` or `tles` does **not** mean "no LEs/TLEs available" — the service is mapped to a shared default pool (`DEFAULT_LE_POOL_ID` / `DEFAULT_TLE_POOL_ID` in the kernel rgroup, see `cxi_rgroup.c:425`) which has `max_alloc` set to the device-wide total and `num_reserved=0`. The service can still consume LEs/TLEs from the default pool on a best-effort basis, but has no guaranteed capacity under contention. A value `>0` carves out exclusive reservation for the service. Slingshot's general guidance is to leave both at `0` for ordinary workloads and raise them only when the workload specifically depends on guaranteed receive-buffer capacity (large MPI with steady unexpected traffic) or triggered operations (NCCL allreduce, counter-driven MPI collectives).
 
 ### Resource field reference
 
-The per-claim resource values map directly to fields in the per-service `cxi_svc_desc.resource_limits[]` quota in the kernel. The libfabric CXI provider (`shs-libfabric/prov/cxi/`) allocates resources from these quotas on demand via libcxi ioctls; allocations fail (and the application fails) when the quota is exhausted. The "shared default pool" model applies only to `le_pools` and `tle_pools` — all other fields are hard caps.
+The per-claim resource values map directly to fields in the per-service `cxi_svc_desc.resource_limits[]` quota in the kernel. The libfabric CXI provider (`shs-libfabric/prov/cxi/`) allocates resources from these quotas on demand via libcxi ioctls; allocations fail (and the application fails) when the quota is exhausted. The "shared default pool" model applies only to `les` and `tles` — all other fields are hard caps.
 
 - **`txqs` — Transmit command queues.** The provider allocates **one shared TX CMDQ per endpoint** (`cxip_ep.c:85`; reused via ref-counting between the data TX context and the control TX path — both write to `ep_obj->txq`). Optional extras: one domain-level trigger CMDQ if any triggered operation is issued; one dedicated counter trigger CMDQ per counter if `FI_CXI_CNTR_TRIG_CMDQ=1`. A value of 2–4 covers a typical single-endpoint job with headroom; jobs that open multiple endpoints from one domain need proportionally more.
 
@@ -338,23 +355,48 @@ The per-claim resource values map directly to fields in the per-service `cxi_svc
 
 - **`acs` — Address contexts.** Allocated implicitly per `cxil_map` call for memory protection / IOMMU translation. The libfabric MR cache (`cxip_iomm.c:368`) aggregates repeated mappings of the same region, so typical jobs need only 2–4 ACs (EQ buffers + send/recv buffers). Frequent buffer reuse minimises AC pressure.
 
-- **`le_pools` — List-entry pools** (1 pool = 1024 LEs). LEs are consumed by **every** `cxip_pte_append`: control messaging during `cxip_ep_ctrl_init` (`cxip_ctrl.c:206`), every receive append in the HPC/RNR paths (`cxip_msg_hpc.c:4218`, `cxip_msg_rnr.c:169`), every memory region (`cxip_mr.c`), rendezvous (`cxip_rdzv_pte.c`), and collectives (`cxip_coll.c`). See the shared-default-pool note above — a value of `0` means "use the shared default LE pool on a best-effort basis"; `>0` reserves N pools exclusively for guaranteed capacity.
+- **`les` — List entries** (allocated in pools of 1024). LEs are consumed by **every** `cxip_pte_append`: control messaging during `cxip_ep_ctrl_init` (`cxip_ctrl.c:206`), every receive append in the HPC/RNR paths (`cxip_msg_hpc.c:4218`, `cxip_msg_rnr.c:169`), every memory region (`cxip_mr.c`), rendezvous (`cxip_rdzv_pte.c`), and collectives (`cxip_coll.c`). See the shared-default-pool note above — a value of `0` means "use the shared default LE pool on a best-effort basis"; `>0` reserves whole pools exclusively for guaranteed capacity.
 
-- **`tle_pools` — Triggered list-entry pools** (1 pool = 512 TLEs). TLEs are consumed only by triggered commands — `cxi_cq_emit_trig_*` in `cxip_dom.c:2013, 2073, 2086` and counter-triggered events in `cxip_cntr.c:572`. A workload without triggered operations (e.g. `fi_pingpong`) needs zero. With `tle_pools: 0`, any triggered operations that do occur draw from the shared default pool on a best-effort basis; `>0` reserves dedicated TLE capacity.
+- **`tles` — Triggered list entries** (allocated in pools of 512). TLEs are consumed only by triggered commands — `cxi_cq_emit_trig_*` in `cxip_dom.c:2013, 2073, 2086` and counter-triggered events in `cxip_cntr.c:572`. A workload without triggered operations (e.g. `fi_pingpong`) needs zero. With `tles: "0"`, any triggered operations that do occur draw from the shared default pool on a best-effort basis; `>0` reserves dedicated TLE capacity.
 
-### CDI Profiles
+### Host runtime injection (env)
 
-`cdi_profiles` is a required list of optional CDI specs to inject into the pod alongside the per-device `/dev/cxiN` node:
+Like the NVIDIA DRA driver, the driver injects the host runtime it owns with every device and leaves nothing to choose per claim. Each prepared CXI device gets its own `/dev/cxiN` spec plus the shared `env` CDI spec (referenced once per claim, however many devices it has). The env spec carries:
 
-| Profile | Contents |
+- `/dev/kdreg2` (libfabric's MR-cache monitor), `/dev/gdrdrv` (GDRCopy) and `/dev/xpmem` device nodes, each only when present on the host, and a `/dev/shm` bind — **always**, even without `--enable-cdi-env`;
+- with `--enable-cdi-env` and `--env-config`: the listed host libraries (libfabric, libcxi and their dependencies), bind-mounted read-only at `/host/env/<basename>` — nothing is written over the image's own files — plus the listed env vars.
+
+A `createContainer` hook (`cxi-cdi-hook update-ldcache --folder /host/env`) rebuilds the container's `ld.so.cache` with `/host/env` included. The driver installs `cxi-cdi-hook` and a self-contained `ldconfig` (with its dynamic linker and libc) onto each node at startup (`--cdi-hook-path`, `--cdi-ldconfig-dir`; see [internal/cdi/hookinstall.go](internal/cdi/hookinstall.go)), so **nothing needs to be pre-installed on the node** — no nvidia-container-toolkit. The driver does **not** touch `LD_LIBRARY_PATH`, which the loader consults before the ldcache; an image that points it at a bundled libfabric (NGC: `/opt/amazon/efa/lib`) is left to k8s-modules (below).
+
+**Not provided here:**
+
+- **NCCL and aws-ofi-nccl** (libraries, tuning env vars, `LD_LIBRARY_PATH` handling) are injected by **k8s-modules**, which defines a cluster-wide `Module` custom resource. Pods load modules by annotation:
+
+  ```yaml
+  metadata:
+    annotations:
+      modules.brics.ac.uk/load: aws-ofi-nccl-1.18.0   # comma-separated; a family name loads its default
+  ```
+
+  A claim that still sets `cdi_profiles` to anything other than `[]` / `["env"]` is rejected with an error pointing there; the field is otherwise deprecated and ignored.
+
+**Configuring** (the `envConfig.json` Helm value / `env.json` ConfigMap):
+
+```json
+{
+  "ldcache": {"enabled": true},
+  "libs":    ["/opt/cray/libfabric/2.3.1/lib64/libfabric.so.1", "/usr/lib64/libcxi.so.1"],
+  "env":     ["CXIP_SKIP_AMA_CHECK=1"]
+}
+```
+
+| Field | Meaning |
 |---|---|
-| `env`          | libcxi / libfabric / userspace runtime libraries (`ld.so.cache` refresh) plus env vars (notably `CXIP_SKIP_AMA_CHECK=1`) |
-| `nccl`         | NCCL libraries from the configured Spack prefix |
-| `aws-ofi-nccl` | AWS-OFI NCCL plugin and tuning env vars |
+| `ldcache` | The ldcache hook; `enabled` defaults to true. The hook and ldconfig locations are driver flags, not config fields. |
+| `libs` | Absolute host file paths, mounted at `/host/env/<basename>`. Required, and basenames must be unique. |
+| `env` | `KEY=value` env vars. |
 
-An empty list (`cdi_profiles: []`) means **no env injection** — use this when the container image already carries libfabric/libcxi (BYO runtime). The driver itself has no defaults; the claim must declare what it needs.
-
-> **Note:** the `env` profile carries the env vars listed under `envVars` in the driver's env config (ConfigMap-driven). `CXIP_SKIP_AMA_CHECK=1` lives here so stock libfabric accepts the synthetic HSN netdev the driver injects (see [HSN Interface Injection](#hsn-interface-injection)). A pod that holds a CXI device but requests no `env` profile still gets the synthetic `/sys/class/net`, but **not** the AMA bypass — such a pod must supply its own libfabric configuration.
+> **Note:** `CXIP_SKIP_AMA_CHECK=1` lives in the env config so stock libfabric accepts the synthetic HSN netdev the driver injects (see [HSN Interface Injection](#hsn-interface-injection)). With `--enable-cdi-env` off, a pod still gets the synthetic `/sys/class/net` and the device nodes, but **not** the AMA bypass — it must supply its own libfabric configuration.
 
 ### Wiring the claim into a pod
 
@@ -374,11 +416,14 @@ See [deploy/kubernetes/test/pod.yaml](deploy/kubernetes/test/pod.yaml) for a com
 
 ### Slingshot CNI auto-attachment
 
-Pods that reference a CXI `ResourceClaimTemplate` do not need to add the
-Multus network-selection annotation manually.
+When the optional Slingshot CNI network is enabled (`cni.nad.create=true`; the
+kubectl path applies [deploy/kubernetes/cni/admission-policy.yaml](deploy/kubernetes/cni/admission-policy.yaml)),
+pods that reference a CXI `ResourceClaimTemplate` do not need to add the
+Multus network-selection annotation manually. Without it, pods opt in with the
+annotation themselves (see [Optional: Slingshot CNI](#optional-slingshot-cni)).
 
-At Pod CREATE admission time, the driver's `MutatingAdmissionPolicy`
-checks `spec.resourceClaims` for a CXI claim-template name. Helm-rendered
+At Pod CREATE admission time, a second `MutatingAdmissionPolicy`
+(`<fullname>-slingshot-network-injection`) checks `spec.resourceClaims` for a CXI claim-template name. Helm-rendered
 CXI `ResourceClaimTemplate` objects follow the naming convention:
 
 `<fullname>-<template>`
@@ -407,43 +452,37 @@ Every pod in a namespace receives the same VNI, so any number of pods in the sam
 
 ### How scheduler placement works
 
-When a `ResourceClaim` with opaque CXI config is created, the `MutatingAdmissionPolicy` automatically injects two CEL selectors into the claim. For a `cxi-small` request from namespace `ellis` these are:
+Each device is published with `allowMultipleAllocations: true` and one consumable `capacity` per CXI resource, valued at the device's usable ceiling (hardware total minus the blessed system services):
 
+```yaml
+- name: cxi0
+  allowMultipleAllocations: true
+  capacity:
+    txqs: { value: "1019", requestPolicy: { default: "4", validRange: { min: "0" } } }
+    les:  { value: "14336", requestPolicy: { default: "0", validRange: { min: "0", step: "1024" } } }
+    # … tgqs, eqs, cts, ptes, acs, tles
 ```
-# Selector 1: per-resource capacity check (one expression with all 8 fields)
-device.attributes["cxi.slingshot.hpe.com"]["avail_txqs"] >= 4 &&
-device.attributes["cxi.slingshot.hpe.com"]["avail_tles"] >= 512 &&
-...
 
-# Selector 2: per-namespace exclusion (literal namespace interpolated at admission time)
-!device.attributes["cxi.slingshot.hpe.com"]["active_namespaces"].contains(",ellis,")
-```
+The scheduler allocates a claim to a device only if, for every resource, the request (rounded up by the `requestPolicy`) plus what earlier allocations of that device consumed fits within `value`. It records the amount in the claim's `status.allocation.devices.results[].consumedCapacity` alongside a per-allocation `shareID`, and the driver programs the CXI service from `consumedCapacity`. The accounting is atomic inside the scheduler, so a batch of claims cannot over-concentrate onto one NIC.
 
-The scheduler ANDs both selectors. Selector 1 steers placement to devices with capacity for the request. Selector 2 prevents the scheduler from picking a device that already hosts another claim from the same namespace — necessary because SHS14 enforces VNI uniqueness per device at the kernel level (`cxil_alloc_svc` runs the RX-profile `vni_overlap_test` against the device's existing services and rejects a second service whose VNI matches an existing one with `-EEXIST`), and every claim in a namespace shares the namespace's VNI.
+There is no per-namespace exclusion: SHS14's duplicate-VNI constraint has been lifted (the kernel now permits multiple services sharing a VNI on one device), so any number of claims from the same namespace may co-locate on a device as long as its capacity allows. Fabric tenancy is still namespace-scoped — every pod in a namespace shares the namespace's VNI — but that no longer restricts placement.
 
-The `active_namespaces` attribute is a comma-padded sorted string (e.g. `,alpha,ellis,zeta,`) published per device on every `ResourceSlice` update. The leading and trailing commas let the CEL `.contains(",<NS>,")` perform exact, non-prefix matching — `,foo,` does not match `,foobar,`. An unoccupied device publishes the empty string.
+The scheduler only sees what Kubernetes allocated. The `ClaimBinder` is the safety net for everything else — CXI services created outside Kubernetes, and claims allocated before the devices published capacity (their `consumedCapacity` is empty, so the scheduler does not count them):
 
-The driver re-publishes the `ResourceSlice` immediately on every occupancy 0↔1 transition (a claim grant flips 0→1; the NRI plugin's `DestroyService` callback flips 1→0). Other claims in the same namespace see the updated `active_namespaces` within milliseconds and are steered away from the now-occupied device — no waiting for the next 10-second periodic refresh.
-
-Because the K8s DRA scheduler evaluates claims against a static snapshot of the `ResourceSlice` within a single scheduling batch, it may still over-concentrate claims onto fewer devices than necessary in one batch (the custom `avail_*` attributes are not decremented between per-claim decisions in the same batch). The driver handles this via **Unschedulable compaction**, which is also the runtime safety net for the rare case where the admission-injected selector raced a stale `ResourceSlice`:
-
-1. The scheduler allocates a batch of claims, possibly concentrating multiple claims on one device.
-2. The `ClaimBinder` evaluates each allocation against real hardware capacity **and** against per-namespace device occupancy. It grants `Ready=True` to claims that fit within current capacity minus in-flight pending grants and whose `(namespace, device)` pair is not already held by another claim.
-3. Claims that **would** fit the device's raw hardware capacity but not after subtracting in-flight pending grants (grants already made on this device whose CXI service is not yet created) receive `Ready=False` with reason `InsufficientCapacity`. Unlike the Unschedulable cases below, this is a *hold*, not a deallocation: the claim stays on the device and the binder re-evaluates it on a 2-second ticker and immediately whenever a service is torn down (`TriggerRetry`), so a transient pending backlog drains without bouncing the claim to another device.
+1. The scheduler allocates a claim; because the device publishes `bindingConditions: [Ready]` the pod is not bound yet.
+2. The `ClaimBinder` evaluates the allocation against live hardware capacity. It grants `Ready=True` to claims that fit within current capacity minus in-flight pending grants.
+3. Claims that **would** fit the device's raw hardware capacity but not after subtracting in-flight pending grants (grants already made on this device whose CXI service is not yet created) receive `Ready=False` with reason `InsufficientCapacity`. This is a *hold*, not a deallocation: the binder re-evaluates it on a 2-second ticker and immediately whenever a service is torn down (`TriggerRetry`).
 4. Claims that exceed the device's hardware capacity even before counting pending grants receive `Unschedulable=True` with reason `DeviceAtCapacity`.
-5. Claims whose `(namespace, device)` pair is already held by another claim in the same namespace receive `Unschedulable=True` with reason `NamespaceDeviceOccupied`. This should be rare with the admission-injected CEL selector in place; it is kept as a defense against admission-policy bypass or stale `ResourceSlice` race conditions.
-6. The scheduler sees `Unschedulable=True` in the claim's `BindingFailureConditions`, deallocates the single CXI claim, and retries.
-7. At retry time, the `ResourceSlice` has been republished — `avail_*` near zero for any device that became full, `active_namespaces` updated for the same-namespace case — steering the retry allocation to an actually eligible device.
+5. The scheduler sees `Unschedulable=True` in the claim's `BindingFailureConditions`, deallocates the single CXI claim, and retries. Its accounting does not include the out-of-band consumption that filled the device, so the retry may pick the same device until that consumption goes away.
 
-The system converges to the correct distribution (≤3 `cxi-small`/`cxi-medium` pods per device, ≤1 `cxi-large`/`cxi-whole` pod per device, ≤1 claim per namespace per device on any one node) within one or two compaction cycles in the worst case, and typically zero (CEL pre-filter catches it at scheduling time).
+With only Kubernetes-managed services on the NIC, steps 3–5 do not occur: the scheduler's accounting already guarantees the hardware fits.
 
-The per-namespace occupancy index is released by three independent, idempotent paths that all converge on a single `removeOccupancyLocked` helper:
+In-flight pending grants are released by two independent, idempotent paths:
 
-1. **NRI `StopPodSandbox`** (normal pod termination) — calls `RemoveOccupancy(ns, dev)` after `cxil_destroy_svc` succeeds. This is the hot path.
-2. **`ClaimBinder` watch** — calls `RemoveOccupancyForClaim(uid)` when the scheduler clears `Status.Allocation` (PostFilter after a PreBind failure, Unschedulable signal, manual edit) or when a `ResourceClaim` is deleted. Resolves the UID through a reverse index so the binder doesn't need to know the device. This catches scheduler-side de-allocation that would never reach NRI.
-3. **Polling reconciler** — runs once per `--resource-refresh-interval` tick before the periodic ResourceSlice republish. Enumerates live CXI services on every device via `cxil_get_svc_list` + `cxil_svc_get_vni_range`, reverse-maps each VNI to its namespace via the annotation cache, and reconciles the in-memory occupancy against hardware truth. Releases any slot not backed by either a pending grant or a live service; adopts any live service not yet tracked with a synthetic `hw:<dev>/<ns>` UID. This recovers from driver restart, missed watch events, force-deleted pods that bypassed NRI, and containerd `StopPodSandbox` short-circuits.
+1. **NRI `RunPodSandbox`** — calls `RemovePending(uid)` once the CXI service backing the claim has been created, so the grant is now reflected in the live hardware capacity and no longer needs a pending reservation.
+2. **`ClaimBinder` watch** — calls `RemovePending(uid)` when the scheduler clears `Status.Allocation` (PostFilter after a PreBind failure, Unschedulable signal, manual edit) or when a `ResourceClaim` is deleted. This catches scheduler-side de-allocation that would never reach NRI.
 
-The reconciler is the hardware-aware authority and keeps the in-memory model converged on actual kernel state without race conditions: if a slot's hardware service still exists, the slot is kept; if it doesn't and no pending grant covers it, the slot is released. The other two paths give sub-second latency in the common cases; the reconciler bounds worst-case latency to one tick.
+Actual hardware capacity is always read live from the device (`cxil_get_svc_list`), so once a service exists the pending reservation is redundant; the pending map exists only to bridge the window between a grant and its service creation within a single scheduling batch.
 
 ## Accounting for Pre-existing System Services
 
@@ -482,7 +521,7 @@ In `RunPodSandbox` the NRI plugin builds a per-pod synthetic `/sys/class/net` tr
 
 Only `/sys/class/net` is overmounted; `/sys/devices` is left untouched, so the replicated NIC symlinks still resolve. The HSN presents **only** as a sysfs directory under its host-native name — the synthetic entry is not a real netdev, so on its own `ip link`, `ethtool`, netlink, and IP addressing show nothing for it. This is sufficient for libfabric, which globs sysfs rather than using netlink, and the RDMA datapath is kernel-bypass and needs no netdev. Pods that also need **IP** over the HSN get a real netdev from the separate [Slingshot CNI plugin](#hsn-ip-interface-slingshot-cni), which runs alongside this mechanism.
 
-Two libfabric gates interact with the tree. The link gate (`cxip_if.c:142`) has no env bypass and is satisfied by `operstate=up`. The AMA gate (`cxip_if.c:580`) drops any device whose netdev lacks a recognised MAC unless `CXIP_SKIP_AMA_CHECK=1` is set; the synthetic tree omits a MAC, so the `env` CDI profile supplies that env var (see [CDI Profiles](#cdi-profiles)) — it is deliberately **not** hardcoded in NRI.
+Two libfabric gates interact with the tree. The link gate (`cxip_if.c:142`) has no env bypass and is satisfied by `operstate=up`. The AMA gate (`cxip_if.c:580`) drops any device whose netdev lacks a recognised MAC unless `CXIP_SKIP_AMA_CHECK=1` is set; the synthetic tree omits a MAC, so the env CDI spec supplies that env var (see [Host runtime injection](#host-runtime-injection-env)) — it is deliberately **not** hardcoded in NRI.
 
 Injection is skipped in mock mode and when `--netns-sysfs-root` is empty. Reading the host HSN metadata is fatal (the services are rolled back and the kubelet retries the sandbox) because libfabric cannot bootstrap without it; replicating the pod's own NICs is best-effort and falls back to an HSN-only tree on failure.
 
@@ -511,11 +550,11 @@ Minimal `NetworkAttachmentDefinition` config (full field reference in [docs/cni/
 
 ## CXI Service Programming
 
-Each pod receives a CXI service scoped to its network namespace inode and a unique VNI. libfabric reads `SLINGSHOT_SVC_IDS` (injected as an env var by the NRI plugin) and uses it instead of allocating its own service, ensuring the pod operates within its allocated fabric resources. `SLINGSHOT_DEVICES` and `SLINGSHOT_VNIS` carry the corresponding device name and VNI, aligned by position.
+Each pod receives a CXI service scoped to its network namespace inode and its namespace's VNI. libfabric reads `SLINGSHOT_SVC_IDS` (injected as an env var by the NRI plugin) and uses it instead of allocating its own service, ensuring the pod operates within its allocated fabric resources. `SLINGSHOT_DEVICES` and `SLINGSHOT_VNIS` carry the corresponding device name and VNI, aligned by position.
 
 ### Namespace-scoped VNI allocation
 
-VNIs are assigned per **namespace** by a leader-elected controller that runs inside the DaemonSet. One DaemonSet pod wins a `Lease`-based election (`cxi-vni-allocator-leader` in `kube-system`) and runs a namespace watcher that scans for the `cxi.slingshot.hpe.com/vni` annotation. Any namespace that lacks one is patched with the lowest free VNI in the configured cluster-wide range.
+VNIs are assigned per **namespace** by a leader-elected controller that runs inside the DaemonSet. One DaemonSet pod wins a `Lease`-based election (`<driver-name>-vni-allocator-leader`, e.g. `cxi.slingshot.hpe.com-vni-allocator-leader`, in the driver's own namespace) and runs a namespace watcher that scans for the `cxi.slingshot.hpe.com/vni` annotation. Any namespace that lacks one is patched with the lowest free VNI in the configured cluster-wide range.
 
 When a pod is scheduled and the kubelet calls `PrepareResourceClaims`, the driver reads the VNI from the pod's namespace annotation and programs it into the CXI service it creates. Every pod in the same namespace therefore shares the same VNI and can form RDMA connections to every other pod in that namespace. Namespaces are isolated from each other on the fabric.
 
@@ -530,16 +569,16 @@ cmd/cxi-dra-driver/      Binary entrypoint and CLI flags
 cmd/cxi-cdi-hook/        Standalone OCI createContainer hook binary (ldconfig cache refresh)
 cmd/slingshot-cni/       Slingshot CNI plugin binary (host-side; IPVLAN-on-HSN + Whereabouts IPAM)
 internal/cxi/            Sysfs device discovery, CXI↔HSN pairing, libcxi CGo wrapper
-internal/cdi/            CDI spec generation (DeviceNodes; env/nccl/ofi specs; containerd CDI config drop-in)
-internal/cni/            CNI ADD/DEL/CHECK logic: hint-file consumption, IPVLAN link management,
-                         IPAM delegation (see docs/cni/cni-plugin.md)
+internal/cdi/            CDI spec generation (DeviceNodes; shared env spec; containerd CDI config drop-in), host install of cxi-cdi-hook/ldconfig/slingshot-cni
+internal/cni/            slingshot-cni logic: hint-file read, L2 IPVLAN on the HSN, Whereabouts IPAM delegation
 internal/netsysfs/       Per-pod synthetic /sys/class/net tree builder for HSN sysfs injection
-internal/driver/         DRA kubelet plugin (ResourceSlice, Prepare/Unprepare,
-                         ClaimBinder, namespace VNI allocator, store)
+internal/driver/         DRA kubelet plugin (static consumable-capacity ResourceSlice, Prepare/Unprepare,
+                         ClaimBinder, namespace VNI allocator, orphan-service reaper, CNI hint writer, store)
 internal/nri/            NRI plugin (RunPodSandbox, CreateContainer, StopPodSandbox)
-deploy/kubernetes/       DaemonSet, DeviceClass, RBAC, MutatingAdmissionPolicy, ConfigMap, test manifests
+deploy/kubernetes/       DaemonSet, DeviceClass, RBAC, MutatingAdmissionPolicy, ConfigMap, test manifests; cni/ holds the optional NAD + network-injection policy
 deploy/helm/             Helm chart (cxi-dra-driver)
 deploy/kind/             kind mock-mode test harness (no hardware)
+docs/                    pod-lifecycle-flow.txt, cni/ (plugin reference, driver-to-CNI hint contract)
 ```
 
 ## Configuration Flags
@@ -553,8 +592,9 @@ deploy/kind/             kind mock-mode test harness (no hardware)
 | `--cdi-root` | `/var/run/cdi` | CDI spec output directory |
 | `--plugin-dir` | `/var/lib/kubelet/plugins/cxi.slingshot.hpe.com` | Kubelet plugin socket directory |
 | `--registrar-dir` | `/var/lib/kubelet/plugins_registry` | Plugin registrar directory |
+| `--kubeconfig` | `""` | Path to a kubeconfig (empty uses in-cluster config) |
 | `--mock-devices` | `0` | Generate N synthetic devices (no hardware needed) |
-| `--resource-refresh-interval` | `10s` | How often to republish the ResourceSlice with refreshed available-capacity attributes |
+| `--resource-refresh-interval` | `10s` | How often the orphan-service reaper checks for CXI services whose pod is gone |
 | `--vni-range-start` | `0` | First VNI in the namespace-VNI allocator's pool (0 disables the allocator) |
 | `--vni-range-end` | `0` | Last VNI in the pool (inclusive) |
 | `--system-svc-ids` | `""` | Comma-separated svc_ids of blessed system services: never deleted, and their reserved resources are deducted from each device's usable ceiling |
@@ -562,37 +602,44 @@ deploy/kind/             kind mock-mode test harness (no hardware)
 | `--cni-hints-dir` | `/var/run/cxi/net-hints` | Host directory for per-pod CNI hint files read by `slingshot-cni` (empty disables the hint-file write/delete); must match the `hintsDir` in the plugin's network config. See [docs/cni/cnidra-cni-hint-contract.md](docs/cni/cnidra-cni-hint-contract.md) |
 | `--cni-install-dir` | `""` (disabled) | Host CNI plugin directory (e.g. `/opt/cni/bin`, must be a hostPath mounted at the same path) to install the bundled `slingshot-cni` into at startup; requires `--cni-hints-dir`. Opt-in — the driver works without the CNI |
 | `--cni-src` | `/slingshot-cni` | Path of the `slingshot-cni` binary bundled in the image |
-| `--enable-cdi-env` | `false` | Write the `env`/`nccl`/`ofi` CDI specs and inject their device IDs into pods |
+| `--enable-cdi-env` | `false` | Add the `--env-config` host libs and env vars to the env CDI spec (the spec itself is always attached) |
 | `--env-config` | `""` | Path to the JSON CDI env config file (required when `--enable-cdi-env`) |
 | `--containerd-config-path` | `""` | Path to write the containerd CDI config drop-in (empty disables) |
+| `--cdi-hook-src` | `/cxi-cdi-hook` | Path of the `cxi-cdi-hook` binary bundled in the image |
+| `--cdi-hook-path` | `/var/run/cxi/bin/cxi-cdi-hook` | Host path the hook is installed at (installed only with `--enable-cdi-env`); referenced by the generated CDI hooks |
+| `--cdi-ldconfig-dir` | `/var/run/cxi/bin` | Host directory the bundled ldconfig runtime (ldconfig, dynamic linker, libc) is installed into (only with `--enable-cdi-env`) |
+| `--cdi-ldconfig-src` / `--cdi-ldconfig-linker-src` / `--cdi-ldconfig-libc-src` | `/ldconfig-runtime/ldconfig` / `/ldconfig-runtime/ld.so` / `/ldconfig-runtime/libc.so.6` | Paths of the ldconfig runtime files bundled in the image |
 
 ## Device Attributes
 
-Each device in the `ResourceSlice` exposes the following attributes, accessible in CEL selectors as `device.attributes["cxi.slingshot.hpe.com"]["<name>"]`:
+Each device in the `ResourceSlice` exposes the following driver-specific attributes, accessible in CEL selectors as `device.attributes["cxi.slingshot.hpe.com"]["<name>"]`:
 
 | Attribute | Type | Description |
 |---|---|---|
-| `numa_node` | int | NUMA node the device is attached to |
-| `pcie_root` | string | PCIe root complex slot of the CXI device itself (e.g. `"0000:81:00.0"`) |
+| `type` | string | Always `"device"`; matched by the DeviceClass selector |
 | `hsn_iface` | string | Associated HSN network interface (e.g. `"hsn2"`) |
-| `capacity_txqs` | int | Hardware total TXQs |
-| `capacity_tgqs` | int | Hardware total TGQs |
-| `capacity_eqs` | int | Hardware total EQs |
-| `capacity_cts` | int | Hardware total CTs |
-| `capacity_ptes` | int | Hardware total PTEs |
-| `capacity_tles` | int | Hardware total TLEs |
-| `capacity_les` | int | Hardware total LEs |
-| `capacity_acs` | int | Hardware total ACs |
-| `avail_txqs` | int | Currently available TXQs (refreshed periodically) |
-| `avail_tgqs` | int | Currently available TGQs |
-| `avail_eqs` | int | Currently available EQs |
-| `avail_cts` | int | Currently available CTs |
-| `avail_ptes` | int | Currently available PTEs |
-| `avail_tles` | int | Currently available TLEs |
-| `avail_les` | int | Currently available LEs |
-| `avail_acs` | int | Currently available ACs |
 
-The `avail_*` attributes are used by the `MutatingAdmissionPolicy` to steer initial placement and by the `ClaimBinder`'s Unschedulable compaction cycle to redirect retried claims away from full devices. The `ClaimBinder`'s live fit-check against hardware capacity (via `ReadAvailableCapacity`) is the authoritative gate for granting `Ready=True`.
+The per-resource `capacity_*` (hardware total) and `avail_*` (live headroom) attributes are no longer published: placement is governed by consumable capacity below, and the `ClaimBinder` reads live headroom from the hardware directly. To see how much of a device is allocated, sum `consumedCapacity` across the claims allocated to it.
+
+Each device also publishes consumable capacity, requested under `spec.devices.requests[].exactly.capacity.requests`. Values are the usable ceiling (hardware total minus the `--system-svc-ids` reservation):
+
+| Capacity | Default per allocation | Step | Description |
+|---|---|---|---|
+| `txqs` | 4 | — | Transmit command queues |
+| `tgqs` | 2 | — | Target command queues |
+| `eqs` | 8 | — | Event queues |
+| `cts` | 4 | — | Counters |
+| `ptes` | 4 | — | Portal table entries |
+| `acs` | 2 | — | Address contexts |
+| `les` | 0 | 1024 | List entries (one LE pool per step) |
+| `tles` | 0 | 512 | Triggered list entries (one TLE pool per step) |
+
+Each device also exposes the Kubernetes [standard device attributes](https://kubernetes.io/docs/reference/node/dra-standard-device-attributes/) under the `resource.kubernetes.io` domain, letting CEL selectors and `matchAttribute` constraints compare CXI devices against devices from other DRA drivers without driver-specific knowledge. `numaNode` is omitted when the device's NUMA affinity is unknown:
+
+| Attribute | Type | Description |
+|---|---|---|
+| `resource.kubernetes.io/numaNode` | int | NUMA node the device is attached to |
+| `resource.kubernetes.io/pciBusID` | string | PCI bus address in extended BDF form (e.g. `"0000:81:00.0"`) |
 
 Example — claim a device on NUMA node 1 with a custom CEL selector:
 
@@ -604,82 +651,8 @@ devices:
         deviceClassName: cxi-device
         selectors:
           - cel:
-              expression: 'device.attributes["cxi.slingshot.hpe.com"]["numa_node"] == 1'
+              expression: 'device.attributes["resource.kubernetes.io"].numaNode == 1'
 ```
-
-## Co-locating CXI NICs with NVIDIA GPUs
-
-On GH200-class nodes each CXI NIC, GPU, and NUMA node map 1:1, and you usually want a
-pod's CXI NIC to sit on the same PCIe locality as its GPU. DRA expresses this with a
-[`matchAttribute`](https://kubernetes.io/docs/concepts/scheduling-eviction/dynamic-resource-allocation/)
-constraint: every device across the listed requests must share the same value for a
-*fully-qualified* attribute.
-
-For a cross-driver match the attribute name and value must be identical on both sides.
-The NVIDIA DRA driver publishes the standardized attribute
-`resource.kubernetes.io/pcieRoot` (value `pci<domain>:<bus>`, e.g. `pci0009:00`). NVIDIA
-does **not** publish `numa_node`, and the NIC and GPU sit under different PCIe roots, so
-NUMA is the only shared locality key. This driver therefore discovers, for each CXI
-device, the NVIDIA GPU on the same NUMA node and republishes that GPU's PCIe root under
-the same standardized name:
-
-| Attribute | Type | Description |
-|---|---|---|
-| `resource.kubernetes.io/pcieRoot` | string | PCIe root (`pci<domain>:<bus>`) of the NVIDIA GPU on this CXI device's NUMA node. Matches the value the NVIDIA driver publishes. Only present when a GPU is found on the device's NUMA node. |
-
-The value is computed exactly as Kubernetes' own `deviceattribute.GetPCIeRootAttributeByPCIBusID`
-helper does (resolve `/sys/bus/pci/devices/<bdf>` and take the leading `pci<domain>:<bus>`
-component), so the two drivers' values are byte-for-byte comparable.
-
-A single claim then requests one GPU and one CXI NIC and constrains them to the same root:
-
-```yaml
-apiVersion: resource.k8s.io/v1
-kind: ResourceClaim
-metadata:
-  name: gpu-cxi
-spec:
-  devices:
-    config:
-      - requests: ["cxi"]
-        opaque:
-          driver: cxi.slingshot.hpe.com   # must match this install's driverName
-          parameters: { txqs: 19, tgqs: 57, eqs: 37, cts: 47, ptes: 36, acs: 18, le_pools: 1, tle_pools: 1, cdi_profiles: ["env", "aws-ofi-nccl"] }
-    constraints:
-      - matchAttribute: resource.kubernetes.io/pcieRoot
-        requests: ["gpu", "cxi"]
-    requests:
-      - name: gpu
-        exactly:
-          deviceClassName: gpu.nvidia.com
-          allocationMode: ExactCount
-          count: 1
-          selectors:
-            - cel: { expression: 'device.driver == "gpu.nvidia.com"' }   # keep a selector so the MutatingAdmissionPolicy does not inject CXI selectors into the GPU request
-      - name: cxi
-        exactly:
-          deviceClassName: cxi-device
-          allocationMode: ExactCount
-          count: 1
-```
-
-The scheduler allocates a GPU and the CXI NIC that share a PCIe root — e.g. `gpu-3` with
-`cxi3`, both on `pci0039:00` (NUMA node 3).
-
-Caveats:
-
-- The CXI NIC and its NUMA-local GPU must both be **free on the same node**; the constraint
-  removes the scheduler's freedom to pick an unrelated NIC, so a busy GPU or a CXI device
-  already in use by another pod **in the same namespace** (see the per-namespace-per-device
-  restriction above) can make an otherwise-valid node unschedulable.
-- `resource.kubernetes.io/pcieRoot` is only published on nodes running a driver build that
-  includes it; the constraint is unsatisfiable on nodes that predate the attribute.
-
-> **Deprecation note:** this republish-the-GPU's-root approach is a stopgap. Once the NVIDIA
-> DRA driver exposes NUMA topology through the standardized device-attributes KEP (the same
-> effort that defines `resource.kubernetes.io/pcieRoot` in `k8s.io/dynamic-resource-allocation/deviceattribute`),
-> both drivers can `matchAttribute` directly on a shared NUMA/topology attribute and this
-> NUMA→GPU-PCIe-root inference can be removed.
 
 ## Mock Mode (kind / no hardware)
 
@@ -690,7 +663,7 @@ The driver supports `--mock-devices=N` which generates N synthetic CXI devices w
 kind create cluster --name cxi-dra-dev --config deploy/kind/kind-config.yaml
 
 # Build and load image (no CGo needed in mock mode)
-podman build -f Dockerfile.ci -t cxi-dra-driver:dev .
+podman build -f Dockerfile.mock -t cxi-dra-driver:dev .
 kind load docker-image cxi-dra-driver:dev --name cxi-dra-dev
 
 # Deploy
@@ -712,7 +685,6 @@ kubectl logs cxi-test-3
 
 - **Hot-plug** — no fsnotify watcher on `/sys/class/cxi_user`; driver restart required if devices appear/disappear
 - **VNI exhaustion handling** — if the configured `[--vni-range-start, --vni-range-end]` is exhausted, the namespace VNI allocator logs the error per reconcile attempt but does not emit an Event on the affected namespace; operators must read the DaemonSet logs to find out why new namespaces aren't getting a VNI
-- **Reconciler API-server load** — the polling reconciler calls `Namespaces().List()` once per `--resource-refresh-interval` tick to build the VNI → namespace map. This is cheap at expected scale (tens of namespaces, 10 s tick) but should be migrated to an informer-backed `NamespaceLister` if the cluster grows large
 
 ## Troubleshooting
 
@@ -747,9 +719,13 @@ Check in order:
    ```
    Should show `SLINGSHOT_DEVICES=cxi0`, `SLINGSHOT_VNIS=<n>`, `SLINGSHOT_SVC_IDS=<n>`.
 
-### Claim rejected: "has no CXI resource config"
+### Claim rejected: "opaque config requests … exceed the scheduler-allocated capacity"
 
-All resource fields are required. Ensure your `ResourceClaimTemplate` has an `opaque` config block with all eight fields (`txqs`, `tgqs`, `eqs`, `cts`, `ptes`, `acs`, `le_pools`, `tle_pools`). See [deploy/kubernetes/test/resourceclaim.yaml](deploy/kubernetes/test/resourceclaim.yaml) for complete examples.
+The claim still carries legacy opaque resource config, but it was allocated without matching capacity requests, so the scheduler charged only the defaults. This happens when the `MutatingAdmissionPolicy` is disabled or did not match the claim (it only converts `requests[0]` using `config[0]`). Move the resources to `spec.devices.requests[].exactly.capacity.requests` — see [deploy/kubernetes/test/resourceclaim.yaml](deploy/kubernetes/test/resourceclaim.yaml).
+
+### Claim rejected: "has neither consumed capacity nor CXI opaque resource config"
+
+The claim was allocated against a device that published no capacity (a driver older than consumable-capacity support), and it has no opaque config to fall back on. Recreate the claim once every node runs the current driver.
 
 ### Claim rejected: "exceed usable ceiling"
 

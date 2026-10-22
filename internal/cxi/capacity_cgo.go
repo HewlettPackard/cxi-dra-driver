@@ -17,22 +17,6 @@ func ReadAvailableCapacity(deviceName string) (ResourceSet, error) {
 	return readAvailableCapacity(deviceName)
 }
 
-// ReadActiveServiceVNIs returns the VNI assigned to each live CXI service on
-// deviceName. Used by the driver's polling reconciler to reverse-map
-// (device, vni) → namespace via the namespace annotation cache so that the
-// in-memory nsDeviceOccupancy state can be reconciled with actual hardware
-// state — recovering from any event-path drift (lost watch events, driver
-// restart, scheduler de-allocations that bypassed both NRI and the
-// ClaimBinder watch).
-//
-// SHS14 stores one VNI per service (vni_min == vni_max under the DRA driver's
-// create path), so each entry in the returned slice corresponds to one
-// service. Services without a VNI restriction (system services, services
-// created outside DRA) are silently skipped.
-func ReadActiveServiceVNIs(deviceName string) ([]uint16, error) {
-	return readActiveServiceVNIs(deviceName)
-}
-
 // ReadActiveServices returns one ServiceInfo per live CXI service on
 // deviceName (svc_id, restricted VNI, is_system_svc bit), including system and
 // VNI-less services. Used by the driver's orphan-service reaper, which must

@@ -26,6 +26,7 @@ Workload: {
     type: "ResourceClaimTemplate"
     deviceClassName: "cxi-device"
     shape_examples: "cxi-small / cxi-medium / cxi-large / cxi-whole"
+    requests: "capacity.requests: txqs … les, tles"
     per_pod: "ephemeral claim per pod (one CXI, no VNI claim)"
   }
 
@@ -53,12 +54,10 @@ Admission: {
   Policy: {
     shape: sql_table
     label: "■ admission-policy.yaml"
-    role: "auto-injects opaque CXI defaults + two CEL selectors"
-    triggers_on: "ResourceClaim CREATE"
+    role: "converts legacy opaque CXI config into capacity.requests"
+    triggers_on: "ResourceClaim CREATE (requests[0] without capacity, config[0] CXI opaque)"
     failure_policy: "Ignore (claim passes through)"
-    constants: "TLEPoolSize=512, LEPoolSize=1024"
-    selector_1: "avail_* >= request (per-resource capacity steering)"
-    selector_2: "!active_namespaces.contains(\",<NS>,\") (per-ns device exclusion)"
+    constants: "le_pools × 1024 → les, tle_pools × 512 → tles"
     impl: "deploy/kubernetes/admission-policy.yaml"
   }
 }
@@ -74,7 +73,9 @@ Kubernetes Scheduler: {
   Structured Parameters: {
     shape: sql_table
     role: "allocates CXI device from ResourceSlices"
-    feature_gate: "DRADeviceBindingConditions=true"
+    feature_gate: "DRAConsumableCapacity + DRADeviceBindingConditions"
+    accounting: "Σ consumedCapacity per device ≤ capacity value (primary capacity gate)"
+    records: "consumedCapacity (policy-rounded) + shareID per allocation"
     binding_gate: "waits for Ready=True before binding pod"
     on_unschedulable: "deallocates + retries on another device"
   }
@@ -94,40 +95,37 @@ DRA Node Driver: {
     role: "device discovery + slice publishing + run loop"
     discovers: "sysfs (real) / mockDevices (--mock-devices)"
     resolves: "CXI ↔ HSN via PCIe root"
-    gpu_colocation: "NUMA-local NVIDIA GPU's PCIe root → resource.kubernetes.io/pcieRoot (cross-driver NIC↔GPU matchAttribute)"
-    publishes: "node-scoped ResourceSlice per device"
-    avail_refresh: "ticker (--resource-refresh-interval) + event-driven via notify chan"
-    ticker_action: "reconcileOccupancyFromHardware THEN publish()"
+    std_attrs: "resource.kubernetes.io/numaNode + pciBusID (standard cross-driver attrs for NIC↔GPU matchAttribute)"
+    publishes: "node-scoped ResourceSlice, once at startup (static)"
+    ticker_action: "reapOrphanServices (--resource-refresh-interval)"
   }
 
   ClaimBinder: {
     shape: sql_table
     label: "■ ClaimBinder (BindingConditions)"
     impl: "internal/driver/claimbinder.go"
-    role: "live fit-check + per-ns device occupancy gate; gates pod binding"
+    role: "safety-net fit-check against live hardware; gates pod binding"
+    covers: "out-of-band services; pre-upgrade claims with no consumedCapacity"
+    requested: "allocation consumedCapacity"
     watches: "ResourceClaims cluster-wide"
-    Ready_True: "fits effective avail AND (ns,dev) not occupied; pending + occupancy recorded under one lock"
+    Ready_True: "fits effective avail (hwAvail − pending); pending recorded under pendingMu"
     Ready_False: "fits hardware but pending blocks; periodic retry"
     Unschedulable_DeviceAtCapacity: "hardware truly full on this device"
-    Unschedulable_NamespaceDeviceOccupied: "another claim in same ns already on this device (SHS14 -EEXIST guard; rare with CEL pre-filter in place)"
-    cleanup_on_dealloc: "Allocation=nil → RemovePending + RemoveOccupancyForClaim"
-    cleanup_on_delete: "watch.Deleted → RemovePending + RemoveOccupancyForClaim"
+    cleanup_on_dealloc: "Allocation=nil → RemovePending"
+    cleanup_on_delete: "watch.Deleted → RemovePending"
   }
 
-  Polling Reconciler: {
+  Orphan Reaper: {
     shape: sql_table
-    label: "■ Polling Reconciler"
-    impl: "internal/driver/reconciler.go"
-    role: "reconciles in-memory occupancy with live CXI services"
-    cadence: "once per ticker, BEFORE publish()"
+    label: "■ Orphan-service Reaper"
+    impl: "internal/driver/reaper.go"
+    role: "destroys CXI services whose owning pod is gone"
+    cadence: "once per ticker"
     skip_mock: "mockDevices != nil → no-op (no hardware to enumerate)"
-    list_vnis: "cxi.ReadActiveServiceVNIs(dev) → live service VNIs per device"
-    list_ns: "client-go Namespaces().List() → vni → namespace map"
-    keep_rule: "entry KEPT if UID in pending OR (ns,dev) in hwSet"
-    release_rule: "entry RELEASED via removeOccupancyLocked otherwise"
-    adopt_rule: "hwSet-only entry ADDED with synthetic UID hw:<dev>/<ns>"
-    self_cleaning: "synthetic entry released on next reconcile after service goes away"
-    covers: "driver restart, missed watch events, force-deleted pods, NRI short-circuits"
+    list_svcs: "cxi.ReadActiveServices(dev) → live services per device"
+    preserve_rule: "kept if blessed / is_system_svc / owned by live pod (LiveSvcIDs) / netns still live / netns indeterminate"
+    grace: "deleted only after N consecutive orphan cycles"
+    covers: "driver restart, force-deleted pods, NRI StopPodSandbox short-circuits"
   }
 
   PrepareResourceClaims: {
@@ -135,7 +133,7 @@ DRA Node Driver: {
     label: "■ PrepareResourceClaims"
     impl: "internal/driver/prepare.go"
     role: "kubelet plugin hook"
-    resolves_resources: "from claim opaque config (8 required fields)"
+    resolves_resources: "from allocation consumedCapacity; opaque config fallback for pre-upgrade claims; rejects opaque config exceeding consumed"
     ceiling_check: "fast-fail if request > hardware total - overhead"
     reads_vni: "from claim.namespace annotation (10-retry)"
     writes_store: "podUID → []PodAllocation{Device,HSN,VNI}"
@@ -149,7 +147,7 @@ DRA Node Driver: {
     impl: "internal/driver/unprepare.go"
     role: "kubelet plugin hook"
     clears: "AllocationStore.Delete(podUID); best-effort delete of the CNI hint file"
-    no_occupancy_touch: "does NOT release occupancy — racing the kernel service would cause -EEXIST on the next grant; NRI + binder + reconciler own occupancy release"
+    no_occupancy_touch: "does NOT destroy the kernel service — racing it would cause resource churn on the next grant; NRI + reaper own service teardown"
   }
 
   AllocationStore: {
@@ -166,14 +164,14 @@ DRA Node Driver: {
     impl: "internal/nri/plugin.go"
     RunPodSandbox: "per-device mutex; secondary fit-check; CreateService(dev, netnsInode, VNI, ResourceSet); buildNetSysfs synthetic /sys/class/net; RemovePending on success"
     CreateContainer: "inject SLINGSHOT_DEVICES, SLINGSHOT_VNIS, SLINGSHOT_SVC_IDS; overmount synthetic /sys/class/net (HSN)"
-    StopPodSandbox: "DestroyService; RemoveOccupancy per (ns,dev) (idempotent, even on DeleteService error); remove netns sysfs tree; TriggerRetry; TriggerRepublish"
+    StopPodSandbox: "DestroyService (idempotent); remove netns sysfs tree; TriggerRetry"
   }
 
   Namespace VNI Allocator: {
     shape: sql_table
     label: "■ Namespace VNI Allocator (leader-elected)"
     impl: "internal/driver/vniallocator.go + vnipool.go"
-    lease: "cxi-vni-allocator-leader (15s/10s/2s)"
+    lease: "<driverName>-vni-allocator-leader (15s/10s/2s)"
     informer: "namespaces; single workqueue worker"
     skip_list: "kube-system, kube-public, kube-node-lease"
     annotates: "cxi.slingshot.hpe.com/vni = <int>"
@@ -181,20 +179,14 @@ DRA Node Driver: {
     on_exhaustion: "logs error; key requeued"
   }
 
-  Occupancy Tables: {
+  Pending Grants: {
     shape: sql_table
-    label: "■ pending + nsDeviceOccupancy + claimToOccupancy"
+    label: "■ pending"
     impl: "internal/driver/driver.go (under pendingMu)"
-    role: "in-flight grants + per-(ns,dev) slot tracking"
-    pending: "map[claimUID]pendingEntry{ns, dev, resources} — bridges Ready=True grant to service creation"
-    nsDeviceOccupancy: "map[ns]map[dev]claimUID — UID-valued so binder can release by UID without knowing device"
-    claimToOccupancy: "map[claimUID]occupancyKey{ns, dev} — reverse index for the binder cleanup path"
-    add: "checkAndAddPending under mutex (4-way: granted / occupied / hwFull / Ready=False)"
-    remove_pending: "RemovePending after NRI CreateService succeeds; also called by binder cleanup paths"
-    remove_occupancy_by_pair: "RemoveOccupancy(ns,dev) — NRI StopPodSandbox path"
-    remove_occupancy_by_uid: "RemoveOccupancyForClaim(uid) — binder cleanup path (Allocation=nil / claim deleted)"
-    centralised_release: "all releases go through removeOccupancyLocked; forward + reverse maps stay strictly in lockstep"
-    used_by: "effectiveAvail() to subtract from published avail_*; active_namespaces attribute build"
+    role: "in-flight grants not yet backed by a service"
+    pending: "map[(claimUID,dev)]pendingEntry{dev, resources} — bridges Ready=True grant to service creation"
+    add: "checkAndAddPending under mutex (granted / hwFull / Ready=False); idempotent per (claim,dev)"
+    remove_pending: "RemovePending after NRI CreateService succeeds; also called by binder cleanup paths (Allocation=nil / claim deleted)"
   }
 
   ResourceSlice CXI: {
@@ -203,26 +195,24 @@ DRA Node Driver: {
     impl: "internal/driver/resourceslice.go"
     pool: "<nodeName> (node-scoped)"
     devices: "cxi0..cxi3"
-    attrs: "numa.node, pcie.root, hsn"
-    capacity: "8 ResourceSet fields per device"
-    avail: "live: hwAvail − pending"
-    active_namespaces: "comma-padded sorted string ',ns1,ns2,' per device; drives CEL exclusion selector"
+    attrs: "type, hsn_iface, resource.kubernetes.io/{numaNode, pciBusID}"
+    capacity: "txqs, tgqs, eqs, cts, ptes, acs, les, tles = usable ceiling (hardware − blessed system services)"
+    request_policy: "default per capacity (cxi-small queues, 0 LEs/TLEs); les step 1024, tles step 512"
+    impl_capacity: "internal/driver/capacity.go"
     multi_alloc: "AllowMultipleAllocations=true"
-    gpu_pcie_root: "resource.kubernetes.io/pcieRoot — NUMA-local GPU root (only when a GPU is found); standardized name, byte-comparable with the NVIDIA driver"
+    static: "published once; consumption tracked by scheduler, not in the slice"
+    std_attrs: "resource.kubernetes.io/numaNode (omitted if unknown) + pciBusID — K8s v1.37 standard device attributes, matchAttribute-comparable with the NVIDIA GPU driver"
   }
 
-  Kubelet Plugin -> ResourceSlice CXI: "publishes + refreshes"
-  ClaimBinder -> Kubelet Plugin: "TriggerRepublish on grant"
-  ClaimBinder -> Occupancy Tables: "checkAndAddPending (records pending + occupancy under one lock)"
-  ClaimBinder -> Occupancy Tables: "RemovePending + RemoveOccupancyForClaim on Allocation=nil / claim deleted"
-  Polling Reconciler -> Occupancy Tables: "applyReconcile (release leaks, adopt orphans with synthetic UID)"
-  Polling Reconciler -> Kubelet Plugin: "TriggerRepublish on state change"
+  Kubelet Plugin -> ResourceSlice CXI: "publishes once"
+  ClaimBinder -> Pending Grants: "checkAndAddPending (records pending under pendingMu)"
+  ClaimBinder -> Pending Grants: "RemovePending on Allocation=nil / claim deleted"
+  Orphan Reaper -> Node Resources.CXI Service: "DestroyService for orphaned services"
   Kubelet Plugin -> PrepareResourceClaims: "kubelet calls on pod scheduled"
   PrepareResourceClaims -> UnprepareResourceClaims: "kubelet calls on pod removal"
   PrepareResourceClaims -> AllocationStore: "write podUID → allocation"
   AllocationStore -> NRI Plugin: "NRI reads on RunPodSandbox / StopPodSandbox"
-  NRI Plugin -> Occupancy Tables: "RemovePending after service create"
-  NRI Plugin -> Occupancy Tables: "RemoveOccupancy(ns,dev) after DestroyService"
+  NRI Plugin -> Pending Grants: "RemovePending after service create"
   NRI Plugin -> ClaimBinder: "TriggerRetry on StopPodSandbox"
 }
 
@@ -265,7 +255,7 @@ Node Resources: {
     binding: "netns inode + VNI + ResourceSet"
     libcxi: "alloc via libcxi ioctl (-tags cxi build)"
     pool_sizes: "TLEPoolSize=512, LEPoolSize=1024"
-    list_api: "cxil_get_svc_list + cxil_svc_get_vni_range → reconciler input"
+    list_api: "cxil_get_svc_list → orphan-reaper input"
   }
 
   ResourceSet: {
@@ -302,9 +292,9 @@ Container: {
     label: "■ CDI Env Spec"
     impl: "internal/cdi/env.go + internal/cdi/containerd.go"
     flag: "--enable-cdi-env=true (set in daemonset)"
-    purpose: "injects libfabric/libcxi libs + optional NCCL/AWS-OFI-NCCL"
+    purpose: "injects /dev/kdreg2, gdrdrv, xpmem, /dev/shm + host libfabric/libcxi (NCCL via k8s-modules)"
     env: "CXIP_SKIP_AMA_CHECK=1 bypasses libfabric AMA gate (no patch, no real netdev)"
-    opt_in: "per-claim cdi_profiles: [env, nccl, aws-ofi-nccl]"
+    attached: "always, to every CXI device (no per-claim opt-in)"
     auto_configure: "writes /etc/containerd/conf.d/50-cxi-cdi.toml + SIGHUPs containerd at startup"
   }
 
@@ -337,22 +327,21 @@ Container: {
 
 # ── FLOWS ────────────────────────────────────────────────────────────────────
 
-# Admission
+# Admission (legacy claims only)
 Workload.Pods.POD -> Admission.Policy: "ResourceClaim CREATE intercepted"
-Admission.Policy -> Workload.Pods.POD: "claim with opaque config + 2 CEL selectors persisted"
+Admission.Policy -> Workload.Pods.POD: "opaque config converted to capacity.requests"
 
-# Scheduling (slice flows into scheduler; selectors filter eligible devices)
+# Scheduling (scheduler charges capacity.requests against device capacity)
 Workload.Pods.POD -> Kubernetes Scheduler.Structured Parameters: "pending pod"
-DRA Node Driver.ResourceSlice CXI -> Kubernetes Scheduler.Structured Parameters: "available CXI capacity + active_namespaces"
+DRA Node Driver.ResourceSlice CXI -> Kubernetes Scheduler.Structured Parameters: "per-device consumable capacity"
 
 # Binding gate
 Kubernetes Scheduler.Structured Parameters -> DRA Node Driver.ClaimBinder: "claim allocated to this node"
-DRA Node Driver.ClaimBinder -> Kubernetes Scheduler.Structured Parameters: "Ready=True (bind) / Unschedulable: DeviceAtCapacity | NamespaceDeviceOccupied (retry)"
+DRA Node Driver.ClaimBinder -> Kubernetes Scheduler.Structured Parameters: "Ready=True (bind) / Unschedulable: DeviceAtCapacity (retry)"
 
 # Namespace VNI
 DRA Node Driver.Namespace VNI Allocator -> Node Resources.Namespace: "patch annotation"
 Node Resources.Namespace -> DRA Node Driver.PrepareResourceClaims: "read VNI annotation"
-Node Resources.Namespace -> DRA Node Driver.Polling Reconciler: "list namespaces → vni → ns map"
 
 # Node preparation
 Kubernetes Scheduler.Structured Parameters -> DRA Node Driver.PrepareResourceClaims: "pod scheduled to node"
@@ -363,7 +352,6 @@ Node Resources.HSN Interface -> Container.Slingshot CNI: "IPVLAN parent"
 # Container lifecycle (NRI → service)
 DRA Node Driver.NRI Plugin -> Node Resources.CXI Service: "CreateService(dev, netnsInode, VNI)"
 Node Resources.CXI Service -> Container.Pod Container: "scopes access to (netns, VNI)"
-Node Resources.CXI Service -> DRA Node Driver.Polling Reconciler: "cxil_get_svc_list → live VNIs"
 
 # Hardware discovery
 DRA Node Driver.Kubelet Plugin -> Node Resources.CXI Device: "discovers at startup"

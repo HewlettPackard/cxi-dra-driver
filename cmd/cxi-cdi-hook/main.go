@@ -1,6 +1,6 @@
 // cxi-cdi-hook is a standalone, statically-linked OCI runtime hook installed
 // on every node by cxi-dra-driver (see internal/cdi.InstallHook). It replaces
-// the CDI env/nccl/aws-ofi-nccl specs' former dependency on NVIDIA's
+// the CDI env spec's former dependency on NVIDIA's
 // /usr/bin/nvidia-cdi-hook binary, which is only present on nodes with
 // nvidia-container-toolkit installed and has no relationship to CXI hardware.
 //
@@ -8,7 +8,7 @@
 // operation cxi-dra-driver's CDI specs need: refreshing the ldconfig cache of
 // a freshly created container's rootfs so libraries bind-mounted in by CDI
 // are resolvable by the dynamic linker. It does not shell out to a bare
-// "ldconfig" resolved from $PATH \u2014 that would just trade the nvidia-cdi-hook
+// "ldconfig" resolved from $PATH - that would just trade the nvidia-cdi-hook
 // dependency for an equally external ldconfig one. Instead it execs the
 // self-contained ldconfig cxi-dra-driver installs alongside this hook (see
 // internal/cdi.DefaultLdconfigDir), via that ldconfig's own dynamic linker,
@@ -16,6 +16,7 @@
 package main
 
 import (
+	"debug/elf"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -72,7 +73,7 @@ func main() {
 // it so it rebuilds /etc/ld.so.cache inside the container including the given
 // folders. ldconfig is invoked through its own dynamic linker (also installed
 // at ldconfigDir) with an explicit --library-path, so it resolves libc
-// entirely from ldconfigDir rather than the node's own library layout \u2014 the
+// entirely from ldconfigDir rather than the node's own library layout - the
 // same trick this repo's own Dockerfile uses to run cxi-dra-driver itself
 // without depending on the runtime environment's glibc.
 func updateLdcache(stdin *os.File, ldconfigDir string, folders []string) error {
@@ -91,14 +92,36 @@ func updateLdcache(stdin *os.File, ldconfigDir string, folders []string) error {
 		return err
 	}
 
-	args := append([]string{"--library-path", ldconfigDir, ldconfigBin, "-r", rootPath}, folders...)
-	cmd := exec.Command(interp, args...)
+	var cmd *exec.Cmd
+	if isStaticELF(ldconfigBin) {
+		// A static ldconfig has no PT_INTERP, so running it through ld.so fails.
+		cmd = exec.Command(ldconfigBin, append([]string{"-r", rootPath}, folders...)...)
+	} else {
+		args := append([]string{"--library-path", ldconfigDir, ldconfigBin, "-r", rootPath}, folders...)
+		cmd = exec.Command(interp, args...)
+	}
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("%s %v: %w", interp, args, err)
+		return fmt.Errorf("%v: %w", cmd.Args, err)
 	}
 	return nil
+}
+
+// isStaticELF reports whether path is an ELF executable with no dynamic
+// interpreter. Anything unreadable or not ELF is treated as dynamic.
+func isStaticELF(path string) bool {
+	f, err := elf.Open(path)
+	if err != nil {
+		return false
+	}
+	defer func() { _ = f.Close() }()
+	for _, p := range f.Progs {
+		if p.Type == elf.PT_INTERP {
+			return false
+		}
+	}
+	return true
 }
 
 // resolveLdconfig locates the dynamic linker and ldconfig binary that

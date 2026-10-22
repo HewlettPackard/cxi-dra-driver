@@ -24,14 +24,6 @@ func ReadAvailableCapacity(_ string) (ResourceSet, error) {
 	return DeviceCapacity(), nil
 }
 
-// ReadActiveServiceVNIs returns an empty slice in non-cxi builds — there are
-// no live CXI services in mock mode, and the reconciler skips the reconcile
-// pass entirely in that case. Production builds enumerate
-// cxil_get_svc_list + cxil_svc_get_vni_range via libcxi (capacity_cgo.go).
-func ReadActiveServiceVNIs(_ string) ([]uint16, error) {
-	return nil, nil
-}
-
 // ReadActiveServices returns an empty slice in non-cxi builds — there are no
 // live CXI services in mock mode, so the orphan-service reaper has nothing to
 // scan and short-circuits. Production builds enumerate cxil_get_svc_list via

@@ -44,7 +44,7 @@ func enumInNetns(netnsPath string) ([]Iface, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open netns %s: %w", netnsPath, err)
 	}
-	defer unix.Close(nsFd)
+	defer func() { _ = unix.Close(nsFd) }()
 
 	if err := unix.Setns(nsFd, unix.CLONE_NEWNET); err != nil {
 		return nil, fmt.Errorf("setns into pod netns: %w", err)
@@ -64,12 +64,12 @@ func enumInNetns(netnsPath string) ([]Iface, error) {
 	if err != nil {
 		return nil, fmt.Errorf("creating temp mountpoint: %w", err)
 	}
-	defer os.RemoveAll(tmp)
+	defer func() { _ = os.RemoveAll(tmp) }()
 
 	if err := unix.Mount("sysfs", tmp, "sysfs", 0, ""); err != nil {
 		return nil, fmt.Errorf("mounting sysfs for pod netns: %w", err)
 	}
-	defer unix.Unmount(tmp, unix.MNT_DETACH)
+	defer func() { _ = unix.Unmount(tmp, unix.MNT_DETACH) }()
 
 	netDir := filepath.Join(tmp, "class", "net")
 	entries, err := os.ReadDir(netDir)

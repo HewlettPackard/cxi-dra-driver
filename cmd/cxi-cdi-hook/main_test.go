@@ -102,3 +102,16 @@ func TestResolveLdconfigMissingBinary(t *testing.T) {
 		t.Error("expected error for missing ldconfig binary, got nil")
 	}
 }
+
+func TestIsStaticELFTreatsNonELFAsDynamic(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "ldconfig")
+	if err := os.WriteFile(p, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if isStaticELF(p) {
+		t.Error("non-ELF file reported static")
+	}
+	if isStaticELF(filepath.Join(t.TempDir(), "missing")) {
+		t.Error("missing file reported static")
+	}
+}

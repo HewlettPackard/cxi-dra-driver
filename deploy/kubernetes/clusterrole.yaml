@@ -76,7 +76,7 @@ rules:
     verbs: ["create"]
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
-    resourceNames: ["cxi-vni-allocator-leader"]
+    resourceNames: ["cxi.slingshot.hpe.com-vni-allocator-leader"]
     verbs: ["get", "update"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
