@@ -18,6 +18,7 @@ Workload: {
     type: "ResourceClaimTemplate"
     deviceClassName: "cxi-device"
     shape_examples: "cxi-small / cxi-medium / cxi-large / cxi-whole"
+    requests: "capacity.requests: txqs … les, tles"
     per_pod: "ephemeral claim per pod"
     note: "exactly one CXI claim per pod"
   }
@@ -43,9 +44,9 @@ MutatingAdmissionPolicy: {
 
   Policy: {
     shape: sql_table
-    role: "auto-injects opaque CXI config"
+    role: "converts legacy opaque CXI config to capacity.requests"
     triggers_on: "ResourceClaim CREATE"
-    enforces: "all 8 resource fields present"
+    pools: "le_pools × 1024 → les; tle_pools × 512 → tles"
     failure_policy: "Ignore (claim passes through)"
     impl: "deploy/kubernetes/admission-policy.yaml"
   }
@@ -58,7 +59,8 @@ Kubernetes Scheduler: {
   Structured Parameters: {
     shape: sql_table
     role: "allocates CXI device from ResourceSlices"
-    selects_node: "by ResourceSlice avail_* attrs"
+    accounting: "Σ consumedCapacity per device ≤ published capacity"
+    records: "consumedCapacity + shareID per allocation"
     binding_gate: "waits for BindingCondition Ready=True"
     on_unschedulable: "deallocates + retries on another device"
   }
@@ -73,22 +75,23 @@ DRA Node Driver: {
     role: "device discovery + slice publishing"
     discovers: "CXI devices via sysfs (or mock)"
     resolves: "CXI-to-HSN pairing via PCIe topology"
-    publishes: "node-scoped ResourceSlice per device"
-    avail_attrs: "txqs/tgqs/eqs/cts/ptes/tles/les/acs"
+    publishes: "node-scoped ResourceSlice, once at startup (static)"
+    capacity: "txqs/tgqs/eqs/cts/ptes/acs/les/tles = usable ceiling"
   }
 
   ClaimBinder: {
     shape: sql_table
-    role: "live capacity fit-check via BindingConditions"
+    role: "safety-net fit-check against live hardware via BindingConditions"
+    covers: "out-of-band services; pre-upgrade claims"
     watches: "ResourceClaims cluster-wide"
     sets_Ready: "True / False / Unschedulable per claim"
     pending_map: "in-flight grants (Ready=True, no service yet)"
-    re_publish: "triggers ResourceSlice update on grant"
   }
 
   PrepareResourceClaims: {
     shape: sql_table
     role: "kubelet hook on pod scheduling"
+    resources: "from allocation consumedCapacity (opaque config fallback)"
     reads_vni: "from claim.namespace annotation"
     fast_fail: "rejects requests > usable ceiling"
     writes_store: "podUID → []PodAllocation{Device,HSN,VNI}"
@@ -119,7 +122,7 @@ DRA Node Driver: {
   Namespace VNI Allocator: {
     shape: sql_table
     role: "leader-elected; assigns VNI per namespace"
-    lease: "cxi-vni-allocator-leader"
+    lease: "<driverName>-vni-allocator-leader"
     skip_list: "kube-system, kube-public, kube-node-lease"
     annotates: "cxi.slingshot.hpe.com/vni on Namespace"
     range: "--vni-range-start..end (e.g. 100..300)"
@@ -129,14 +132,13 @@ DRA Node Driver: {
     shape: sql_table
     pool: "<nodeName> (node-scoped)"
     devices: "cxi0, cxi1, cxi2, cxi3"
-    attributes: "numa.node, pcie.root, hsn"
-    capacity: "txqs, tgqs, eqs, cts, ptes, tles, les, acs"
-    avail: "live, refreshed every 10s + on events"
-    gpu_colocation: "resource.kubernetes.io/pcieRoot (NUMA-local GPU root) for NIC↔GPU matchAttribute"
+    allowMultipleAllocations: "true (shared between claims)"
+    attributes: "type, hsn_iface, resource.kubernetes.io/numaNode, pciBusID"
+    capacity: "txqs, tgqs, eqs, cts, ptes, acs, les (step 1024), tles (step 512)"
+    gpu_colocation: "matchAttribute resource.kubernetes.io/numaNode for NIC↔GPU"
   }
 
-  Kubelet Plugin -> ResourceSlice CXI: "publishes + republishes"
-  ClaimBinder -> Kubelet Plugin: "TriggerRepublish on grant"
+  Kubelet Plugin -> ResourceSlice CXI: "publishes once"
   Kubelet Plugin -> PrepareResourceClaims: "on pod scheduled"
   PrepareResourceClaims -> UnprepareResourceClaims: "on pod removal"
   PrepareResourceClaims -> AllocationStore: "write podUID → allocation"
@@ -206,12 +208,12 @@ Container: {
 # User submits workload
 User -> Workload.Owning Resource: "kubectl apply Deployment"
 
-# Admission rewrites claim
-Workload.Pods.POD -> MutatingAdmissionPolicy.Policy: "ResourceClaim created"
+# Admission converts legacy claims
+Workload.Pods.POD -> MutatingAdmissionPolicy.Policy: "ResourceClaim created (legacy opaque config)"
 
 # Scheduling
 Workload.Pods.POD -> Kubernetes Scheduler.Structured Parameters: "pending pod with claim"
-DRA Node Driver.ResourceSlice CXI -> Kubernetes Scheduler.Structured Parameters: "available CXI capacity"
+DRA Node Driver.ResourceSlice CXI -> Kubernetes Scheduler.Structured Parameters: "per-device consumable capacity"
 
 # Binding gate
 Kubernetes Scheduler.Structured Parameters -> DRA Node Driver.ClaimBinder: "claim allocated to this node"

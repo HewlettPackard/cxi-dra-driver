@@ -42,7 +42,7 @@ func InstallHook(srcPath, destPath string) error {
 	if err != nil {
 		return fmt.Errorf("opening hook binary %s: %w", srcPath, err)
 	}
-	defer src.Close()
+	defer func() { _ = src.Close() }()
 
 	if err := os.MkdirAll(filepath.Dir(destPath), 0o755); err != nil {
 		return fmt.Errorf("creating hook install dir: %w", err)
@@ -53,14 +53,14 @@ func InstallHook(srcPath, destPath string) error {
 		return fmt.Errorf("creating temp file for hook binary: %w", err)
 	}
 	tmpPath := tmp.Name()
-	defer os.Remove(tmpPath) // no-op once renamed into place
+	defer func() { _ = os.Remove(tmpPath) }() // no-op once renamed into place
 
 	if _, err := io.Copy(tmp, src); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		return fmt.Errorf("copying hook binary: %w", err)
 	}
 	if err := tmp.Chmod(0o755); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		return fmt.Errorf("chmod hook binary: %w", err)
 	}
 	if err := tmp.Close(); err != nil {

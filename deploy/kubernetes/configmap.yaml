@@ -8,73 +8,41 @@ metadata:
 data:
   env.json: |
     {
-      "envMounts": [
-        {"hostPath": "/opt/cray/libfabric/2.3.1/lib64/libfabric.so.1", "containerPath": "/usr/lib64/libfabric.so.1"},
-        {"hostPath": "/usr/lib64/libcxi.so.1",            "containerPath": "/usr/lib64/libcxi.so.1"},
-        {"hostPath": "/usr/lib64/libcurl.so.4",           "containerPath": "/usr/lib64/libcurl.so.4"},
-        {"hostPath": "/usr/lib64/libjson-c.so.5",         "containerPath": "/usr/lib64/libjson-c.so.5"},
-        {"hostPath": "/usr/lib64/libatomic.so.1",         "containerPath": "/usr/lib64/libatomic.so.1"},
-        {"hostPath": "/usr/lib64/libnl-3.so.200",         "containerPath": "/usr/lib64/libnl-3.so.200"},
-        {"hostPath": "/usr/lib64/libnghttp2.so.14",       "containerPath": "/usr/lib64/libnghttp2.so.14"},
-        {"hostPath": "/usr/lib64/libidn2.so.0",           "containerPath": "/usr/lib64/libidn2.so.0"},
-        {"hostPath": "/usr/lib64/libssh.so.4",            "containerPath": "/usr/lib64/libssh.so.4"},
-        {"hostPath": "/usr/lib64/libpsl.so.5",            "containerPath": "/usr/lib64/libpsl.so.5"},
-        {"hostPath": "/usr/lib64/libssl.so.3",          "containerPath": "/usr/lib64/libssl.so.1.1"},
-        {"hostPath": "/usr/lib64/libcrypto.so.3",       "containerPath": "/usr/lib64/libcrypto.so.1.1"},
-        {"hostPath": "/usr/lib64/libgssapi_krb5.so.2",    "containerPath": "/usr/lib64/libgssapi_krb5.so.2"},
-        {"hostPath": "/usr/lib64/libldap_r-2.4.so.2",     "containerPath": "/usr/lib64/libldap_r-2.4.so.2"},
-        {"hostPath": "/usr/lib64/liblber-2.4.so.2",       "containerPath": "/usr/lib64/liblber-2.4.so.2"},
-        {"hostPath": "/usr/lib64/libzstd.so.1",           "containerPath": "/usr/lib64/libzstd.so.1"},
-        {"hostPath": "/usr/lib64/libbrotlidec.so.1",      "containerPath": "/usr/lib64/libbrotlidec.so.1"},
-        {"hostPath": "/usr/lib64/libz.so.1",              "containerPath": "/usr/lib64/libz.so.1"},
-        {"hostPath": "/usr/lib64/libunistring.so.2",      "containerPath": "/usr/lib64/libunistring.so.2"},
-        {"hostPath": "/usr/lib64/libjitterentropy.so.3",  "containerPath": "/usr/lib64/libjitterentropy.so.3"},
-        {"hostPath": "/usr/lib64/libkrb5.so.3",           "containerPath": "/usr/lib64/libkrb5.so.3"},
-        {"hostPath": "/usr/lib64/libk5crypto.so.3",       "containerPath": "/usr/lib64/libk5crypto.so.3"},
-        {"hostPath": "/lib64/libcom_err.so.2",            "containerPath": "/lib64/libcom_err.so.2"},
-        {"hostPath": "/usr/lib64/libkrb5support.so.0",    "containerPath": "/usr/lib64/libkrb5support.so.0"},
-        {"hostPath": "/usr/lib64/libsasl2.so.3",          "containerPath": "/usr/lib64/libsasl2.so.3"},
-        {"hostPath": "/usr/lib64/libbrotlicommon.so.1",   "containerPath": "/usr/lib64/libbrotlicommon.so.1"},
-        {"hostPath": "/usr/lib64/libkeyutils.so.1",       "containerPath": "/usr/lib64/libkeyutils.so.1"},
-        {"hostPath": "/usr/lib64/libpcre.so.1",           "containerPath": "/usr/lib64/libpcre.so.1"},
-        {"hostPath": "/opt/xpmem/lib64/libxpmem.so.0",    "containerPath": "/usr/lib64/libxpmem.so.0"}
+      "ldcache": {
+        "enabled": true
+      },
+      "libs": [
+        "/opt/cray/libfabric/2.3.1/lib64/libfabric.so.1",
+        "/usr/lib64/libcxi.so.1",
+        "/usr/lib64/libcurl.so.4",
+        "/usr/lib64/libjson-c.so.5",
+        "/usr/lib64/libatomic.so.1",
+        "/usr/lib64/libnl-3.so.200",
+        "/usr/lib64/libnghttp2.so.14",
+        "/usr/lib64/libidn2.so.0",
+        "/usr/lib64/libssh.so.4",
+        "/usr/lib64/libpsl.so.5",
+        "/usr/lib64/libssl.so.3",
+        "/usr/lib64/libcrypto.so.3",
+        "/usr/lib64/libgssapi_krb5.so.2",
+        "/usr/lib64/libldap_r-2.4.so.2",
+        "/usr/lib64/liblber-2.4.so.2",
+        "/usr/lib64/libzstd.so.1",
+        "/usr/lib64/libbrotlidec.so.1",
+        "/usr/lib64/libz.so.1",
+        "/usr/lib64/libunistring.so.2",
+        "/usr/lib64/libjitterentropy.so.3",
+        "/usr/lib64/libkrb5.so.3",
+        "/usr/lib64/libk5crypto.so.3",
+        "/lib64/libcom_err.so.2",
+        "/usr/lib64/libkrb5support.so.0",
+        "/usr/lib64/libsasl2.so.3",
+        "/usr/lib64/libbrotlicommon.so.1",
+        "/usr/lib64/libkeyutils.so.1",
+        "/usr/lib64/libpcre.so.1",
+        "/opt/xpmem/lib64/libxpmem.so.0"
       ],
-
-      "envVars": [
+      "env": [
         "CXIP_SKIP_AMA_CHECK=1"
-      ],
-
-      "ncclPrefix": "/projects/public/brics/dev/apps/linux-neoverse_v2/nccl-2.29.2-1-yjntbzz5uuuashekge53wqizfqum6swy",
-
-      "awsOfiMounts": [
-        {"hostPath": "/projects/public/brics/dev/apps/linux-neoverse_v2/aws-ofi-nccl-1.18.0-6pbztrbjhvrmtu5r6nq2silgputmmcyk/lib/libnccl-net.so", "containerPath": "/usr/lib/libnccl-net.so"},
-        {"hostPath": "/usr/lib64/libgdrapi.so.2.5",                                                                                              "containerPath": "/usr/lib/libgdrapi.so"},
-        {"hostPath": "/projects/public/brics/dev/apps/linux-neoverse_v2/hwloc-2.12.2-xbbx7czzg3oczc3trftvj2dat3t6qj3o/lib/libhwloc.so.15",         "containerPath": "/usr/lib/libhwloc.so.15"},
-        {"hostPath": "/projects/public/brics/dev/apps/linux-neoverse_v2/libpciaccess-0.17-yisowb26ojigtiis73t5dukyrvx7r6rk/lib/libpciaccess.so.0", "containerPath": "/usr/lib/libpciaccess.so.0"},
-        {"hostPath": "/projects/public/brics/dev/apps/linux-neoverse_v2/libxml2-2.13.5-xr3mgbb5y3midpndczeurgot35yosxkd/lib/libxml2.so.2",         "containerPath": "/usr/lib/libxml2.so.2"},
-        {"hostPath": "/projects/public/brics/dev/apps/linux-neoverse_v2/gcc-runtime-14.3.0-4aynqrbkrzeranfuqhyfg7wktmszdenq/lib/libatomic.so.1",   "containerPath": "/usr/lib/libatomic.so.1"},
-        {"hostPath": "/projects/public/brics/dev/apps/linux-neoverse_v2/xz-5.6.3-iqien4jp4hkpdks2rzyflpvgw3b72zqc/lib/liblzma.so.5",               "containerPath": "/usr/lib/liblzma.so.5"},
-        {"hostPath": "/projects/public/brics/dev/apps/linux-neoverse_v2/libiconv-1.18-4ok6y76vboaxcwzvxwnwhc6uaxzookdp/lib/libiconv.so.2",         "containerPath": "/usr/lib/libiconv.so.2"}
-      ],
-
-      "awsOfiEnv": [
-        "NCCL_NET=AWS Libfabric",
-        "NCCL_CROSS_NIC=1",
-        "NCCL_NET_GDR_LEVEL=PHB",
-        "NCCL_SOCKET_IFNAME=eth0",
-        "NCCL_MIN_NCHANNELS=4",
-        "NCCL_GDRCOPY_ENABLE=1",
-        "NCCL_NET_FORCE_FLUSH=0",
-        "FI_MR_CACHE_MONITOR=userfaultfd",
-        "FI_CXI_DISABLE_HOST_REGISTER=1",
-        "FI_HMEM_CUDA_USE_GDRCOPY=1",
-        "FI_CXI_DEFAULT_CQ_SIZE=131072",
-        "FI_CXI_DEFAULT_TX_SIZE=2048",
-        "FI_CXI_RDZV_PROTO=alt_read",
-        "FI_CXI_RDZV_THRESHOLD=0",
-        "FI_CXI_RDZV_GET_MIN=0",
-        "FI_CXI_RDZV_EAGER_SIZE=0",
-        "FI_CXI_DISABLE_NON_INJECT_MSG_IDC=1",
-        "FI_CXI_RX_MATCH_MODE=hybrid"
       ]
     }

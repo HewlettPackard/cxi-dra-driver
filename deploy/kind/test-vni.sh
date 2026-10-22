@@ -24,7 +24,7 @@ export KUBECONFIG="${KUBECONFIG:-${KUBECONFIG_DEFAULT}}"
 
 CLUSTER_NS="kube-system"
 DRIVER="cxi.slingshot.hpe.com"
-LEASE_NAME="cxi-vni-allocator-leader"
+LEASE_NAME="cxi.slingshot.hpe.com-vni-allocator-leader"
 DAEMONSET_NAME="cxi-dra-driver"
 VNI_ANNOTATION="cxi.slingshot.hpe.com/vni"
 # Must match --vni-range-start / --vni-range-end in daemonset-mock.yaml.
@@ -158,7 +158,6 @@ spec:
               acs: 2
               le_pools: 1
               tle_pools: 1
-              cdi_profiles: []
 ---
 apiVersion: v1
 kind: Pod

@@ -7,8 +7,8 @@
 
 ## Before opening a PR
 
-- Run `go test ./...`, `make vet`, and `golangci-lint run` — all three are enforced in CI (`.github/workflows/build.yaml`).
-- If your change touches `internal/cxi`'s `_cgo.go` files, attempt a `make build` on an ARM64 Slingshot node with libcxi headers, or note in the PR that this wasn't possible.
+- Run `go test ./...`, `make vet`, and `golangci-lint run`. CI (`.github/workflows/build.yaml`) enforces only `go vet` and `go test`; `golangci-lint` is a local check, so run it yourself.
+- If your change touches `internal/cxi`'s `_cgo.go` files, check that `make image` still builds (it compiles libcxi from pinned SHS sources in-container), or run `make build` on a Slingshot node with libcxi headers, or note in the PR that neither was possible.
 - If your change affects pod lifecycle behavior (`internal/driver`, `internal/nri`, `internal/cdi`), verify it against the sibling `cxi-dra-integration-tests` suite — this repo's own CI cannot reach a live cluster.
 - Use `.github/pull_request_template.md` to structure the description.
 
@@ -18,7 +18,7 @@
 
 ## Updating deployment manifests
 
-Both `deploy/helm/cxi-dra-driver` and `deploy/kubernetes/` must stay in sync for any change to RBAC, the DeviceClass, or the MutatingAdmissionPolicy — the Helm chart is the recommended path but the raw manifests are kept as a lighter alternative (see README § Deployment).
+Both `deploy/helm/cxi-dra-driver` and `deploy/kubernetes/` must stay in sync for any change to RBAC (including the VNI allocator's `<driverName>-vni-allocator-leader` Lease), the DeviceClass, or the MutatingAdmissionPolicies — the Helm chart is the recommended path but the raw manifests are kept as a lighter alternative (see README § Deployment).
 
 ## First task suggestions
 

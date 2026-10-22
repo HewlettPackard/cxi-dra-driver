@@ -10,16 +10,17 @@ import (
 // helper.PublishResources.
 //
 // Each physical CXI device is published with AllowMultipleAllocations=true
-// and BindingConditions=["Ready"]. The scheduler may allocate multiple claims
-// to the same device, but must wait for the ClaimBinder to set Ready=True
-// before binding each pod. This prevents pods from being bound before capacity
-// is confirmed — eliminating the race condition that caused concurrent pods to
-// collide at the libcxi layer.
+// and one consumable capacity per CXI resource (see buildCapacity). The
+// scheduler shares a device between claims and keeps the sum of their
+// consumedCapacity within the device's usable ceiling, so capacity accounting
+// for Kubernetes-allocated claims happens atomically in the scheduler.
 //
-// avail_* attributes reflect ReadAvailableCapacity minus any in-flight pending
-// grants (resources granted Ready=True but whose services haven't been created
-// yet). Publishing these pending-adjusted values steers the scheduler toward
-// less-loaded devices for subsequent pod allocations.
+// BindingConditions=["Ready"] remain as a safety net: the ClaimBinder checks
+// each allocation against live hardware before the pod is bound, catching
+// consumption the scheduler cannot see (services created outside Kubernetes,
+// claims allocated before the device published capacity).
+//
+// Nothing in the slice changes at runtime, so it is published once at startup.
 func (d *Driver) buildDriverResources() resourceslice.DriverResources {
 	return resourceslice.DriverResources{
 		Pools: map[string]resourceslice.Pool{
@@ -36,59 +37,22 @@ func (d *Driver) buildDriverResources() resourceslice.DriverResources {
 func (d *Driver) buildDevices() []resourceapi.Device {
 	out := make([]resourceapi.Device, 0, len(d.devices))
 	for _, dev := range d.devices {
-		// Pending-adjusted available capacity. ReadAvailableCapacity already
-		// reflects all running service consumption; we only subtract in-flight
-		// pending grants on top of that.
-		avail := d.effectiveAvail(dev.Name)
-
 		attrs := map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
 			"type": {StringValue: ptr.To("device")},
 			// Topology — usable in CEL placement selectors.
-			"numa_node": {IntValue: ptr.To(int64(dev.NUMANode))},
-			"pcie_root": {StringValue: ptr.To(dev.PCIeRoot)},
 			"hsn_iface": {StringValue: ptr.To(dev.HSNIface)},
-			// Hardware totals — static, from cxil_devinfo at discovery.
-			"capacity_txqs": {IntValue: ptr.To(dev.Capacity.TXQs)},
-			"capacity_tgqs": {IntValue: ptr.To(dev.Capacity.TGQs)},
-			"capacity_eqs":  {IntValue: ptr.To(dev.Capacity.EQs)},
-			"capacity_cts":  {IntValue: ptr.To(dev.Capacity.CTs)},
-			"capacity_tles": {IntValue: ptr.To(dev.Capacity.TLEs)},
-			"capacity_ptes": {IntValue: ptr.To(dev.Capacity.PTEs)},
-			"capacity_les":  {IntValue: ptr.To(dev.Capacity.LEs)},
-			"capacity_acs":  {IntValue: ptr.To(dev.Capacity.ACs)},
-			// Effective available — pending-adjusted; updated on every
-			// service create/delete and on the periodic refresh interval.
-			"avail_txqs": {IntValue: ptr.To(avail.TXQs)},
-			"avail_tgqs": {IntValue: ptr.To(avail.TGQs)},
-			"avail_eqs":  {IntValue: ptr.To(avail.EQs)},
-			"avail_cts":  {IntValue: ptr.To(avail.CTs)},
-			"avail_tles": {IntValue: ptr.To(avail.TLEs)},
-			"avail_ptes": {IntValue: ptr.To(avail.PTEs)},
-			"avail_les":  {IntValue: ptr.To(avail.LEs)},
-			"avail_acs":  {IntValue: ptr.To(avail.ACs)},
-			// Comma-padded sorted list of namespaces currently holding a
-			// pending grant or live service on this device. Consumed by
-			// the MutatingAdmissionPolicy-injected per-claim CEL selector
-			// to exclude devices already occupied by the claim's
-			// namespace — pre-filtering at scheduling time enforces
-			// SHS14's per-device VNI uniqueness without relying on a
-			// late binding-failure retry. Empty string when the device
-			// is unoccupied. Always published so the CEL selector can
-			// rely on the attribute being present.
-			"active_namespaces": {StringValue: ptr.To(d.activeNamespacesFor(dev.Name))},
 		}
 
-		// Standardized PCIe-root attribute carrying the NUMA-local GPU's root
-		// (e.g. "pci0009:00"), matching what the NVIDIA DRA driver publishes.
-		// Lets a ResourceClaim use matchAttribute on resource.kubernetes.io/pcieRoot
-		// to co-locate a CXI NIC with its NUMA-local GPU. Only published when a
-		// GPU was discovered on the device's NUMA node — omitting it (rather than
-		// publishing an empty string) keeps the match constraint unsatisfiable on
-		// nodes without GPUs instead of matching every empty value together.
-		if dev.GPUPCIeRoot != "" {
-			attrs["resource.kubernetes.io/pcieRoot"] = resourceapi.DeviceAttribute{
-				StringValue: ptr.To(dev.GPUPCIeRoot),
-			}
+		// Standard cross-driver attributes (Kubernetes v1.37+ DRA standard
+		// device attributes). numaNode is omitted rather than published as -1
+		// when the topology is unknown, since a present-but-meaningless value
+		// would still participate in scheduler matchAttribute comparisons
+		// against other devices/drivers.
+		if dev.NUMANode >= 0 {
+			attrs["resource.kubernetes.io/numaNode"] = resourceapi.DeviceAttribute{IntValue: ptr.To(int64(dev.NUMANode))}
+		}
+		if dev.PCIBusID != "" {
+			attrs["resource.kubernetes.io/pciBusID"] = resourceapi.DeviceAttribute{StringValue: ptr.To(dev.PCIBusID)}
 		}
 
 		out = append(out, resourceapi.Device{
@@ -103,6 +67,7 @@ func (d *Driver) buildDevices() []resourceapi.Device {
 			BindingConditions:        []string{"Ready"},
 			BindingFailureConditions: []string{"Unschedulable"},
 			AllowMultipleAllocations: ptr.To(true),
+			Capacity:                 buildCapacity(d.usableCeiling(dev.Name)),
 		})
 	}
 	return out

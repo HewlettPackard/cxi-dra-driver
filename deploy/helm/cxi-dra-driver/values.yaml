@@ -22,8 +22,13 @@ namespace: kube-system
 priorityClassName: system-node-critical
 
 image:
-  repository: docker.io/yourandomly/cxi-dra-driver
-  tag: stable-v1.0.0
+  # -- Driver image. Published by .github/workflows/build.yaml on every push
+  # to main, as a multi-arch (amd64 + arm64) manifest built with `-tags cxi`.
+  repository: ghcr.io/bristol-supercomputing/cxi-dra
+  # -- `main` tracks the latest build, which is why pullPolicy is Always.
+  # Every build is also tagged with its commit sha (e.g. `af87aba`) -- pin one
+  # of those, or a `v*` release tag, for a reproducible install.
+  tag: main
   pullPolicy: Always
 
 workload:
@@ -73,7 +78,9 @@ driver:
   # `cxi-state` volume mounted writable for netnsSysfsRoot above. Set to ""
   # to disable the hint-file write/delete.
   cniHintsDir: /var/run/cxi/net-hints
-  # -- Inject the env.json runtime-library CDI spec into claimed pods.
+  # -- Add the envConfig host libs and env vars to the env CDI spec (the spec
+  # itself, with /dev/kdreg2, /dev/gdrdrv, /dev/xpmem and /dev/shm, is always
+  # injected).
   enableCdiEnv: true
   # -- Per-namespace VNI pool.
   vniRange:
@@ -133,81 +140,62 @@ cni:
     retryTimeout: ""
 
 admissionPolicy:
-  # -- Render the MutatingAdmissionPolicy + Binding that injects capacity/namespace
-  # selectors into claims carrying this install's opaque driver.
+  # -- Render the MutatingAdmissionPolicy + Binding that converts legacy opaque
+  # resource config (txqs, ..., le_pools, tle_pools) on claims for this install's
+  # driver into consumable-capacity requests.
   enabled: true
   # -- Namespaces the policy does NOT mutate.
   excludedNamespaces:
     - kube-system
 
 envConfig:
-  # -- Render the env.json ConfigMap (runtime library mounts for the "env"/"nccl"/
-  # "aws-ofi-nccl" CDI profiles). Host paths are site-specific — override below.
+  # -- Render the env.json ConfigMap for the "env" CDI spec, which is attached to
+  # every CXI device alongside /dev/cxiN (it always carries /dev/kdreg2,
+  # /dev/gdrdrv, /dev/xpmem and /dev/shm). With driver.enableCdiEnv it also
+  # injects the host libfabric/libcxi below, bind-mounted read-only at
+  # /host/env/<basename>, and the env vars. Host paths are site-specific —
+  # override below. NCCL and aws-ofi-nccl are injected by k8s-modules (pod
+  # annotation modules.brics.ac.uk/load).
   enabled: true
   json:
-    envMounts:
-      - { hostPath: "/opt/cray/libfabric/2.3.1/lib64/libfabric.so.1", containerPath: "/usr/lib64/libfabric.so.1" }
-      - { hostPath: "/usr/lib64/libcxi.so.1", containerPath: "/usr/lib64/libcxi.so.1" }
-      - { hostPath: "/usr/lib64/libcurl.so.4", containerPath: "/usr/lib64/libcurl.so.4" }
-      - { hostPath: "/usr/lib64/libjson-c.so.5", containerPath: "/usr/lib64/libjson-c.so.5" }
-      - { hostPath: "/usr/lib64/libatomic.so.1", containerPath: "/usr/lib64/libatomic.so.1" }
-      - { hostPath: "/usr/lib64/libnl-3.so.200", containerPath: "/usr/lib64/libnl-3.so.200" }
-      - { hostPath: "/usr/lib64/libnghttp2.so.14", containerPath: "/usr/lib64/libnghttp2.so.14" }
-      - { hostPath: "/usr/lib64/libidn2.so.0", containerPath: "/usr/lib64/libidn2.so.0" }
-      - { hostPath: "/usr/lib64/libssh.so.4", containerPath: "/usr/lib64/libssh.so.4" }
-      - { hostPath: "/usr/lib64/libpsl.so.5", containerPath: "/usr/lib64/libpsl.so.5" }
-      - { hostPath: "/usr/lib64/libssl.so.3", containerPath: "/usr/lib64/libssl.so.1.1" }
-      - { hostPath: "/usr/lib64/libcrypto.so.3", containerPath: "/usr/lib64/libcrypto.so.1.1" }
-      - { hostPath: "/usr/lib64/libgssapi_krb5.so.2", containerPath: "/usr/lib64/libgssapi_krb5.so.2" }
-      - { hostPath: "/usr/lib64/libldap_r-2.4.so.2", containerPath: "/usr/lib64/libldap_r-2.4.so.2" }
-      - { hostPath: "/usr/lib64/liblber-2.4.so.2", containerPath: "/usr/lib64/liblber-2.4.so.2" }
-      - { hostPath: "/usr/lib64/libzstd.so.1", containerPath: "/usr/lib64/libzstd.so.1" }
-      - { hostPath: "/usr/lib64/libbrotlidec.so.1", containerPath: "/usr/lib64/libbrotlidec.so.1" }
-      - { hostPath: "/usr/lib64/libz.so.1", containerPath: "/usr/lib64/libz.so.1" }
-      - { hostPath: "/usr/lib64/libunistring.so.2", containerPath: "/usr/lib64/libunistring.so.2" }
-      - { hostPath: "/usr/lib64/libjitterentropy.so.3", containerPath: "/usr/lib64/libjitterentropy.so.3" }
-      - { hostPath: "/usr/lib64/libkrb5.so.3", containerPath: "/usr/lib64/libkrb5.so.3" }
-      - { hostPath: "/usr/lib64/libk5crypto.so.3", containerPath: "/usr/lib64/libk5crypto.so.3" }
-      - { hostPath: "/lib64/libcom_err.so.2", containerPath: "/lib64/libcom_err.so.2" }
-      - { hostPath: "/usr/lib64/libkrb5support.so.0", containerPath: "/usr/lib64/libkrb5support.so.0" }
-      - { hostPath: "/usr/lib64/libsasl2.so.3", containerPath: "/usr/lib64/libsasl2.so.3" }
-      - { hostPath: "/usr/lib64/libbrotlicommon.so.1", containerPath: "/usr/lib64/libbrotlicommon.so.1" }
-      - { hostPath: "/usr/lib64/libkeyutils.so.1", containerPath: "/usr/lib64/libkeyutils.so.1" }
-      - { hostPath: "/usr/lib64/libpcre.so.1", containerPath: "/usr/lib64/libpcre.so.1" }
-      - { hostPath: "/opt/xpmem/lib64/libxpmem.so.0", containerPath: "/usr/lib64/libxpmem.so.0" }
-    # -- Env vars injected into every pod that requests the "env" CDI profile.
-    # CXIP_SKIP_AMA_CHECK=1 lets stock libfabric accept the synthetic HSN netdev.
-    envVars:
+    # -- createContainer hook (cxi-cdi-hook, installed on the node by the driver)
+    # that adds /host/env to the container ldcache.
+    ldcache:
+      enabled: true
+    libs:
+      - "/opt/cray/libfabric/2.3.1/lib64/libfabric.so.1"
+      - "/usr/lib64/libcxi.so.1"
+      - "/usr/lib64/libcurl.so.4"
+      - "/usr/lib64/libjson-c.so.5"
+      - "/usr/lib64/libatomic.so.1"
+      - "/usr/lib64/libnl-3.so.200"
+      - "/usr/lib64/libnghttp2.so.14"
+      - "/usr/lib64/libidn2.so.0"
+      - "/usr/lib64/libssh.so.4"
+      - "/usr/lib64/libpsl.so.5"
+      - "/usr/lib64/libssl.so.3"
+      - "/usr/lib64/libcrypto.so.3"
+      - "/usr/lib64/libgssapi_krb5.so.2"
+      - "/usr/lib64/libldap_r-2.4.so.2"
+      - "/usr/lib64/liblber-2.4.so.2"
+      - "/usr/lib64/libzstd.so.1"
+      - "/usr/lib64/libbrotlidec.so.1"
+      - "/usr/lib64/libz.so.1"
+      - "/usr/lib64/libunistring.so.2"
+      - "/usr/lib64/libjitterentropy.so.3"
+      - "/usr/lib64/libkrb5.so.3"
+      - "/usr/lib64/libk5crypto.so.3"
+      - "/lib64/libcom_err.so.2"
+      - "/usr/lib64/libkrb5support.so.0"
+      - "/usr/lib64/libsasl2.so.3"
+      - "/usr/lib64/libbrotlicommon.so.1"
+      - "/usr/lib64/libkeyutils.so.1"
+      - "/usr/lib64/libpcre.so.1"
+      - "/opt/xpmem/lib64/libxpmem.so.0"
+    # -- Env vars for every CXI container. CXIP_SKIP_AMA_CHECK=1 lets stock
+    # libfabric accept the synthetic HSN netdev.
+    env:
       - "CXIP_SKIP_AMA_CHECK=1"
-    ncclPrefix: "/projects/public/brics/dev/apps/linux-neoverse_v2/nccl-2.29.2-1-yjntbzz5uuuashekge53wqizfqum6swy"
-    awsOfiMounts:
-      - { hostPath: "/projects/public/brics/dev/apps/linux-neoverse_v2/aws-ofi-nccl-1.18.0-6pbztrbjhvrmtu5r6nq2silgputmmcyk/lib/libnccl-net.so", containerPath: "/usr/lib/libnccl-net.so" }
-      - { hostPath: "/usr/lib64/libgdrapi.so.2.5", containerPath: "/usr/lib/libgdrapi.so" }
-      - { hostPath: "/projects/public/brics/dev/apps/linux-neoverse_v2/hwloc-2.12.2-xbbx7czzg3oczc3trftvj2dat3t6qj3o/lib/libhwloc.so.15", containerPath: "/usr/lib/libhwloc.so.15" }
-      - { hostPath: "/projects/public/brics/dev/apps/linux-neoverse_v2/libpciaccess-0.17-yisowb26ojigtiis73t5dukyrvx7r6rk/lib/libpciaccess.so.0", containerPath: "/usr/lib/libpciaccess.so.0" }
-      - { hostPath: "/projects/public/brics/dev/apps/linux-neoverse_v2/libxml2-2.13.5-xr3mgbb5y3midpndczeurgot35yosxkd/lib/libxml2.so.2", containerPath: "/usr/lib/libxml2.so.2" }
-      - { hostPath: "/projects/public/brics/dev/apps/linux-neoverse_v2/gcc-runtime-14.3.0-4aynqrbkrzeranfuqhyfg7wktmszdenq/lib/libatomic.so.1", containerPath: "/usr/lib/libatomic.so.1" }
-      - { hostPath: "/projects/public/brics/dev/apps/linux-neoverse_v2/xz-5.6.3-iqien4jp4hkpdks2rzyflpvgw3b72zqc/lib/liblzma.so.5", containerPath: "/usr/lib/liblzma.so.5" }
-      - { hostPath: "/projects/public/brics/dev/apps/linux-neoverse_v2/libiconv-1.18-4ok6y76vboaxcwzvxwnwhc6uaxzookdp/lib/libiconv.so.2", containerPath: "/usr/lib/libiconv.so.2" }
-    awsOfiEnv:
-      - "NCCL_NET=AWS Libfabric"
-      - "NCCL_CROSS_NIC=1"
-      - "NCCL_NET_GDR_LEVEL=PHB"
-      - "NCCL_SOCKET_IFNAME=eth0"
-      - "NCCL_MIN_NCHANNELS=4"
-      - "NCCL_GDRCOPY_ENABLE=1"
-      - "NCCL_NET_FORCE_FLUSH=0"
-      - "FI_MR_CACHE_MONITOR=kdreg2"
-      - "FI_CXI_DISABLE_HOST_REGISTER=1"
-      - "FI_HMEM_CUDA_USE_GDRCOPY=1"
-      - "FI_CXI_DEFAULT_CQ_SIZE=131072"
-      - "FI_CXI_DEFAULT_TX_SIZE=2048"
-      - "FI_CXI_RDZV_PROTO=alt_read"
-      - "FI_CXI_RDZV_THRESHOLD=0"
-      - "FI_CXI_RDZV_GET_MIN=0"
-      - "FI_CXI_RDZV_EAGER_SIZE=0"
-      - "FI_CXI_DISABLE_NON_INJECT_MSG_IDC=1"
-      - "FI_CXI_RX_MATCH_MODE=hybrid"
 
 resourceClaimTemplates:
   # -- Render the ResourceClaimTemplates. Each is named <name-prefix>-<template name>
@@ -218,11 +206,10 @@ resourceClaimTemplates:
   # when this list is empty.
   namespaces:
     - default
-    - argo-workflows
-    - kserve-llm
-    - llm-d-optimized-baseline
   # -- Deprecated single-namespace setting, used only when `namespaces` is empty.
   namespace: default
+  # Each template's params become capacity requests (le_pools x 1024 = les,
+  # tle_pools x 512 = tles). Omitted fields consume the device default.
   templates:
     # cxi-small — benchmarks, fi_pingpong, development, simple single-threaded tools.
     - name: small
@@ -235,7 +222,6 @@ resourceClaimTemplates:
         acs: 2
         le_pools: 1
         tle_pools: 1
-        cdi_profiles: ["env"]
     # cxi-medium — standard MPI jobs, NCCL at moderate scale, typical HPC workloads.
     - name: medium
       params:
@@ -247,7 +233,6 @@ resourceClaimTemplates:
         acs: 8
         le_pools: 2
         tle_pools: 1
-        cdi_profiles: ["env", "nccl", "aws-ofi-nccl"]
     # cxi-large — multi-threaded MPI, NCCL at scale, collectives-heavy workloads.
     - name: large
       params:
@@ -259,7 +244,6 @@ resourceClaimTemplates:
         acs: 32
         le_pools: 4
         tle_pools: 2
-        cdi_profiles: ["env", "nccl", "aws-ofi-nccl"]
     # cxi-whole — exclusive device access; full NIC after the system-svc reservation.
     - name: whole
       params:
@@ -271,7 +255,6 @@ resourceClaimTemplates:
         acs: 1018
         le_pools: 14
         tle_pools: 3
-        cdi_profiles: ["env", "nccl", "aws-ofi-nccl"]
     # cxi-2-small — two devices (ExactCount) with the small profile.
     - name: 2-small
       count: 2
@@ -284,7 +267,6 @@ resourceClaimTemplates:
         acs: 2
         le_pools: 1
         tle_pools: 1
-        cdi_profiles: ["env"]
     - name: 2-whole
       count: 2
       params:
@@ -296,4 +278,3 @@ resourceClaimTemplates:
         acs: 1018
         le_pools: 14
         tle_pools: 3
-        cdi_profiles: ["env", "aws-ofi-nccl"]

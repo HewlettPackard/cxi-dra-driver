@@ -9,7 +9,7 @@ applyTo: "**/*.go"
 - Package-level "why this exists" doc comments are expected for packages with non-obvious rationale — see [internal/netsysfs/build.go](../../internal/netsysfs/build.go).
 - File naming mirrors responsibility, not type: `capacity_cgo.go`/`capacity_stub.go`, `service_cgo.go`/`service_mock.go`/`service_stub.go` — keep the `_cgo`/`_mock`/`_stub` suffix convention for any new hardware-abstraction split rather than inventing a new pattern.
 - No magic numbers for hardware quota fields (`txqs`, `tgqs`, `eqs`, `cts`, `ptes`, `le_pools`, `tle_pools`, `acs`) — name or comment the constant with the hardware reason, following the existing style in `internal/cxi/resources.go`.
-- Run `golangci-lint run` before submitting — see `.golangci.yml` for the enabled linters (includes `gosec` for the security-relevant host/CGO paths).
+- Run `golangci-lint run` before submitting (not run in CI), paying attention to `gosec` findings on the security-relevant host/CGO paths.
 
 ## Do not
 

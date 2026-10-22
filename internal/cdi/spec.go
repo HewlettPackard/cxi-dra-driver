@@ -14,6 +14,10 @@ import (
 
 const cdiVersion = "0.6.0"
 
+// DeviceSysfsRoot is the container directory under which each per-device
+// spec mounts the device's sysfs node (/run/cxi/<dev>).
+const DeviceSysfsRoot = "/run/cxi"
+
 // DeviceID returns the CDI device identifier for a CXI device, e.g.
 // "cxi.slingshot.hpe.com/cxi=cxi0".
 func DeviceID(driverName, devName string) string {
@@ -36,7 +40,7 @@ func WriteSpec(cdiRoot, driverName string, dev *cxi.Device) error {
 	if dev.HostDevPath != "" {
 		hostDevPath = dev.HostDevPath
 	}
-	containerSysfsPath := "/run/cxi/" + dev.Name
+	containerSysfsPath := DeviceSysfsRoot + "/" + dev.Name
 
 	// Stat the device on the host to get its major/minor numbers.
 	// These are needed for the CDI DeviceNode entry so containerd can add the

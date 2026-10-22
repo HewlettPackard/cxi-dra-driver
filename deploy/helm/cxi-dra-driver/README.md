@@ -12,10 +12,11 @@ A/B two driver versions) and each install is fully isolated.
 | DaemonSet *or* Deployment | `cxi-slingshot-hpe-com` | `workload.kind` selects; pods carry constant `app: cxi-dra-driver` label for anti-affinity |
 | ServiceAccount / ClusterRole(+Binding) / Role(+Binding) | `cxi-slingshot-hpe-com*` | Lease `resourceNames` derived from the driver name |
 | DeviceClass | `cxi-slingshot-hpe-com-device` | CEL selects this driver's ResourceSlices |
-| MutatingAdmissionPolicy + Binding | `cxi-slingshot-hpe-com-selector-injection` | only mutates claims carrying this driver |
+| MutatingAdmissionPolicy + Binding | `cxi-slingshot-hpe-com-capacity-conversion` | converts legacy opaque resource config on claims for this driver into capacity requests |
 | ConfigMap | `cxi-slingshot-hpe-com-env` | `env.json` runtime-library mounts |
 | ResourceClaimTemplates | `cxi-slingshot-hpe-com-{small,medium,large,whole,2-small,2-whole}` | one set per `resourceClaimTemplates.namespaces` entry; point at this install's DeviceClass |
 | NetworkAttachmentDefinition (opt-in) | `slingshot-hsn` | only when `cni.nad.create=true`; one per `cni.nad.namespaces` (falls back to the claim-template namespaces); requires Multus + Whereabouts |
+| MutatingAdmissionPolicy + Binding (opt-in) | `cxi-slingshot-hpe-com-slingshot-network-injection` | only when `cni.nad.create=true`; adds the Multus `k8s.v1.cni.cncf.io/networks` annotation to pods that reference this install's claim templates |
 
 ## Isolation model
 
@@ -56,13 +57,15 @@ See [values.yaml](values.yaml) for the full set. Most-used:
 | `workload.kind` | `DaemonSet` | `DaemonSet` or `Deployment` |
 | `workload.replicas` | `10` | Deployment replica count |
 | `workload.antiAffinity.enabled` | `true` | spread pods onto distinct nodes |
-| `image.repository` / `image.tag` | `docker.io/pirese/cxi-dra-driver` / `dev` | driver image |
+| `image.repository` / `image.tag` | `ghcr.io/bristol-supercomputing/cxi-dra` / `main` | driver image; every build is also tagged with its commit sha, pin one for a reproducible install |
 | `namespace` | `kube-system` | driver components namespace |
 | `priorityClassName` | `system-node-critical` | set `""` if installing outside kube-system |
 | `driver.vniRange.start/end` | `100`/`300` | per-namespace VNI pool |
 | `driver.systemSvcIDs` | `[1,2,3,4]` | blessed system service svc_ids (never reaped; their usage is reserved) |
 | `resourceClaimTemplates.namespaces` | `[default]` | namespaces the templates are rendered into, one copy each (falls back to singular `namespace` when empty) |
 | `admissionPolicy.excludedNamespaces` | `[kube-system]` | namespaces the policy ignores |
+| `cni.install` | `false` | install the bundled `slingshot-cni` into `cni.binDir` (default `/opt/cni/bin`) at driver startup |
+| `cni.nad.create` | `false` | render the `slingshot-hsn` NetworkAttachmentDefinition and the pod network-injection policy; `cni.nad.ipam` is the Whereabouts block |
 
 ## Verify a render
 

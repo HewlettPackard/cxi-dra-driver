@@ -19,20 +19,24 @@ import (
 // ClaimBinder watches ResourceClaims cluster-wide and manages DRA binding
 // conditions for claims that allocate CXI devices on this node.
 //
+// The scheduler is the primary capacity check: devices publish consumable
+// capacity and it keeps the sum of consumedCapacity per device within the
+// usable ceiling. The ClaimBinder is the safety net for consumption the
+// scheduler cannot see — services created outside Kubernetes, or claims
+// allocated before the device published capacity — by checking each
+// allocation against live hardware before the pod is bound. The requested
+// ResourceSet it checks is the allocation's consumedCapacity.
+//
 // When the scheduler allocates a claim to a CXI device on this node it writes
 // the allocation into the claim's status. The ClaimBinder sees this event and
 // decides whether the pod can proceed to binding:
 //
 //   - Ready=True: the requested resources fit within currently available
-//     hardware capacity minus any in-flight pending grants, AND no other
-//     claim from the same namespace is already on this device. The grant is
-//     recorded in the driver's pending map and the (namespace, device)
-//     occupancy counter is incremented so that subsequent evaluations on the
-//     same device see the reduced capacity and don't over-commit, and so
-//     that other claims in the same namespace are steered to other devices.
-//     TriggerRepublish is called so the ResourceSlice immediately reflects
-//     the reduced avail_* — steering the scheduler toward other devices for
-//     subsequent pods.
+//     hardware capacity minus any in-flight pending grants. The grant is
+//     recorded in the driver's pending map so that subsequent evaluations on
+//     the same device see the reduced capacity and don't over-commit. Multiple claims from the same namespace may now share
+//     one device: the SHS14 VNI-per-device-uniqueness constraint has been
+//     lifted, so there is no namespace-occupancy rejection.
 //
 //   - Ready=False: pending grants (not yet backed by hardware services) are
 //     blocking the request, but the raw hardware capacity would fit it.
@@ -44,29 +48,18 @@ import (
 //     (ReadAvailableCapacity, already reflecting all running services)
 //     cannot fit the request even before accounting for pending grants. The
 //     device is truly full. Setting Unschedulable causes the DRA scheduler
-//     to deallocate the claim and retry on a different device; the updated
-//     ResourceSlice (avail_* near zero for the full device) steers it to a
-//     device with real capacity.
-//
-//   - Unschedulable=True (NamespaceDeviceOccupied): another claim from the
-//     same namespace is already pending or active on this device. SHS14
-//     enforces VNI uniqueness per device, and every claim in a namespace
-//     shares the namespace's VNI, so co-locating two claims from the same
-//     namespace on the same device would collide at cxil_alloc_svc with
-//     -EEXIST (the RX-profile vni_overlap_test rejects overlapping VNIs
-//     on the same device). Setting Unschedulable forces the scheduler to
-//     retry on
-//     a different device. (The ResourceSlice cannot express this constraint
-//     directly because it has no notion of per-namespace state.)
+//     to deallocate the claim and retry. The scheduler's accounting does not
+//     include the out-of-band consumption that filled the device, so the
+//     retry can land on the same device again until that consumption goes.
 //
 // Pods carry exactly one ResourceClaim: the CXI device. The VNI is assigned
 // per namespace (see NamespaceVNIConfig) and read at prepare time, so it is
-// not part of any ResourceClaim. When Unschedulable=True is set on a full or
-// already-occupied CXI device the scheduler deallocates that single claim
-// and retries on another device — there is no second (VNI) claim to leave
-// dangling, so the DRA Score plugin cannot hit the "number of allocations N
-// is smaller than number of claims" mismatch that splitting CXI and VNI
-// across two claims would cause.
+// not part of any ResourceClaim. When Unschedulable=True is set on a full
+// CXI device the scheduler deallocates that single claim and retries on
+// another device — there is no second (VNI) claim to leave dangling, so the
+// DRA Score plugin cannot hit the "number of allocations N is smaller than
+// number of claims" mismatch that splitting CXI and VNI across two claims
+// would cause.
 type ClaimBinder struct {
 	driver     *Driver
 	client     kubernetes.Interface
@@ -167,18 +160,14 @@ func (b *ClaimBinder) runWatch(ctx context.Context, ticker *time.Ticker) error {
 // evaluateClaim processes one ResourceClaim event.
 func (b *ClaimBinder) evaluateClaim(ctx context.Context, claim *resourceapi.ResourceClaim) {
 	if claim.Status.Allocation == nil {
-		// Not yet allocated (or de-allocated) — clean up any stale state.
-		// Both pending and the (namespace, device) slot must be released
-		// here: the scheduler can clear Status.Allocation at any time
-		// (Unschedulable=True, PostFilter de-allocation, manual edit),
-		// and NRI's StopPodSandbox cannot be relied on to cover it —
-		// NRI may never have run if the pod hadn't been admitted yet.
-		// Without RemoveOccupancyForClaim the namespace would stay
-		// pinned to this device in active_namespaces and the CEL
-		// selector would keep excluding it, eventually pinning the
-		// namespace across every device on the node.
+		// Not yet allocated (or de-allocated) — release any stale pending
+		// grant. The scheduler can clear Status.Allocation at any time
+		// (Unschedulable=True, PostFilter de-allocation, manual edit), and
+		// NRI's StopPodSandbox cannot be relied on to cover it — NRI may
+		// never have run if the pod hadn't been admitted yet. Without this
+		// the pending grant would leak and understate the device's effective
+		// capacity.
 		b.driver.RemovePending(claim.UID)
-		b.driver.RemoveOccupancyForClaim(claim.UID)
 		b.mu.Lock()
 		delete(b.falseClaims, claim.UID)
 		b.mu.Unlock()
@@ -194,10 +183,10 @@ func (b *ClaimBinder) evaluateClaim(ctx context.Context, claim *resourceapi.Reso
 		return // not our claim / not our node
 	}
 
-	// Release any slot/pending this claim held for a device that is no longer
+	// Release any pending grant this claim held for a device that is no longer
 	// in the current allocation (subset reallocation without an intervening
-	// Allocation=nil). Without this, the dropped device would leak in
-	// nsDeviceOccupancy and stay pinned to this namespace via active_namespaces.
+	// Allocation=nil). Without this, the dropped device's pending grant would
+	// leak and understate its effective capacity.
 	currentDevs := make(map[string]bool, len(devices))
 	for _, dr := range devices {
 		currentDevs[dr.result.Device] = true
@@ -236,49 +225,29 @@ func (b *ClaimBinder) evaluateClaim(ctx context.Context, claim *resourceapi.Reso
 			continue
 		}
 
-		// Four-way decision based on namespace occupancy and hardware capacity:
-		//
-		//  1. (namespace, device) is already occupied by another claim from this
-		//     namespace                                  → Unschedulable
-		//                                                 (NamespaceDeviceOccupied)
-		//  2. hwAvail − pendingSum  fits requested       → Ready=True  (grant)
-		//  3. hwAvail alone         fits requested       → Ready=False (pending
+		// Three-way decision based on hardware capacity (namespace occupancy
+		// no longer gates placement — multiple same-namespace claims may share
+		// a device now that SHS14 permits duplicate VNIs per device):
+		//  1. hwAvail − pendingSum  fits requested       → Ready=True  (grant)
+		//  2. hwAvail alone         fits requested       → Ready=False (pending
 		//                                                 blocking, retry)
-		//  4. hwAvail               can't fit alone      → Unschedulable
+		//  3. hwAvail               can't fit alone      → Unschedulable
 		//                                                 (DeviceAtCapacity)
-		granted, occupied := b.driver.checkAndAddPending(
-			claim.UID, claim.Namespace, result.Device, requested, hwAvail,
+		granted := b.driver.checkAndAddPending(
+			claim.UID, result.Device, requested, hwAvail,
 		)
 		switch {
 		case granted:
-			// Case 2: grant. Record in pending so subsequent claims on the same
-			// device see reduced capacity. checkAndAddPending already calls
-			// TriggerRepublish internally (covers both the avail_* decrement
-			// from the new pending entry and the active_namespaces addition
-			// from the 0→1 occupancy transition), so no explicit republish
-			// here.
+			// Case 1: grant. Record in pending so subsequent claims on the same
+			// device see reduced capacity.
 			b.logf("Ready=True: claim=%s/%s device=%s requested=(%s)",
 				claim.Namespace, claim.Name, result.Device, requested)
 			b.setCondition(ctx, claim, result, "Ready", metav1.ConditionTrue,
 				"DeviceCapacityAvailable",
 				fmt.Sprintf("requested resources (%s) fit within effective available capacity", requested))
 
-		case occupied:
-			// Case 1: another claim from the same namespace already holds this
-			// device. SHS14 would reject the second cxil_alloc_svc with
-			// -EEXIST (RX-profile vni_overlap_test). Tell the scheduler to put
-			// this claim on a different device. ResourceSlice has no
-			// per-namespace state, so we cannot steer scheduling via avail_* —
-			// Unschedulable is the only signal.
-			b.logf("Unschedulable: claim=%s/%s device=%s — namespace %s already holds this device",
-				claim.Namespace, claim.Name, result.Device, claim.Namespace)
-			b.setCondition(ctx, claim, result, "Unschedulable", metav1.ConditionTrue,
-				"NamespaceDeviceOccupied",
-				fmt.Sprintf("namespace %s already has another claim on device %s; the scheduler will reallocate to a different device (SHS14 enforces VNI uniqueness per device)",
-					claim.Namespace, result.Device))
-
 		case requested.Fits(hwAvail):
-			// Case 3: hardware would fit but in-flight pending grants are consuming
+			// Case 2: hardware would fit but in-flight pending grants are consuming
 			// the remaining capacity. Keep the claim in falseClaims for
 			// re-evaluation when TriggerRetry fires (after a pending service is
 			// actually created and RemovePending is called).
@@ -290,7 +259,7 @@ func (b *ClaimBinder) evaluateClaim(ctx context.Context, claim *resourceapi.Reso
 			anyPending = true
 
 		default:
-			// Case 4: hardware is truly at capacity — the request cannot fit even
+			// Case 3: hardware is truly at capacity — the request cannot fit even
 			// without counting any pending grants. Signal Unschedulable so the DRA
 			// scheduler deallocates this claim and retries on a different device.
 			b.logf("Unschedulable: claim=%s/%s device=%s requested=(%s) — device at capacity",
@@ -298,9 +267,6 @@ func (b *ClaimBinder) evaluateClaim(ctx context.Context, claim *resourceapi.Reso
 			b.setCondition(ctx, claim, result, "Unschedulable", metav1.ConditionTrue,
 				"DeviceAtCapacity",
 				fmt.Sprintf("device %s hardware capacity is exhausted; the scheduler will reallocate to a less-loaded device", result.Device))
-			// Republish so the updated avail_* (near zero for the full device)
-			// steers the retry allocation to a device with real capacity.
-			b.driver.TriggerRepublish()
 		}
 	}
 
@@ -314,13 +280,10 @@ func (b *ClaimBinder) evaluateClaim(ctx context.Context, claim *resourceapi.Reso
 }
 
 func (b *ClaimBinder) onClaimDeleted(claim *resourceapi.ResourceClaim) {
-	// Release pending and the (namespace, device) slot. A ResourceClaim
-	// can be deleted before NRI's StopPodSandbox fires (force-delete,
-	// pod never admitted, etc.), so the binder is the sole reliable
-	// cleanup path here. RemoveOccupancyForClaim is a no-op for claims
-	// that never held a slot.
+	// Release any pending grant. A ResourceClaim can be deleted before NRI's
+	// StopPodSandbox fires (force-delete, pod never admitted, etc.), so the
+	// binder is a reliable cleanup path for the pending map.
 	b.driver.RemovePending(claim.UID)
-	b.driver.RemoveOccupancyForClaim(claim.UID)
 	b.mu.Lock()
 	delete(b.falseClaims, claim.UID)
 	b.mu.Unlock()
@@ -376,7 +339,7 @@ func (b *ClaimBinder) findOurDevices(claim *resourceapi.ResourceClaim) ([]device
 		if alloc.Pool != b.nodeName {
 			continue
 		}
-		requested, _, err := b.driver.resolveClaim(claim, alloc)
+		requested, err := b.driver.resolveClaim(claim, alloc)
 		if err != nil {
 			return nil, fmt.Errorf("resolving resources for device %s: %w", alloc.Device, err)
 		}

@@ -18,7 +18,7 @@ func MockDevices(n int) []*Device {
 			HostDevPath: "/dev/null",
 			SysfsPath:   fmt.Sprintf("/tmp/mock-cxi/cxi%d", i),
 			NUMANode:    i % 2,
-			PCIeRoot:    fmt.Sprintf("0000:%02x:00.0", 0x81+i),
+			PCIBusID:    fmt.Sprintf("0000:%02x:00.0", 0x81+i),
 			HSNIface:    fmt.Sprintf("hsn%d", i*2),
 			Capacity:    DeviceCapacity(),
 		}

@@ -4,373 +4,277 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
 
 	specs "tags.cncf.io/container-device-interface/specs-go"
 )
 
-func TestDeviceIDs(t *testing.T) {
-	const driver = "cxi.slingshot.hpe.com"
+const testDriver = "cxi.slingshot.hpe.com"
+
+func TestEnvDeviceID(t *testing.T) {
+	if got, want := EnvDeviceID(testDriver), testDriver+"/env=env"; got != want {
+		t.Errorf("EnvDeviceID = %q, want %q", got, want)
+	}
+}
+
+// absentDevNodes returns cfg with xpmem/gdrdrv/kdreg2 paths that do not exist, so
+// the env spec emits no device nodes.
+func absentDevNodes(t *testing.T, cfg CDIEnvConfig) CDIEnvConfig {
+	dir := t.TempDir()
+	cfg.XpmemPath = filepath.Join(dir, "xpmem")
+	cfg.GdrDrvPath = filepath.Join(dir, "gdrdrv")
+	cfg.KdReg2Path = filepath.Join(dir, "kdreg2")
+	return cfg
+}
+
+func readEnvSpec(t *testing.T, cdiRoot string) specs.ContainerEdits {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(cdiRoot, testDriver+"-env.json"))
+	if err != nil {
+		t.Fatalf("reading env spec: %v", err)
+	}
+	var spec specs.Spec
+	if err := json.Unmarshal(data, &spec); err != nil {
+		t.Fatalf("unmarshalling env spec: %v", err)
+	}
+	if spec.Kind != testDriver+"/env" {
+		t.Errorf("kind = %q, want %q", spec.Kind, testDriver+"/env")
+	}
+	if len(spec.Devices) != 1 || spec.Devices[0].Name != EnvName {
+		t.Fatalf("devices = %v, want [{env}]", spec.Devices)
+	}
+	return spec.Devices[0].ContainerEdits
+}
+
+func mountsByContainerPath(edits specs.ContainerEdits) map[string]*specs.Mount {
+	out := make(map[string]*specs.Mount, len(edits.Mounts))
+	for _, m := range edits.Mounts {
+		out[m.ContainerPath] = m
+	}
+	return out
+}
+
+func TestWriteEnvSpec(t *testing.T) {
+	cdiRoot := t.TempDir()
+	const libfabricHost = "/opt/cray/libfabric/2.3.1/lib64/libfabric.so.1"
+	cfg := absentDevNodes(t, CDIEnvConfig{
+		Libs: []string{libfabricHost, "/usr/lib64/libcxi.so.1"},
+		Env:  []string{"CXIP_SKIP_AMA_CHECK=1"},
+	})
+
+	if err := WriteEnvSpec(cdiRoot, testDriver, cfg); err != nil {
+		t.Fatalf("WriteEnvSpec: %v", err)
+	}
+	edits := readEnvSpec(t, cdiRoot)
+
+	if len(edits.DeviceNodes) != 0 {
+		t.Errorf("device nodes = %d, want 0 (all absent)", len(edits.DeviceNodes))
+	}
+	mounts := mountsByContainerPath(edits)
+	if len(mounts) != 3 {
+		t.Errorf("mounts = %v, want /dev/shm + 2 libs", edits.Mounts)
+	}
+	for containerPath, hostPath := range map[string]string{
+		"/dev/shm":                 "/dev/shm",
+		"/host/env/libfabric.so.1": libfabricHost,
+		"/host/env/libcxi.so.1":    "/usr/lib64/libcxi.so.1",
+	} {
+		m, ok := mounts[containerPath]
+		if !ok {
+			t.Errorf("no mount at %s; mounts = %v", containerPath, edits.Mounts)
+			continue
+		}
+		if m.HostPath != hostPath {
+			t.Errorf("mount %s host path = %q, want %q", containerPath, m.HostPath, hostPath)
+		}
+	}
+	if !reflect.DeepEqual(edits.Env, []string{"CXIP_SKIP_AMA_CHECK=1"}) {
+		t.Errorf("env = %v", edits.Env)
+	}
+	if len(edits.Hooks) != 1 {
+		t.Fatalf("hooks = %v, want one ldcache hook", edits.Hooks)
+	}
+	h := edits.Hooks[0]
+	wantArgs := []string{DefaultHookPath, "update-ldcache", "--ldconfig-dir", DefaultLdconfigDir, "--folder", "/host/env"}
+	if h.HookName != "createContainer" || h.Path != DefaultHookPath || !reflect.DeepEqual(h.Args, wantArgs) {
+		t.Errorf("hook = %+v, want createContainer %s %v", h, DefaultHookPath, wantArgs)
+	}
+}
+
+func TestWriteEnvSpecCustomLdcache(t *testing.T) {
+	cdiRoot := t.TempDir()
+	cfg := absentDevNodes(t, CDIEnvConfig{Libs: []string{"/usr/lib64/libcxi.so.1"}})
+	cfg.HookPath = "/opt/cxi/bin/cxi-cdi-hook"
+	cfg.LdconfigDir = "/opt/cxi/bin"
+	if err := WriteEnvSpec(cdiRoot, testDriver, cfg); err != nil {
+		t.Fatalf("WriteEnvSpec: %v", err)
+	}
+	edits := readEnvSpec(t, cdiRoot)
+	wantArgs := []string{"/opt/cxi/bin/cxi-cdi-hook", "update-ldcache", "--ldconfig-dir", "/opt/cxi/bin", "--folder", "/host/env"}
+	if len(edits.Hooks) != 1 || edits.Hooks[0].Path != "/opt/cxi/bin/cxi-cdi-hook" ||
+		!reflect.DeepEqual(edits.Hooks[0].Args, wantArgs) {
+		t.Errorf("hooks = %+v, want %v", edits.Hooks, wantArgs)
+	}
+
+	disabled := false
+	cfg.Ldcache.Enabled = &disabled
+	if err := WriteEnvSpec(cdiRoot, testDriver, cfg); err != nil {
+		t.Fatalf("WriteEnvSpec: %v", err)
+	}
+	if edits := readEnvSpec(t, cdiRoot); len(edits.Hooks) != 0 {
+		t.Errorf("hooks = %v, want none with ldcache disabled", edits.Hooks)
+	}
+}
+
+// With --enable-cdi-env unset the driver writes the env spec from a zero
+// config: it must still carry the gdrdrv and kdreg2 nodes and /dev/shm so
+// every CXI device gets them, but no lib mounts, hook, or env.
+func TestWriteEnvSpecZeroConfigInjectsDeviceNodes(t *testing.T) {
+	cdiRoot := t.TempDir()
+	// A regular file is enough: optionalDeviceNode only needs stat to succeed
+	// (Rdev is 0 for a regular file, but the entry is still emitted).
+	devDir := t.TempDir()
+	gdrdrv := filepath.Join(devDir, "gdrdrv")
+	kdreg2 := filepath.Join(devDir, "kdreg2")
+	for _, p := range []string{gdrdrv, kdreg2} {
+		if err := os.WriteFile(p, nil, 0o644); err != nil {
+			t.Fatalf("creating fake %s: %v", p, err)
+		}
+	}
+	cfg := absentDevNodes(t, CDIEnvConfig{})
+	cfg.GdrDrvPath = gdrdrv
+	cfg.KdReg2Path = kdreg2
+	if err := WriteEnvSpec(cdiRoot, testDriver, cfg); err != nil {
+		t.Fatalf("WriteEnvSpec: %v", err)
+	}
+	edits := readEnvSpec(t, cdiRoot)
+	var got []string
+	for _, dn := range edits.DeviceNodes {
+		got = append(got, dn.HostPath)
+	}
+	if want := []string{gdrdrv, kdreg2}; !reflect.DeepEqual(got, want) {
+		t.Errorf("device nodes = %v, want %v", got, want)
+	}
+	if len(edits.Mounts) != 1 || edits.Mounts[0].ContainerPath != "/dev/shm" {
+		t.Errorf("mounts = %v, want only /dev/shm", edits.Mounts)
+	}
+	if len(edits.Hooks) != 0 || len(edits.Env) != 0 {
+		t.Errorf("hooks = %v env = %v, want none", edits.Hooks, edits.Env)
+	}
+}
+
+// Specs of the removed nccl/aws-ofi-nccl profiles must be deleted so their
+// device IDs stop resolving on nodes upgraded in place.
+func TestWriteEnvSpecRemovesLegacyProfiles(t *testing.T) {
+	cdiRoot := t.TempDir()
+	var stale []string
+	for _, name := range []string{"nccl", "aws-ofi-nccl"} {
+		p := filepath.Join(cdiRoot, testDriver+"-"+name+".json")
+		if err := os.WriteFile(p, []byte("{}"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		stale = append(stale, p)
+	}
+	if err := WriteEnvSpec(cdiRoot, testDriver, absentDevNodes(t, CDIEnvConfig{})); err != nil {
+		t.Fatalf("WriteEnvSpec: %v", err)
+	}
+	for _, p := range stale {
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			t.Errorf("legacy spec %s still present", p)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(cdiRoot, testDriver+"-env.json")); err != nil {
+		t.Errorf("env spec not written: %v", err)
+	}
+}
+
+func writeConfig(t *testing.T, body string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "env.json")
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatalf("writing config: %v", err)
+	}
+	return path
+}
+
+func TestLoadConfig(t *testing.T) {
+	path := writeConfig(t, `{
+		"ldcache": {"enabled": false},
+		"libs": [
+			"/opt/cray/libfabric/2.3.1/lib64/libfabric.so.1",
+			"/usr/lib64/libcxi.so.1"
+		],
+		"env": ["CXIP_SKIP_AMA_CHECK=1"]
+	}`)
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	wantLibs := []string{"/opt/cray/libfabric/2.3.1/lib64/libfabric.so.1", "/usr/lib64/libcxi.so.1"}
+	if !reflect.DeepEqual(cfg.Libs, wantLibs) {
+		t.Errorf("libs = %v, want %v", cfg.Libs, wantLibs)
+	}
+	if !reflect.DeepEqual(cfg.Env, []string{"CXIP_SKIP_AMA_CHECK=1"}) {
+		t.Errorf("env = %v", cfg.Env)
+	}
+	if cfg.Ldcache.enabled() {
+		t.Error("ldcache enabled, want disabled")
+	}
+}
+
+func TestLoadConfigRejects(t *testing.T) {
 	tests := []struct {
-		name string
-		fn   func(string) string
-		want string
+		name, body, wantErr string
 	}{
-		{"env", EnvDeviceID, driver + "/env=env"},
-		{"nccl", NCCLDeviceID, driver + "/nccl=nccl"},
-		{"aws-ofi-nccl", AWSofiNCCLDeviceID, driver + "/aws-ofi-nccl=aws-ofi-nccl"},
+		{"empty libs", `{"libs":[]}`, "libs is empty"},
+		{"no libs", `{}`, "libs is empty"},
+		{"legacy profiles schema", `{"profiles":{"env":{"libs":["/a"]}}}`, "unknown field"},
+		{"legacy ldLibraryPath", `{"ldLibraryPath":{"mode":"prepend"},"libs":["/a"]}`, "unknown field"},
+		{"legacy rename object", `{"libs":[{"path":"/a/libx.so","as":"liby.so"}]}`, "cannot unmarshal"},
+		{"relative lib", `{"libs":["lib/libcxi.so.1"]}`, "must be an absolute file path"},
+		{"root lib", `{"libs":["/"]}`, "must be an absolute file path"},
+		{"collision", `{"libs":["/a/libz.so.1","/b/libz.so.1"]}`, "both mount at /host/env/libz.so.1"},
+		{"hook path moved to driver flags", `{"ldcache":{"hookPath":"/a"},"libs":["/a"]}`, "unknown field"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := tt.fn(driver); got != tt.want {
-				t.Errorf("got %q, want %q", got, tt.want)
+			_, err := LoadConfig(writeConfig(t, tt.body))
+			if err == nil {
+				t.Fatal("LoadConfig accepted invalid config")
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("error %q does not contain %q", err, tt.wantErr)
 			}
 		})
 	}
 }
 
-func TestWriteEnvSpec(t *testing.T) {
-	cdiRoot := t.TempDir()
-	const driver = "cxi.slingshot.hpe.com"
-
-	const libfabricHost = "/opt/cray/libfabric/2.3.1/lib64/libfabric.so.1"
-	// Use non-existent paths so xpmem/gdrdrv/kdreg2 device nodes are skipped.
-	cfg := CDIEnvConfig{
-		XpmemPath:  filepath.Join(t.TempDir(), "xpmem"),
-		GdrDrvPath: filepath.Join(t.TempDir(), "gdrdrv"),
-		KdReg2Path: filepath.Join(t.TempDir(), "kdreg2"),
-		EnvMounts: []MountSpec{
-			{HostPath: libfabricHost, ContainerPath: "/usr/lib64/libfabric.so.1"},
-			{HostPath: "/usr/lib64/libcxi.so.1", ContainerPath: "/usr/lib64/libcxi.so.1"},
-			{HostPath: "/opt/xpmem/lib64/libxpmem.so.0", ContainerPath: "/usr/lib64/libxpmem.so.0"},
-		},
-		EnvVars: []string{"CXIP_SKIP_AMA_CHECK=1"},
-	}
-
-	if err := WriteEnvSpec(cdiRoot, driver, cfg); err != nil {
-		t.Fatalf("WriteEnvSpec: %v", err)
-	}
-
-	specPath := filepath.Join(cdiRoot, driver+"-env.json")
-	data, err := os.ReadFile(specPath)
+// The shipped non-Helm ConfigMap must stay loadable under the current schema.
+func TestDeployConfigMapLoads(t *testing.T) {
+	data, err := os.ReadFile("../../deploy/kubernetes/configmap.yaml")
 	if err != nil {
-		t.Fatalf("reading spec: %v", err)
+		t.Fatalf("reading configmap: %v", err)
 	}
-
-	var spec specs.Spec
-	if err := json.Unmarshal(data, &spec); err != nil {
-		t.Fatalf("unmarshalling spec: %v", err)
+	_, body, ok := strings.Cut(string(data), "env.json: |\n")
+	if !ok {
+		t.Fatal("env.json key not found in configmap")
 	}
-
-	if spec.Kind != driver+"/env" {
-		t.Errorf("kind = %q, want %q", spec.Kind, driver+"/env")
-	}
-	if len(spec.Devices) != 1 || spec.Devices[0].Name != "env" {
-		t.Errorf("devices = %v, want [{env}]", spec.Devices)
-	}
-	if len(spec.Devices[0].ContainerEdits.DeviceNodes) != 0 {
-		t.Errorf("device nodes = %d, want 0 (all absent)", len(spec.Devices[0].ContainerEdits.DeviceNodes))
-	}
-	found := false
-	for _, m := range spec.Devices[0].ContainerEdits.Mounts {
-		if m.HostPath == libfabricHost {
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Error("libfabric mount not found in env spec")
-	}
-	foundShm := false
-	for _, m := range spec.Devices[0].ContainerEdits.Mounts {
-		if m.HostPath == "/dev/shm" {
-			foundShm = true
-			break
-		}
-	}
-	if !foundShm {
-		t.Error("/dev/shm mount not found in env spec")
-	}
-	// The libxpmem.so.0 mount has a host path different from its container path —
-	// confirm both halves survive the round-trip through json.
-	foundXpmem := false
-	for _, m := range spec.Devices[0].ContainerEdits.Mounts {
-		if m.HostPath == "/opt/xpmem/lib64/libxpmem.so.0" && m.ContainerPath == "/usr/lib64/libxpmem.so.0" {
-			foundXpmem = true
-			break
-		}
-	}
-	if !foundXpmem {
-		t.Error("libxpmem.so.0 mount with split host/container path not found")
-	}
-	if len(spec.Devices[0].ContainerEdits.Hooks) == 0 {
-		t.Error("no hooks in env spec, want ldcache hook")
-	}
-	foundAMA := false
-	for _, e := range spec.Devices[0].ContainerEdits.Env {
-		if e == "CXIP_SKIP_AMA_CHECK=1" {
-			foundAMA = true
-			break
-		}
-	}
-	if !foundAMA {
-		t.Errorf("CXIP_SKIP_AMA_CHECK env var not found in env spec; env = %v",
-			spec.Devices[0].ContainerEdits.Env)
-	}
-}
-
-func TestWriteEnvSpecInjectsKdReg2(t *testing.T) {
-	cdiRoot := t.TempDir()
-	const driver = "cxi.slingshot.hpe.com"
-
-	// A regular file is enough: optionalDeviceNode only needs stat to succeed
-	// (Rdev is 0 for a regular file, but the entry is still emitted), which
-	// confirms /dev/kdreg2 is wired into the env spec's device-node loop.
-	kdreg2 := filepath.Join(t.TempDir(), "kdreg2")
-	if err := os.WriteFile(kdreg2, nil, 0o644); err != nil {
-		t.Fatalf("creating fake kdreg2: %v", err)
-	}
-	cfg := CDIEnvConfig{
-		XpmemPath:  filepath.Join(t.TempDir(), "xpmem"),  // absent → skipped
-		GdrDrvPath: filepath.Join(t.TempDir(), "gdrdrv"), // absent → skipped
-		KdReg2Path: kdreg2,
-		EnvMounts: []MountSpec{
-			{HostPath: "/usr/lib64/libcxi.so.1", ContainerPath: "/usr/lib64/libcxi.so.1"},
-		},
-	}
-	if err := WriteEnvSpec(cdiRoot, driver, cfg); err != nil {
-		t.Fatalf("WriteEnvSpec: %v", err)
-	}
-
-	data, err := os.ReadFile(filepath.Join(cdiRoot, driver+"-env.json"))
+	cfg, err := LoadConfig(writeConfig(t, body))
 	if err != nil {
-		t.Fatalf("reading spec: %v", err)
+		t.Fatalf("LoadConfig(deploy/kubernetes/configmap.yaml): %v", err)
 	}
-	var spec specs.Spec
-	if err := json.Unmarshal(data, &spec); err != nil {
-		t.Fatalf("unmarshalling spec: %v", err)
+	if !slicesContainPrefix(cfg.Env, "CXIP_SKIP_AMA_CHECK=") {
+		t.Errorf("deploy configmap env %v lacks CXIP_SKIP_AMA_CHECK", cfg.Env)
 	}
+}
 
-	found := false
-	for _, dn := range spec.Devices[0].ContainerEdits.DeviceNodes {
-		if dn.HostPath == kdreg2 {
-			found = true
-			break
+func slicesContainPrefix(list []string, prefix string) bool {
+	for _, s := range list {
+		if strings.HasPrefix(s, prefix) {
+			return true
 		}
 	}
-	if !found {
-		t.Errorf("kdreg2 device node not injected; nodes = %v",
-			spec.Devices[0].ContainerEdits.DeviceNodes)
-	}
-}
-
-func TestRemoveEnvSpec(t *testing.T) {
-	cdiRoot := t.TempDir()
-	const driver = "cxi.slingshot.hpe.com"
-	cfg := CDIEnvConfig{
-		XpmemPath:  filepath.Join(t.TempDir(), "xpmem"),
-		GdrDrvPath: filepath.Join(t.TempDir(), "gdrdrv"),
-	}
-	if err := WriteEnvSpec(cdiRoot, driver, cfg); err != nil {
-		t.Fatalf("WriteEnvSpec: %v", err)
-	}
-	if err := RemoveEnvSpec(cdiRoot, driver); err != nil {
-		t.Fatalf("RemoveEnvSpec: %v", err)
-	}
-	if _, err := os.Stat(filepath.Join(cdiRoot, driver+"-env.json")); !os.IsNotExist(err) {
-		t.Error("env spec file still exists after RemoveEnvSpec")
-	}
-	if err := RemoveEnvSpec(cdiRoot, driver); err != nil {
-		t.Errorf("RemoveEnvSpec on absent file: %v", err)
-	}
-}
-
-func TestWriteNCCLSpec(t *testing.T) {
-	cdiRoot := t.TempDir()
-	const driver = "cxi.slingshot.hpe.com"
-	cfg := CDIEnvConfig{NCCLPrefix: "/spack/nccl-2.29.2"}
-
-	if err := WriteNCCLSpec(cdiRoot, driver, cfg); err != nil {
-		t.Fatalf("WriteNCCLSpec: %v", err)
-	}
-
-	data, err := os.ReadFile(filepath.Join(cdiRoot, driver+"-nccl.json"))
-	if err != nil {
-		t.Fatalf("reading NCCL spec: %v", err)
-	}
-	var spec specs.Spec
-	if err := json.Unmarshal(data, &spec); err != nil {
-		t.Fatalf("unmarshalling: %v", err)
-	}
-
-	if spec.Kind != driver+"/nccl" {
-		t.Errorf("kind = %q, want %q", spec.Kind, driver+"/nccl")
-	}
-	if len(spec.Devices) != 1 || spec.Devices[0].Name != "nccl" {
-		t.Errorf("devices = %v, want [{nccl}]", spec.Devices)
-	}
-	if len(spec.Devices[0].ContainerEdits.Mounts) != 1 ||
-		spec.Devices[0].ContainerEdits.Mounts[0].HostPath != cfg.NCCLPrefix ||
-		spec.Devices[0].ContainerEdits.Mounts[0].ContainerPath != "/host/nccl" {
-		t.Errorf("mounts = %v, want NCCL prefix → /host/nccl", spec.Devices[0].ContainerEdits.Mounts)
-	}
-	if len(spec.Devices[0].ContainerEdits.Hooks) == 0 {
-		t.Error("no hooks in NCCL spec, want ldcache hook")
-	}
-}
-
-func TestRemoveNCCLSpec(t *testing.T) {
-	cdiRoot := t.TempDir()
-	const driver = "cxi.slingshot.hpe.com"
-	cfg := CDIEnvConfig{NCCLPrefix: "/spack/nccl"}
-	if err := WriteNCCLSpec(cdiRoot, driver, cfg); err != nil {
-		t.Fatalf("WriteNCCLSpec: %v", err)
-	}
-	if err := RemoveNCCLSpec(cdiRoot, driver); err != nil {
-		t.Fatalf("RemoveNCCLSpec: %v", err)
-	}
-	if _, err := os.Stat(filepath.Join(cdiRoot, driver+"-nccl.json")); !os.IsNotExist(err) {
-		t.Error("nccl spec file still exists after RemoveNCCLSpec")
-	}
-	if err := RemoveNCCLSpec(cdiRoot, driver); err != nil {
-		t.Errorf("RemoveNCCLSpec on absent file: %v", err)
-	}
-}
-
-func TestWriteAWSofiNCCLSpec(t *testing.T) {
-	cdiRoot := t.TempDir()
-	const driver = "cxi.slingshot.hpe.com"
-	cfg := CDIEnvConfig{
-		AWSofiMounts: []MountSpec{
-			{HostPath: "/spack/aws-ofi-nccl-1.18.0/lib/libnccl-net.so", ContainerPath: "/usr/lib/libnccl-net.so"},
-			{HostPath: "/spack/hwloc/lib/libhwloc.so.15", ContainerPath: "/usr/lib/libhwloc.so.15"},
-		},
-		AWSofiEnv: []string{"NCCL_NET=AWS Libfabric", "FI_CXI_RX_MATCH_MODE=hybrid"},
-	}
-
-	if err := WriteAWSofiNCCLSpec(cdiRoot, driver, cfg); err != nil {
-		t.Fatalf("WriteAWSofiNCCLSpec: %v", err)
-	}
-
-	data, err := os.ReadFile(filepath.Join(cdiRoot, driver+"-aws-ofi-nccl.json"))
-	if err != nil {
-		t.Fatalf("reading spec: %v", err)
-	}
-	var spec specs.Spec
-	if err := json.Unmarshal(data, &spec); err != nil {
-		t.Fatalf("unmarshalling: %v", err)
-	}
-
-	if spec.Kind != driver+"/aws-ofi-nccl" {
-		t.Errorf("kind = %q, want %q", spec.Kind, driver+"/aws-ofi-nccl")
-	}
-	if len(spec.Devices) != 1 || spec.Devices[0].Name != "aws-ofi-nccl" {
-		t.Errorf("devices = %v, want [{aws-ofi-nccl}]", spec.Devices)
-	}
-
-	found := false
-	for _, m := range spec.Devices[0].ContainerEdits.Mounts {
-		if m.HostPath == "/spack/aws-ofi-nccl-1.18.0/lib/libnccl-net.so" && m.ContainerPath == "/usr/lib/libnccl-net.so" {
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Errorf("libnccl-net.so mount not found; mounts = %v", spec.Devices[0].ContainerEdits.Mounts)
-	}
-
-	foundEnv := false
-	for _, e := range spec.Devices[0].ContainerEdits.Env {
-		if e == "NCCL_NET=AWS Libfabric" {
-			foundEnv = true
-			break
-		}
-	}
-	if !foundEnv {
-		t.Error("NCCL_NET env var not found in aws-ofi-nccl spec")
-	}
-
-	if len(spec.Devices[0].ContainerEdits.Hooks) == 0 {
-		t.Error("no hooks in aws-ofi-nccl spec, want ldcache hook")
-	}
-}
-
-func TestRemoveAWSofiNCCLSpec(t *testing.T) {
-	cdiRoot := t.TempDir()
-	const driver = "cxi.slingshot.hpe.com"
-	cfg := CDIEnvConfig{
-		AWSofiMounts: []MountSpec{
-			{HostPath: "/spack/aws-ofi-nccl/lib/libnccl-net.so", ContainerPath: "/usr/lib/libnccl-net.so"},
-		},
-	}
-	if err := WriteAWSofiNCCLSpec(cdiRoot, driver, cfg); err != nil {
-		t.Fatalf("WriteAWSofiNCCLSpec: %v", err)
-	}
-	if err := RemoveAWSofiNCCLSpec(cdiRoot, driver); err != nil {
-		t.Fatalf("RemoveAWSofiNCCLSpec: %v", err)
-	}
-	if _, err := os.Stat(filepath.Join(cdiRoot, driver+"-aws-ofi-nccl.json")); !os.IsNotExist(err) {
-		t.Error("aws-ofi-nccl spec file still exists after remove")
-	}
-	if err := RemoveAWSofiNCCLSpec(cdiRoot, driver); err != nil {
-		t.Errorf("RemoveAWSofiNCCLSpec on absent file: %v", err)
-	}
-}
-
-func TestLoadConfig(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "env.json")
-	if err := os.WriteFile(path, []byte(`{
-		"envMounts": [
-			{"hostPath": "/opt/cray/libfabric/2.3.1/lib64/libfabric.so.1", "containerPath": "/usr/lib64/libfabric.so.1"},
-			{"hostPath": "/opt/xpmem/lib64/libxpmem.so.0",                "containerPath": "/usr/lib64/libxpmem.so.0"}
-		],
-		"envVars": ["CXIP_SKIP_AMA_CHECK=1"],
-		"ncclPrefix": "/spack/nccl",
-		"awsOfiMounts": [
-			{"hostPath": "/spack/aws-ofi-nccl/lib/libnccl-net.so", "containerPath": "/usr/lib/libnccl-net.so"}
-		],
-		"awsOfiEnv": ["NCCL_NET=AWS Libfabric"]
-	}`), 0o644); err != nil {
-		t.Fatalf("writing config: %v", err)
-	}
-	cfg, err := LoadConfig(path)
-	if err != nil {
-		t.Fatalf("LoadConfig: %v", err)
-	}
-	if len(cfg.EnvMounts) != 2 || cfg.EnvMounts[1].HostPath != "/opt/xpmem/lib64/libxpmem.so.0" {
-		t.Errorf("EnvMounts = %v", cfg.EnvMounts)
-	}
-	if len(cfg.EnvVars) != 1 || cfg.EnvVars[0] != "CXIP_SKIP_AMA_CHECK=1" {
-		t.Errorf("EnvVars = %v", cfg.EnvVars)
-	}
-	if cfg.NCCLPrefix != "/spack/nccl" {
-		t.Errorf("NCCLPrefix = %q", cfg.NCCLPrefix)
-	}
-	if len(cfg.AWSofiMounts) != 1 || len(cfg.AWSofiEnv) != 1 {
-		t.Errorf("aws-ofi fields = %v / %v", cfg.AWSofiMounts, cfg.AWSofiEnv)
-	}
-}
-
-func TestLoadConfigRejectsEmptyMounts(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "env.json")
-	if err := os.WriteFile(path, []byte(`{"envMounts":[]}`), 0o644); err != nil {
-		t.Fatalf("writing config: %v", err)
-	}
-	if _, err := LoadConfig(path); err == nil {
-		t.Error("LoadConfig accepted empty envMounts")
-	}
-}
-
-func TestLoadConfigRejectsUnknownFields(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "env.json")
-	if err := os.WriteFile(path, []byte(`{
-		"envMounts":[{"hostPath":"/a","containerPath":"/a"}],
-		"libfabricLib":"/opt/cray/libfabric.so.1"
-	}`), 0o644); err != nil {
-		t.Fatalf("writing config: %v", err)
-	}
-	if _, err := LoadConfig(path); err == nil {
-		t.Error("LoadConfig accepted unknown field libfabricLib")
-	}
+	return false
 }

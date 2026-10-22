@@ -6,7 +6,7 @@ CXI DRA driver "{{ .Release.Name }}" installed.
   DeviceClass : {{ include "cxi-dra.deviceClassName" . }}
 {{- end }}
 {{- if .Values.admissionPolicy.enabled }}
-  Policy      : {{ include "cxi-dra.fullname" . }}-selector-injection
+  Policy      : {{ include "cxi-dra.fullname" . }}-capacity-conversion (legacy opaque config → capacity.requests)
 {{- end }}
 
 The driver publishes ResourceSlices under driver name
