@@ -3,6 +3,7 @@
 package cni
 
 import (
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
@@ -99,7 +100,7 @@ func TestNetlinkManager_CreateConfigureCheckDelete(t *testing.T) {
 	nsPath := newTestNetNS(t)
 	m := newLinkManager()
 
-	name, err := m.CreateIPVLAN(parent, "abcdef1234567890", nsPath)
+	name, err := m.CreateIPVLAN(parent, parent, "abcdef1234567890", nsPath)
 	if err != nil {
 		t.Fatalf("CreateIPVLAN: %v", err)
 	}
@@ -204,7 +205,7 @@ func TestNetlinkManager_NameFallback(t *testing.T) {
 	}
 
 	m := newLinkManager()
-	name, err := m.CreateIPVLAN(parent, "ctr", nsPath)
+	name, err := m.CreateIPVLAN(parent, parent, "ctr", nsPath)
 	if err != nil {
 		t.Fatalf("CreateIPVLAN: %v", err)
 	}
@@ -241,7 +242,70 @@ func TestNetlinkManager_GoneNetNSIsNotAnError(t *testing.T) {
 	if name, err := m.Find(gone, "hsn0"); err != nil || name != "" {
 		t.Errorf("Find on missing netns = (%q, %v), want (\"\", nil)", name, err)
 	}
-	if _, err := m.CreateIPVLAN("no-such-parent", "ctr", gone); err == nil {
+	if _, err := m.CreateIPVLAN("no-such-parent", "cxi0", "ctr", gone); err == nil {
 		t.Error("CreateIPVLAN with a missing parent must fail")
+	}
+}
+
+func TestNetlinkManager_CustomName(t *testing.T) {
+	requireRoot(t)
+	const parent = "enp197s0f1np0"
+	newDummyParent(t, parent)
+	for _, tt := range []struct {
+		name     string
+		fallback bool
+	}{
+		{"cxi4", false},
+		{"cxi4", true},
+		{"1234567890", true},
+	} {
+		t.Run(fmt.Sprintf("%s/fallback=%t", tt.name, tt.fallback), func(t *testing.T) {
+			nsPath := newTestNetNS(t)
+			if tt.fallback {
+				if err := withHandle(nsPath, func(h *netlink.Handle) error {
+					return h.LinkAdd(&netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: tt.name}})
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			m := newLinkManager()
+			name, err := m.CreateIPVLAN(parent, tt.name, "custom", nsPath)
+			if err != nil {
+				t.Fatalf("CreateIPVLAN: %v", err)
+			}
+			wantName := tt.name
+			if tt.fallback {
+				wantName += inetSuffix
+			}
+			if name != wantName {
+				t.Fatalf("created %q, want %q", name, wantName)
+			}
+			if got, err := m.Find(nsPath, tt.name); err != nil || got != wantName {
+				t.Fatalf("Find = (%q, %v), want %q", got, err, wantName)
+			}
+			if err := m.Check(nsPath, name); err != nil {
+				t.Fatalf("Check: %v", err)
+			}
+			if err := m.Delete(nsPath, name); err != nil {
+				t.Fatalf("Delete: %v", err)
+			}
+			if err := m.Delete(nsPath, name); err != nil {
+				t.Fatalf("second Delete: %v", err)
+			}
+			if tt.fallback {
+				if err := m.Delete(nsPath, tt.name); err != nil {
+					t.Fatal(err)
+				}
+				if link := linksIn(t, nsPath)[tt.name]; link == nil || link.Type() != "dummy" {
+					t.Fatalf("non-IPVLAN link was disturbed: %v", link)
+				}
+			}
+			if got, err := m.Find(nsPath, tt.name); err != nil || got != "" {
+				t.Errorf("Find after Delete = (%q, %v)", got, err)
+			}
+			if err := m.Check(nsPath, name); err == nil {
+				t.Error("Check after Delete must fail")
+			}
+		})
 	}
 }

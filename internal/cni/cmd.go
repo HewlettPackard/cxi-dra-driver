@@ -62,7 +62,7 @@ func (p *plugin) add(args *skel.CmdArgs) error {
 	}
 
 	for _, hint := range hints {
-		ifName, err := p.links.CreateIPVLAN(hint.HSNIface, args.ContainerID, args.Netns)
+		ifName, err := p.links.CreateIPVLAN(hint.HSNIface, hint.effectiveName(), args.ContainerID, args.Netns)
 		if err != nil {
 			rollback()
 			return fmt.Errorf("device %s: %w", hint.Device, err)
@@ -114,8 +114,11 @@ func (p *plugin) del(args *skel.CmdArgs) error {
 	}
 	hints, err := ReadHint(conf.hintsDirOrDefault(), podUID, conf.retryInterval, conf.retryTimeout)
 	if err != nil {
-		log.Printf("slingshot-cni: DEL %s: hint file unavailable, nothing to clean up: %v", podUID, err)
-		return nil
+		if errors.Is(err, os.ErrNotExist) {
+			log.Printf("slingshot-cni: DEL %s: hint file unavailable, nothing to clean up: %v", podUID, err)
+			return nil
+		}
+		return fmt.Errorf("resolving CNI hint for pod %s: %w", podUID, err)
 	}
 	if err := validateHints(hints); err != nil {
 		return fmt.Errorf("validating CNI hint for pod %s: %w", podUID, err)
@@ -128,12 +131,12 @@ func (p *plugin) del(args *skel.CmdArgs) error {
 		// Recover the name ADD actually used so the IPAM release hits the
 		// same (containerID, ifname) reservation. If the interface is already
 		// gone, release under the preferred name — the most likely match.
-		ifName, err := p.links.Find(args.Netns, hint.HSNIface)
+		ifName, err := p.links.Find(args.Netns, hint.effectiveName())
 		if err != nil {
 			errs = append(errs, fmt.Errorf("device %s: %w", hint.Device, err))
 		}
 		if ifName == "" {
-			ifName = hint.HSNIface
+			ifName = hint.effectiveName()
 		}
 		if err := ipam.Del(ctx, args.StdinData, ifName); err != nil {
 			errs = append(errs, fmt.Errorf("device %s: %w", hint.Device, err))
@@ -155,12 +158,12 @@ func (p *plugin) check(args *skel.CmdArgs) error {
 	ctx := context.Background()
 	ipam := p.newIPAM(conf.IPAM.Type)
 	for _, hint := range hints {
-		ifName, err := p.links.Find(args.Netns, hint.HSNIface)
+		ifName, err := p.links.Find(args.Netns, hint.effectiveName())
 		if err != nil {
 			return fmt.Errorf("device %s: %w", hint.Device, err)
 		}
 		if ifName == "" {
-			return fmt.Errorf("device %s: no interface found for %s (tried %v)", hint.Device, hint.HSNIface, ifaceNameCandidates(hint.HSNIface))
+			return fmt.Errorf("device %s: no interface found for %s (tried %v)", hint.Device, hint.effectiveName(), ifaceNameCandidates(hint.effectiveName()))
 		}
 		if err := p.links.Check(args.Netns, ifName); err != nil {
 			return fmt.Errorf("device %s: %w", hint.Device, err)

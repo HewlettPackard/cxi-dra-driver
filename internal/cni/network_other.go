@@ -17,9 +17,9 @@ type unsupportedManager struct{}
 
 func newLinkManager() linkManager { return unsupportedManager{} }
 
-func (unsupportedManager) CreateIPVLAN(_, _, _ string) (string, error) { return "", errUnsupported }
-func (unsupportedManager) Find(_, _ string) (string, error)            { return "", errUnsupported }
-func (unsupportedManager) Delete(_, _ string) error                    { return errUnsupported }
+func (unsupportedManager) CreateIPVLAN(_, _, _, _ string) (string, error) { return "", errUnsupported }
+func (unsupportedManager) Find(_, _ string) (string, error)               { return "", errUnsupported }
+func (unsupportedManager) Delete(_, _ string) error                       { return errUnsupported }
 func (unsupportedManager) ConfigureAddress(_, _ string, _ *types100.Result) error {
 	return errUnsupported
 }

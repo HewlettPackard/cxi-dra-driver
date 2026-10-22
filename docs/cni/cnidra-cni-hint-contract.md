@@ -1,7 +1,7 @@
 # CNI Hint-File Contract (Slingshot CNI)
 
 This document defines the contract by which the CXI DRA driver hands off
-per-pod network information (`hsn_iface`, `vni`, per device) to the Slingshot
+per-pod network information (`hsn_iface`, optional `ifname`, `vni`, per device) to the Slingshot
 CNI plugin. It specifies the driver-side write contract; the read side is
 implemented by `slingshot-cni` ([internal/cni](../../internal/cni)), described
 in [cni-plugin.md](./cni-plugin.md).
@@ -79,9 +79,44 @@ the pod, matching how `AllocationStore` merges per-pod state across claims):
 
 | Field | Type | Meaning |
 |---|---|---|
+| `schema_version` | int, optional | Per-entry schema version; absent or `0` denotes the legacy unversioned format, `1` denotes the legacy fields, and `2` adds optional `ifname`. The CNI supports versions through `2`. |
 | `device` | string | CXI device name, e.g. `cxi0` — matches the `ResourceSlice` device name |
-| `hsn_iface` | string | Paired HSN interface, e.g. `hsn2` — same value as the device's `hsn_iface` `ResourceSlice` attribute |
+| `hsn_iface` | string | The host link the CNI attaches the pod interface to: a PF netdev in PF mode or a VF netdev in VF mode. Same value as the device's `hsn_iface` `ResourceSlice` attribute; not necessarily the pod-side name. |
+| `ifname` | string, optional | Preferred pod-side interface name. When absent or empty, the CNI uses `hsn_iface`. |
 | `vni` | int | Virtual Network Identifier assigned to the pod's namespace |
+
+### Naming and compatibility
+
+The file remains a JSON array. Existing unversioned hints without `ifname`
+continue to work with the same names (`hsn2`, fallback `hsn2_inet`).
+For a distinct pod-side name, the version-2 contract accepts:
+
+```json
+[
+  { "schema_version": 2, "device": "cxi4", "hsn_iface": "enp197s0f1np0", "ifname": "cxi4", "vni": 137 }
+]
+```
+
+Here the CNI attaches to host link `enp197s0f1np0` but names the IPVLAN
+`cxi4` in the pod, falling back to `cxi4_inet` if necessary. `ADD`, `DEL`,
+`CHECK`, and Whereabouts all use the selected pod-side name.
+
+The effective name (`ifname` when non-empty, otherwise `hsn_iface`) must
+leave room for the five-byte `_inet` suffix within Linux's 15-byte interface
+name limit: **at most 10 bytes for the base name**. This validation also
+applies to legacy hints. A long host link name is allowed when a short
+`ifname` is supplied. Over-long effective names are rejected before network changes.
+
+The CNI logs an explicit error and rejects entries with a newer
+`schema_version`; negative versions are also rejected. Hint schema versions
+are independent of the network config's `cniVersion`.
+
+The current PF driver writer continues to emit unversioned hints without
+`ifname`; emitting VF-specific names is separate driver work. Upgrade the
+host-installed CNI before enabling a writer that emits custom names:
+older CNI binaries ignore unknown JSON fields, including `ifname`, so they
+would still use the host name. Do not change a live pod's effective name
+between `ADD` and `DEL`/`CHECK`.
 
 ## hostPath directory convention
 
