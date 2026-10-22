@@ -17,8 +17,8 @@ func TestReadHint_SchemaCompatibility(t *testing.T) {
 	}{
 		{"legacy", `[{"device":"cxi4","hsn_iface":"hsn0","vni":137}]`, "hsn0"},
 		{"version 1", `[{"schema_version":1,"device":"cxi4","hsn_iface":"hsn0","vni":137}]`, "hsn0"},
-		{"custom name", `[{"schema_version":2,"device":"cxi4","hsn_iface":"enp197s0f1","ifname":"cxi4","vni":137}]`, "cxi4"},
-		{"optional name", `[{"schema_version":2,"device":"cxi4","hsn_iface":"hsn0","vni":137}]`, "hsn0"},
+		{"custom name", `[{"schema_version":1,"device":"cxi4","hsn_iface":"enp197s0f1","ifname":"cxi4","vni":137}]`, "cxi4"},
+		{"optional name", `[{"schema_version":1,"device":"cxi4","hsn_iface":"hsn0","vni":137}]`, "hsn0"},
 		{"empty name", `[{"device":"cxi4","hsn_iface":"hsn0","ifname":"","vni":137}]`, "hsn0"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -50,7 +50,7 @@ func TestReadHint_NewerSchemaIsLoggedAndRejected(t *testing.T) {
 	log.SetOutput(&logs)
 	t.Cleanup(func() { log.SetOutput(original) })
 	_, err := ReadHint(dir, "pod", time.Millisecond, time.Second)
-	if err == nil || !strings.Contains(err.Error(), "unsupported schema_version 3") {
+	if err == nil || !strings.Contains(err.Error(), "unsupported schema_version 2") {
 		t.Fatalf("ReadHint error = %v, want unsupported schema", err)
 	}
 	if !strings.Contains(logs.String(), "upgrade slingshot-cni") {
