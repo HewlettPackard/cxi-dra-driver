@@ -13,8 +13,9 @@ each CXI device it claimed. For every device in the pod's hint file it:
 
 1. creates an **L2 IPVLAN sub-interface** on the device's paired host HSN
    interface (`hsn_iface`),
-2. moves it into the pod's network namespace under the HSN's own name
-   (`hsn2`, falling back to `hsn2_inet` if that name is taken), and
+2. moves it into the pod's network namespace under the hint's optional
+   `ifname`, defaulting to `hsn_iface` (`hsn2`, for example), and tries
+   `<name>_inet` if the preferred name is taken, and
 3. delegates address assignment to the **Whereabouts IPAM plugin** per the
    standard CNI IPAM delegate contract, then applies the returned
    address/routes to the interface.
@@ -72,7 +73,24 @@ All three commands start the same way:
    (default `100ms`/`5s`) if it isn't there yet — a safety net for the driver
    crashing between claim allocation and `PrepareResourceClaims`, not the
    common path (see the ordering guarantee in the hint contract).
-4. Validate every hint entry (`device`, `hsn_iface`, positive `vni`).
+4. Validate every hint entry (`device`, `hsn_iface`, positive `vni`, supported
+   `schema_version`, and effective name plus `_inet` at most 15 bytes).
+
+The optional `ifname` separates the pod-side name from the host parent:
+`{"schema_version":2,"device":"cxi4","hsn_iface":"enp197s0f1np0","ifname":"cxi4","vni":137}`
+creates `cxi4` (fallback `cxi4_inet`) on host parent `enp197s0f1np0`.
+The base name must be at most **10 bytes**, leaving five bytes for `_inet`.
+The host parent's length is not subject to that fallback constraint when
+`ifname` is set.
+
+Existing unversioned JSON arrays and hints without `ifname` remain supported;
+absent or empty `ifname` preserves PF naming. Optional per-entry
+`schema_version` supports legacy versions `0`/`1` and version `2` with
+optional naming. Newer versions are logged and rejected, including on
+`DEL`, rather than interpreted as a missing hint. Upgrade the CNI before
+enabling a custom-name writer; older binaries ignore the new fields.
+See the [hint contract](./cnidra-cni-hint-contract.md#naming-and-compatibility)
+for the full compatibility rules.
 
 ### `ADD`
 
@@ -83,7 +101,7 @@ For each hint entry, in order:
 | a | `LinkByName(hsn_iface)` in the host netns → parent | fail; unwind previous devices |
 | b | `LinkAdd` IPVLAN (mode L2, parent = HSN) under a temporary host-side name (`cxi<containerID[:8]>`) | fail; unwind |
 | c | `LinkSetNsFd` → move into `CNI_NETNS` | delete link; unwind |
-| d | Inside the pod netns: rename to `hsn_iface`; if the kernel refuses (name in use), rename to `hsn_iface_inet`; `LinkSetUp` | delete link; unwind |
+| d | Inside the pod netns: rename to the effective name (`ifname`, otherwise `hsn_iface`); if the kernel refuses (name in use), try `<name>_inet`; `LinkSetUp` | delete link; unwind |
 | e | Exec the IPAM plugin (`ipam.type`, found on `CNI_PATH`) with `CNI_COMMAND=ADD`, the **unmodified stdin config**, and `CNI_IFNAME` overridden to the name chosen in (d) | delete link; unwind |
 | f | Apply every returned IP to the interface; add every returned route (using the IP's gateway when the route has none) | IPAM `DEL` + delete link; unwind |
 
@@ -119,7 +137,7 @@ regardless:
   joined and returned at the end.
 
 `DEL` only ever deletes **IPVLAN** links. If the pod's netns has a non-IPVLAN
-interface under the HSN's name (the very situation the `_inet` fallback
+interface under the preferred pod-side name (the very situation the `_inet` fallback
 exists for), it is left untouched.
 
 ### `CHECK`
@@ -174,9 +192,10 @@ Prerequisites on each node:
 
 | File | Covers | Runs |
 |---|---|---|
-| [cmd_test.go](../../internal/cni/cmd_test.go) | `ADD`/`DEL`/`CHECK` orchestration against in-memory fakes: single- and multi-device result shape, `_inet` fallback, rollback ordering on IPAM / configure / create failure, `DEL` idempotency and per-device continuation, missing-vs-malformed hint handling | everywhere |
+| [cmd_test.go](../../internal/cni/cmd_test.go) | `ADD`/`DEL`/`CHECK` orchestration against in-memory fakes: single- and multi-device result shape, custom names, `_inet` fallback, rollback ordering on IPAM / configure / create failure, `DEL` idempotency and per-device continuation, missing-vs-malformed/unsupported hint handling | everywhere |
+| [hint_test.go](../../internal/cni/hint_test.go) | Legacy/versioned hints, optional naming, fallback length boundaries, unsupported schema errors and logging | everywhere |
 | [ipam_test.go](../../internal/cni/ipam_test.go) | the real IPAM delegate exec'ing a fake `whereabouts` binary (built from [testdata/fakewhereabouts](../../internal/cni/testdata/fakewhereabouts)) — verifies `CNI_COMMAND`, per-device `CNI_IFNAME` override, inherited `CNI_CONTAINERID`, stdin forwarding, result parsing, and error surfacing | everywhere (needs `go` on `PATH`) |
-| [network_linux_test.go](../../internal/cni/network_linux_test.go) | the real `netlink` implementation against a throwaway named netns and a dummy parent: create/move/rename/up, L2 mode, address and route application, `Find`/`Check`/`Delete`, idempotent delete, `_inet` fallback without disturbing the pod's own link, vanished-netns handling | Linux as root only (skips otherwise) |
+| [network_linux_test.go](../../internal/cni/network_linux_test.go) | the real `netlink` implementation against a throwaway named netns and a dummy parent: create/move/rename/up, L2 mode, address and route application, distinct host/pod names, `Find`/`Check`/`Delete`, idempotent delete, `_inet` fallback at the 15-byte limit without disturbing the pod's own link, vanished-netns handling | Linux as root only (skips otherwise) |
 
 To run the root-gated tests from a non-Linux workstation:
 

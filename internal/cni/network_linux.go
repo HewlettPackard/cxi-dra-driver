@@ -32,7 +32,7 @@ func tempLinkName(containerID string) string {
 	return "cxi" + containerID
 }
 
-func (netlinkManager) CreateIPVLAN(hsnIface, containerID, nsPath string) (string, error) {
+func (netlinkManager) CreateIPVLAN(hsnIface, ifName, containerID, nsPath string) (string, error) {
 	parent, err := netlink.LinkByName(hsnIface)
 	if err != nil {
 		return "", fmt.Errorf("looking up HSN parent interface %s: %w", hsnIface, err)
@@ -66,14 +66,14 @@ func (netlinkManager) CreateIPVLAN(hsnIface, containerID, nsPath string) (string
 			return fmt.Errorf("finding %s inside netns: %w", tmpName, err)
 		}
 		var renameErr error
-		for _, candidate := range ifaceNameCandidates(hsnIface) {
+		for _, candidate := range ifaceNameCandidates(ifName) {
 			if renameErr = h.LinkSetName(moved, candidate); renameErr == nil {
 				usedName = candidate
 				break
 			}
 		}
 		if renameErr != nil {
-			return fmt.Errorf("renaming IPVLAN sub-interface to %s (or fallback): %w", hsnIface, renameErr)
+			return fmt.Errorf("renaming IPVLAN sub-interface to %s (or fallback): %w", ifName, renameErr)
 		}
 		if err := h.LinkSetUp(moved); err != nil {
 			return fmt.Errorf("setting %s up: %w", usedName, err)
@@ -83,7 +83,7 @@ func (netlinkManager) CreateIPVLAN(hsnIface, containerID, nsPath string) (string
 	if err != nil {
 		// The link may be under tmpName or a candidate name by now; try all.
 		_ = withHandle(nsPath, func(h *netlink.Handle) error {
-			l, _, ferr := findLink(h, append([]string{tmpName}, ifaceNameCandidates(hsnIface)...))
+			l, _, ferr := findLink(h, append([]string{tmpName}, ifaceNameCandidates(ifName)...))
 			if ferr != nil || l == nil {
 				return ferr
 			}
@@ -94,10 +94,10 @@ func (netlinkManager) CreateIPVLAN(hsnIface, containerID, nsPath string) (string
 	return usedName, nil
 }
 
-func (netlinkManager) Find(nsPath, hsnIface string) (string, error) {
+func (netlinkManager) Find(nsPath, ifName string) (string, error) {
 	var found string
 	err := withHandle(nsPath, func(h *netlink.Handle) error {
-		link, name, err := findLink(h, ifaceNameCandidates(hsnIface))
+		link, name, err := findLink(h, ifaceNameCandidates(ifName))
 		if err != nil {
 			return err
 		}

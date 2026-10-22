@@ -4,18 +4,20 @@ import (
 	types100 "github.com/containernetworking/cni/pkg/types/100"
 )
 
-// inetSuffix is appended to a hint's hsn_iface to name the in-pod interface
-// when the bare hsn_iface name is rejected by the kernel (e.g. it collides
+// inetSuffix is appended to the effective name of the in-pod interface
+// when the bare name is rejected by the kernel (e.g. it collides
 // with an interface the pod's netns already has).
 const inetSuffix = "_inet"
 
+// Linux interface names have IFNAMSIZ-1 usable bytes.
+const maxIfaceNameLen = 15
+
 // ifaceNameCandidates returns the in-pod interface names tried, in order,
-// for a device whose HSN parent is hsnIface: the HSN's own name first (so
-// the pod sees the same name the host does), then a suffixed fallback.
+// starting with the effective name, then a suffixed fallback.
 // ADD's naming outcome is not persisted, so DEL/CHECK probe the same two
 // names to find the interface again.
-func ifaceNameCandidates(hsnIface string) []string {
-	return []string{hsnIface, hsnIface + inetSuffix}
+func ifaceNameCandidates(ifName string) []string {
+	return []string{ifName, ifName + inetSuffix}
 }
 
 // linkManager is the kernel-facing half of the plugin: everything that
@@ -26,13 +28,13 @@ func ifaceNameCandidates(hsnIface string) []string {
 type linkManager interface {
 	// CreateIPVLAN creates an L2 IPVLAN sub-interface on the host interface
 	// hsnIface, moves it into the netns at nsPath, renames it to the first
-	// accepted candidate from ifaceNameCandidates, brings it up, and returns
-	// the name used. Cleans up after itself on failure.
-	CreateIPVLAN(hsnIface, containerID, nsPath string) (string, error)
+	// accepted candidate from ifaceNameCandidates(ifName), brings it up, and
+	// returns the name used. Cleans up after itself on failure.
+	CreateIPVLAN(hsnIface, ifName, containerID, nsPath string) (string, error)
 
-	// Find returns the name the interface for hsnIface currently has in the
-	// netns at nsPath, or "" if neither the interface nor the netns exists.
-	Find(nsPath, hsnIface string) (string, error)
+	// Find probes the effective ifName and its fallback in the netns at
+	// nsPath, returning "" if neither the interface nor the netns exists.
+	Find(nsPath, ifName string) (string, error)
 
 	// Delete removes the named interface from the netns at nsPath.
 	// Idempotent: a missing interface or a missing netns is not an error.

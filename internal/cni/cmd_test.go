@@ -9,6 +9,8 @@ import (
 	"io"
 	"log"
 	"net"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -33,12 +35,12 @@ type fakeLinks struct {
 
 func newFakeLinks() *fakeLinks { return &fakeLinks{ifaces: map[string]string{}} }
 
-func (f *fakeLinks) CreateIPVLAN(hsnIface, _, _ string) (string, error) {
+func (f *fakeLinks) CreateIPVLAN(hsnIface, ifName, _, _ string) (string, error) {
 	f.calls = append(f.calls, "create:"+hsnIface)
 	if hsnIface == f.failCreate {
 		return "", errors.New("injected create failure")
 	}
-	for _, name := range ifaceNameCandidates(hsnIface) {
+	for _, name := range ifaceNameCandidates(ifName) {
 		if _, exists := f.ifaces[name]; exists || slices.Contains(f.taken, name) {
 			continue
 		}
@@ -48,9 +50,9 @@ func (f *fakeLinks) CreateIPVLAN(hsnIface, _, _ string) (string, error) {
 	return "", errors.New("no free name")
 }
 
-func (f *fakeLinks) Find(_, hsnIface string) (string, error) {
-	f.calls = append(f.calls, "find:"+hsnIface)
-	for _, name := range ifaceNameCandidates(hsnIface) {
+func (f *fakeLinks) Find(_, ifName string) (string, error) {
+	f.calls = append(f.calls, "find:"+ifName)
+	for _, name := range ifaceNameCandidates(ifName) {
 		if _, ok := f.ifaces[name]; ok {
 			return name, nil
 		}
@@ -169,6 +171,102 @@ var (
 	oneDevice  = []Hint{{Device: "cxi0", HSNIface: "hsn0", VNI: 137}}
 	twoDevices = []Hint{{Device: "cxi0", HSNIface: "hsn0", VNI: 137}, {Device: "cxi1", HSNIface: "hsn1", VNI: 137}}
 )
+
+func TestCommands_CustomName(t *testing.T) {
+	for _, fallback := range []bool{false, true} {
+		t.Run(fmt.Sprintf("fallback=%t", fallback), func(t *testing.T) {
+			dir := t.TempDir()
+			const parent = "enp197s0f1np0"
+			mustWriteHint(t, dir, "pod", []Hint{{SchemaVersion: 2, Device: "cxi4", HSNIface: parent, IfName: "cxi4", VNI: 137}})
+			p, links, ipam, out := testPlugin()
+			wantName := "cxi4"
+			if fallback {
+				links.taken = []string{wantName}
+				wantName += inetSuffix
+			}
+			args := testCmdArgs(t, dir, "pod")
+			if err := p.add(args); err != nil {
+				t.Fatalf("add: %v", err)
+			}
+			if got := links.ifaces[wantName]; got != parent {
+				t.Errorf("parent for %s = %q, want %q", wantName, got, parent)
+			}
+			var result types100.Result
+			if err := json.Unmarshal(out.Bytes(), &result); err != nil {
+				t.Fatal(err)
+			}
+			if len(result.Interfaces) != 1 || result.Interfaces[0].Name != wantName {
+				t.Fatalf("interfaces = %+v, want %s", result.Interfaces, wantName)
+			}
+			if err := p.check(args); err != nil {
+				t.Fatalf("check: %v", err)
+			}
+			if err := p.del(args); err != nil {
+				t.Fatalf("del: %v", err)
+			}
+			if len(links.ifaces) != 0 || len(ipam.reserved) != 0 {
+				t.Errorf("leaked state: links=%v reservations=%v", links.ifaces, ipam.reserved)
+			}
+			wantCalls := []string{"add:" + wantName, "check:" + wantName, "del:" + wantName}
+			if !slices.Equal(ipam.calls, wantCalls) {
+				t.Errorf("IPAM calls = %v, want %v", ipam.calls, wantCalls)
+			}
+			if err := p.del(args); err != nil {
+				t.Fatalf("second del: %v", err)
+			}
+			if got := ipam.calls[len(ipam.calls)-1]; got != "del:cxi4" {
+				t.Errorf("DEL with missing link = %s, want preferred custom name", got)
+			}
+		})
+	}
+}
+
+func TestCommands_RejectInvalidHintsBeforeNetworking(t *testing.T) {
+	for _, tt := range []struct {
+		name, data, wantError string
+	}{
+		{"long name", `[{"device":"cxi4","hsn_iface":"hsn0","ifname":"12345678901","vni":137}]`, "base name at most 10 bytes"},
+		{"newer schema", `[{"schema_version":3,"device":"cxi4","hsn_iface":"hsn0","vni":137}]`, "unsupported schema_version"},
+		{"malformed JSON", `[`, "parsing CNI hint file"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(dir, "pod.json"), []byte(tt.data), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			p, links, ipam, _ := testPlugin()
+			for name, command := range map[string]func(*skel.CmdArgs) error{"ADD": p.add, "DEL": p.del, "CHECK": p.check} {
+				err := command(testCmdArgs(t, dir, "pod"))
+				if err == nil || !strings.Contains(err.Error(), tt.wantError) {
+					t.Errorf("%s error = %v, want %q", name, err, tt.wantError)
+				}
+			}
+			if len(links.calls) != 0 || len(ipam.calls) != 0 {
+				t.Errorf("networking attempted: links=%v IPAM=%v", links.calls, ipam.calls)
+			}
+		})
+	}
+}
+
+func TestAdd_CustomNameRollback(t *testing.T) {
+	dir := t.TempDir()
+	mustWriteHint(t, dir, "pod", []Hint{
+		{Device: "cxi4", HSNIface: "enp197s0f1", IfName: "cxi4", VNI: 137},
+		{Device: "cxi5", HSNIface: "enp197s0f2", IfName: "cxi5", VNI: 137},
+	})
+	p, links, ipam, _ := testPlugin()
+	links.taken = []string{"cxi4"}
+	ipam.failAdd = "cxi5"
+	if err := p.add(testCmdArgs(t, dir, "pod")); err == nil {
+		t.Fatal("expected IPAM failure")
+	}
+	if len(links.ifaces) != 0 || len(ipam.reserved) != 0 {
+		t.Errorf("leaked state: links=%v reservations=%v", links.ifaces, ipam.reserved)
+	}
+	if !slices.Equal(ipam.calls, []string{"add:cxi4_inet", "add:cxi5", "del:cxi4_inet"}) {
+		t.Errorf("IPAM calls = %v", ipam.calls)
+	}
+}
 
 func TestAdd_SingleDevice(t *testing.T) {
 	dir := t.TempDir()
