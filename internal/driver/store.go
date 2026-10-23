@@ -1,6 +1,7 @@
 package driver
 
 import (
+	"slices"
 	"sync"
 
 	"k8s.io/apimachinery/pkg/types"
@@ -29,8 +30,9 @@ type PodAllocation struct {
 type AllocationStore struct {
 	mu          sync.Mutex
 	byPodUID    map[types.UID][]PodAllocation
-	claimToPods map[types.UID][]types.UID // claim UID → pod UIDs that reserved it
-	podToClaim  map[types.UID]types.UID   // pod UID → CXI claim UID (reverse map)
+	claimToPods map[types.UID][]types.UID     // claim UID → pod UIDs that reserved it
+	podToClaim  map[types.UID]types.UID       // pod UID → CXI claim UID (reverse map)
+	claimAllocs map[types.UID][]PodAllocation // claim UID → allocation recorded when it was prepared here
 }
 
 func NewAllocationStore() *AllocationStore {
@@ -38,6 +40,7 @@ func NewAllocationStore() *AllocationStore {
 		byPodUID:    make(map[types.UID][]PodAllocation),
 		claimToPods: make(map[types.UID][]types.UID),
 		podToClaim:  make(map[types.UID]types.UID),
+		claimAllocs: make(map[types.UID][]PodAllocation),
 	}
 }
 
@@ -76,13 +79,57 @@ func (s *AllocationStore) Set(podUID types.UID, allocs []PodAllocation) {
 }
 
 // SetClaimPods records that claimUID was reserved by podUID. Multiple calls
-// accumulate pod UIDs for the same claim. Also populates the reverse map so
-// the NRI plugin can look up the claim UID from a pod UID after service creation.
+// accumulate pod UIDs for the same claim; recording the same pod again is a
+// no-op. Also populates the reverse map so the NRI plugin can look up the
+// claim UID from a pod UID after service creation.
 func (s *AllocationStore) SetClaimPod(claimUID, podUID types.UID) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.claimToPods[claimUID] = append(s.claimToPods[claimUID], podUID)
+	if !slices.Contains(s.claimToPods[claimUID], podUID) {
+		s.claimToPods[claimUID] = append(s.claimToPods[claimUID], podUID)
+	}
 	s.podToClaim[podUID] = claimUID
+}
+
+// HasClaimPod reports whether podUID was ever recorded for claimUID. It stays
+// true after Delete(podUID), so a stopped pod still listed in the claim's
+// ReservedFor is not recorded again.
+func (s *AllocationStore) HasClaimPod(claimUID, podUID types.UID) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return slices.Contains(s.claimToPods[claimUID], podUID)
+}
+
+// ForgetClaimPod undoes SetClaimPod for podUID, so HasClaimPod reports false
+// again and the pod is picked up by the next recordSharedClaimPods pass. Used
+// when the pod's CNI hint could not be written.
+func (s *AllocationStore) ForgetClaimPod(claimUID, podUID types.UID) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if pods := slices.DeleteFunc(slices.Clone(s.claimToPods[claimUID]), func(u types.UID) bool { return u == podUID }); len(pods) > 0 {
+		s.claimToPods[claimUID] = pods
+	} else {
+		delete(s.claimToPods, claimUID)
+	}
+	if s.podToClaim[podUID] == claimUID {
+		delete(s.podToClaim, podUID)
+	}
+}
+
+// SetClaimAllocs records the allocation prepared for claimUID on this node,
+// for pods that reserve the claim after it was prepared.
+func (s *AllocationStore) SetClaimAllocs(claimUID types.UID, allocs []PodAllocation) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.claimAllocs[claimUID] = slices.Clone(allocs)
+}
+
+// ClaimAllocs returns a copy of the allocation prepared for claimUID, or nil
+// if the claim was not prepared on this node.
+func (s *AllocationStore) ClaimAllocs(claimUID types.UID) []PodAllocation {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return slices.Clone(s.claimAllocs[claimUID])
 }
 
 // PodUIDsForClaim returns all pod UIDs that reserved the given claim.
@@ -115,9 +162,11 @@ func (s *AllocationStore) ClaimForPod(podUID types.UID) types.UID {
 	return s.podToClaim[podUID]
 }
 
-// DeleteClaim removes the claim → pod mapping (called on teardown).
+// DeleteClaim removes the claim → pod mapping and the claim's prepared
+// allocation (called on teardown).
 func (s *AllocationStore) DeleteClaim(claimUID types.UID) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.claimToPods, claimUID)
+	delete(s.claimAllocs, claimUID)
 }
