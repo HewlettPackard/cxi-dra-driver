@@ -8,7 +8,7 @@ Hardware abstraction layer for CXI (HPE Slingshot NIC) devices. Everything else 
 |------|---------|
 | `device.go` | `Device` struct (name, index, dev path, sysfs path, NUMA node, PCI bus ID, HSN interface, capacity, reserved) and `Discover()`, which walks `/sys/class/cxi_user`, reads capacity, NUMA node and PCI bus ID, and pairs each device with its HSN interface |
 | `resources.go` | `ResourceSet` struct (the per-device hardware quota counters: `txqs`, `tgqs`, `eqs`, `cts`, `ptes`, `le_pools`, `tle_pools`, `acs`) and its `Fits`/`Minus` operations — see [README.md](../../README.md#resource-field-reference) for the exact semantics of each field |
-| `hsn.go` | `PairDevice()` — matches a CXI device's PCIe root to its HSN netdev name via device topology |
+| `hsn.go` | `PairDevice()` — pairs a CXI device with the netdev (any name, e.g. `hsn3` for a PF, `enp197s0f1` for a VF) whose resolved `device` symlink equals the CXI device's PCI function path |
 | `service.go` | `ServiceManager` interface — CXI service (virtual network interface) CRUD: create, destroy, enable/disable |
 | `capacity_cgo.go` / `capacity_stub.go` | Real (`tags cxi`, libcxi ioctls) vs. non-CGO fallback capacity reads |
 | `service_cgo.go` / `service_mock.go` / `service_stub.go` | Real, synthetic (`--mock-devices`), and no-op service implementations |

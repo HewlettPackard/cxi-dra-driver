@@ -27,6 +27,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - `--cdi-ldconfig-src`, `--cdi-ldconfig-linker-src` and `--cdi-ldconfig-libc-src` now default to `/ldconfig-runtime/{ldconfig,ld.so,libc.so.6}`, the layout of the bundled ldconfig runtime. `cxi-cdi-hook` execs a statically linked ldconfig directly and otherwise runs it through the bundled `ld.so`.
 
 ### Fixed
+- HSN pairing (`internal/cxi.PairDevice`) now matches a CXI device to the netdev whose resolved `device` symlink equals the device's PCI function path, instead of requiring an `hsn*` name under the same PCIe root complex. SR-IOV VF netdevs (e.g. `enp197s0f1`) are now paired, `.1` vs `.10` functions are no longer confused, and `Discover` logs a warning when a device has no paired netdev (the CNI rejects an empty `hsn_iface`). The net class directory can be overridden with `SYS_NET_PATH` (default `/sys/class/net`), mainly for tests.
 - The raw `deploy/kubernetes/clusterrole.yaml` Lease role named `cxi-vni-allocator-leader`, but the driver's Lease is `<driverName>-vni-allocator-leader`; it now names `cxi.slingshot.hpe.com-vni-allocator-leader` so the kubectl install path can run the VNI allocator. `deploy/kind/test-vni.sh` follows.
 - Documentation drift after merging the Bristol consumable-capacity work: README flag table and chart defaults, `ARCHITECTURE.md` initialization order and package indexes, `internal/driver/README.md`, `CONTRIBUTING.md`/`SECURITY.md`/PR template claims about CI-enforced linting and files that do not exist.
 

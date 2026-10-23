@@ -4,78 +4,59 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 )
 
-const sysfsNetPath = "/sys/class/net"
+const (
+	// sysNetPathEnv overrides the net class directory scanned for pairing.
+	sysNetPathEnv = "SYS_NET_PATH"
 
-// PairDevice walks sysfs PCIe topology to find the HSN network interface that
-// shares the same PCIe root complex as dev, and sets dev.HSNIface.
+	defaultSysfsNetPath = "/sys/class/net"
+)
+
+// sysfsNetPath returns $SYS_NET_PATH, or /sys/class/net if unset or empty.
+func sysfsNetPath() string {
+	if v := os.Getenv(sysNetPathEnv); v != "" {
+		return v
+	}
+	return defaultSysfsNetPath
+}
+
+// PairDevice finds the network interface backed by the same PCI function as
+// dev and sets dev.HSNIface.
 //
-// The pairing relies on the fact that a CXI NIC and its companion HSN ethernet
-// function are siblings under the same PCIe root port. We climb the CXI
-// device's sysfs path to the root-complex level, then scan net interfaces
-// whose sysfs path is rooted under the same complex.
+// A CXI device and its netdev are two class devices on one PCI function, so
+// the resolved "device" symlink of both points at the same sysfs path. The
+// match is exact on that path, independent of the netdev name: PFs are named
+// hsnN but VFs carry predictable names such as enp197s0f1, and a prefix match
+// would confuse function .1 with .10.
 func PairDevice(dev *Device) error {
+	return pairDevice(dev, sysfsNetPath())
+}
+
+// pairDevice is PairDevice with the net class directory injectable for tests.
+func pairDevice(dev *Device, netPath string) error {
 	cxiPCIPath, err := filepath.EvalSymlinks(filepath.Join(dev.SysfsPath, "device"))
 	if err != nil {
 		return fmt.Errorf("resolving CXI sysfs link for %s: %w", dev.Name, err)
 	}
 
-	// Walk up to the PCIe root complex (three levels: function → slot → root-port → bus).
-	rootComplex := pciRootComplex(cxiPCIPath)
-
-	entries, err := os.ReadDir(sysfsNetPath)
+	entries, err := os.ReadDir(netPath)
 	if err != nil {
-		return fmt.Errorf("reading %s: %w", sysfsNetPath, err)
+		return fmt.Errorf("reading %s: %w", netPath, err)
 	}
 
 	for _, e := range entries {
 		iface := e.Name()
-		if !strings.HasPrefix(iface, "hsn") {
-			continue
-		}
-
-		ifaceSysfs, err := filepath.EvalSymlinks(filepath.Join(sysfsNetPath, iface, "device"))
+		ifacePCIPath, err := filepath.EvalSymlinks(filepath.Join(netPath, iface, "device"))
 		if err != nil {
+			// Virtual netdevs (lo, bridges, veth) have no device link.
 			continue
 		}
-
-		if strings.HasPrefix(ifaceSysfs, rootComplex) {
+		if ifacePCIPath == cxiPCIPath {
 			dev.HSNIface = iface
 			return nil
 		}
 	}
 
-	return fmt.Errorf("no HSN interface found for %s under root complex %s", dev.Name, rootComplex)
-}
-
-// pciRootComplex returns the sysfs path of the PCIe root complex for a given
-// PCI function path by walking up until the path segment looks like a PCI bus
-// (e.g. "0000:80:" — two hex octets separated by a colon).
-func pciRootComplex(pciPath string) string {
-	dir := pciPath
-	for {
-		parent := filepath.Dir(dir)
-		if parent == dir {
-			break
-		}
-		base := filepath.Base(parent)
-		// PCIe bus directories look like "0000:80" (domain:bus).
-		if isPCIBus(base) {
-			return parent
-		}
-		dir = parent
-	}
-	return pciPath
-}
-
-// isPCIBus returns true for sysfs directory names matching a PCIe bus segment
-// like "0000:80" (domain:bus in hex).
-func isPCIBus(name string) bool {
-	parts := strings.Split(name, ":")
-	if len(parts) != 2 {
-		return false
-	}
-	return len(parts[0]) == 4 && len(parts[1]) == 2
+	return fmt.Errorf("no netdev found for %s on PCI function %s", dev.Name, cxiPCIPath)
 }
