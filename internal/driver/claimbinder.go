@@ -183,6 +183,9 @@ func (b *ClaimBinder) evaluateClaim(ctx context.Context, claim *resourceapi.Reso
 		return // not our claim / not our node
 	}
 
+	// Keep the claim in falseClaims when a pod's hint could not be written, so
+	// the ticker retries it; the watch would not fire again on its own.
+	anyPending := !b.driver.recordSharedClaimPods(ctx, claim)
 	// Release any pending grant this claim held for a device that is no longer
 	// in the current allocation (subset reallocation without an intervening
 	// Allocation=nil). Without this, the dropped device's pending grant would
@@ -198,7 +201,6 @@ func (b *ClaimBinder) evaluateClaim(ctx context.Context, claim *resourceapi.Reso
 	// condition is True, so we must evaluate and set a condition for each one.
 	// anyPending tracks whether any device is waiting on capacity (Ready=False)
 	// so the claim stays in falseClaims for retry.
-	anyPending := false
 	for _, dr := range devices {
 		result, requested := dr.result, dr.requested
 

@@ -69,3 +69,53 @@ func TestAllocationStoreSetMergesByDevice(t *testing.T) {
 		}
 	}
 }
+
+func TestAllocationStoreSetClaimPodIdempotent(t *testing.T) {
+	s := NewAllocationStore()
+	s.SetClaimPod("claim-1", "pod-a")
+	s.SetClaimPod("claim-1", "pod-a")
+	s.SetClaimPod("claim-1", "pod-b")
+	if got := s.PodUIDsForClaim("claim-1"); len(got) != 2 {
+		t.Fatalf("PodUIDsForClaim = %v, want [pod-a pod-b]", got)
+	}
+	s.Delete("pod-a")
+	if !s.HasClaimPod("claim-1", "pod-a") {
+		t.Errorf("HasClaimPod(pod-a) = false after Delete, want true until the claim is deleted")
+	}
+}
+
+func TestAllocationStoreClaimAllocs(t *testing.T) {
+	s := NewAllocationStore()
+	allocs := []PodAllocation{{DeviceName: "cxi0", VNI: 42}}
+	s.SetClaimAllocs("claim-1", allocs)
+	allocs[0].VNI = 43
+	if got := s.ClaimAllocs("claim-1"); len(got) != 1 || got[0].VNI != 42 {
+		t.Fatalf("ClaimAllocs = %+v, want a copy with VNI 42", got)
+	}
+	s.DeleteClaim("claim-1")
+	if got := s.ClaimAllocs("claim-1"); got != nil {
+		t.Errorf("ClaimAllocs after DeleteClaim = %+v, want nil", got)
+	}
+}
+
+func TestAllocationStoreForgetClaimPod(t *testing.T) {
+	s := NewAllocationStore()
+	s.SetClaimPod("claim-1", "pod-a")
+	s.SetClaimPod("claim-1", "pod-b")
+
+	s.ForgetClaimPod("claim-1", "pod-b")
+
+	if s.HasClaimPod("claim-1", "pod-b") {
+		t.Error("pod-b still recorded after ForgetClaimPod")
+	}
+	if c := s.ClaimForPod("pod-b"); c != "" {
+		t.Errorf("ClaimForPod(pod-b) = %q, want empty", c)
+	}
+	if !s.HasClaimPod("claim-1", "pod-a") {
+		t.Error("pod-a dropped by ForgetClaimPod(pod-b)")
+	}
+	s.ForgetClaimPod("claim-1", "pod-a")
+	if pods := s.PodUIDsForClaim("claim-1"); len(pods) != 0 {
+		t.Errorf("PodUIDsForClaim = %v, want none", pods)
+	}
+}

@@ -64,6 +64,15 @@ no earlier point at which the hint file could be needed — by the time CNI ADD
 fires, the hint file for that pod already exists and is complete for every
 device the pod claimed.
 
+**Shared claims are the exception.** Kubelet calls `NodePrepareResources`
+once per claim per node, so a pod that reserves a claim already prepared on
+its node (one `ResourceClaim` referenced by several pods) gets no prepare call
+of its own. The driver's ResourceClaim watch (`ClaimBinder`) sees the scheduler
+add the pod to `claim.Status.ReservedFor` and writes its hint from the claim's
+prepared allocation. That update precedes the pod's binding, so the hint is
+normally in place before CNI ADD; if it is late, the CNI's wait for the file
+and kubelet's sandbox retry cover it.
+
 ## Hint file schema
 
 One file per pod, containing a JSON array with one entry per CXI device
@@ -138,7 +147,9 @@ between `ADD` and `DEL`/`CHECK`.
   the `AllocationStore` ([internal/driver/cnihints.go](../internal/driver/cnihints.go)). The write is atomic (temp file +
   rename), so a reader never observes a partially written file. A write
   failure fails the claim's `PrepareResult`, so kubelet retries rather than
-  silently proceeding to `RunPodSandbox` without a hint file.
+  silently proceeding to `RunPodSandbox` without a hint file. Pods that
+  reserve the claim after it was prepared get their file from the claim
+  watch (see [Ordering guarantee](#ordering-guarantee)).
 - **Delete**: `UnprepareResourceClaims` removes the file for each pod UID
   freed by the claim. Removal failures are logged but do not block claim
   release — the pod is going away regardless.

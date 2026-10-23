@@ -2,6 +2,7 @@ package driver
 
 import (
 	"context"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -12,6 +13,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
+	"k8s.io/dynamic-resource-allocation/kubeletplugin"
 
 	"github.com/slingshot/cxi-dra-driver/internal/cdi"
 	"github.com/slingshot/cxi-dra-driver/internal/cxi"
@@ -247,5 +249,89 @@ func TestPrepareClaimRejectsRemovedProfiles(t *testing.T) {
 				t.Errorf("error %q does not point at k8s-modules", res.Err)
 			}
 		})
+	}
+}
+
+func podRef(uid string) resourceapi.ResourceClaimConsumerReference {
+	return resourceapi.ResourceClaimConsumerReference{Resource: "pods", Name: uid, UID: types.UID(uid)}
+}
+
+// sharedClaim is a claim allocated cxi0 on nodePool and reserved by pods.
+func sharedClaim(pods ...string) *resourceapi.ResourceClaim {
+	c := makeClaim("claim-1", testNamespace, "claim-1", "cxi0")
+	for _, p := range pods {
+		c.Status.ReservedFor = append(c.Status.ReservedFor, podRef(p))
+	}
+	return c
+}
+
+// Kubelet prepares a claim once per node: a pod that reserves it afterwards
+// must still get the allocation and a CNI hint, or its sandbox never starts.
+func TestRecordSharedClaimPods_LaterPodGetsHint(t *testing.T) {
+	d := newTestDriver()
+	d.cniHintsDir = t.TempDir()
+	if res := d.prepareClaim(context.Background(), sharedClaim("pod-a")); res.Err != nil {
+		t.Fatalf("prepareClaim: %v", res.Err)
+	}
+
+	d.recordSharedClaimPods(context.Background(), sharedClaim("pod-a", "pod-b"))
+
+	got := readHintFile(t, d.cniHintsDir, "pod-b")
+	if len(got) != 1 || got[0].Device != "cxi0" || got[0].VNI != testVNI {
+		t.Fatalf("pod-b hint = %+v, want one cxi0 entry with VNI %d", got, testVNI)
+	}
+	if a := d.store.Get("pod-b"); len(a) != 1 || a[0].DeviceName != "cxi0" || a[0].ClaimUID != "claim-1" {
+		t.Fatalf("pod-b allocation = %+v, want cxi0 from claim-1", a)
+	}
+	if c := d.store.ClaimForPod("pod-b"); c != "claim-1" {
+		t.Errorf("ClaimForPod(pod-b) = %q, want claim-1", c)
+	}
+	if pods := d.store.PodUIDsForClaim("claim-1"); len(pods) != 2 {
+		t.Errorf("PodUIDsForClaim = %v, want [pod-a pod-b]", pods)
+	}
+
+	if _, err := d.UnprepareResourceClaims(context.Background(), []kubeletplugin.NamespacedObject{
+		{NamespacedName: types.NamespacedName{Namespace: testNamespace, Name: "claim-1"}, UID: "claim-1"},
+	}); err != nil {
+		t.Fatalf("UnprepareResourceClaims: %v", err)
+	}
+	for _, p := range []types.UID{"pod-a", "pod-b"} {
+		if _, err := os.Stat(d.cniHintPath(p)); !os.IsNotExist(err) {
+			t.Errorf("hint for %s still present after unprepare: err=%v", p, err)
+		}
+	}
+	if a := d.store.ClaimAllocs("claim-1"); a != nil {
+		t.Errorf("ClaimAllocs after unprepare = %+v, want nil", a)
+	}
+}
+
+// Claims allocated on other nodes, or not yet prepared here, are ignored.
+func TestRecordSharedClaimPods_UnpreparedClaimIgnored(t *testing.T) {
+	d := newTestDriver()
+	d.cniHintsDir = t.TempDir()
+
+	d.recordSharedClaimPods(context.Background(), sharedClaim("pod-a"))
+
+	if a := d.store.Get("pod-a"); a != nil {
+		t.Fatalf("pod-a allocation = %+v, want none for an unprepared claim", a)
+	}
+	if _, err := os.Stat(d.cniHintPath("pod-a")); !os.IsNotExist(err) {
+		t.Fatalf("hint written for an unprepared claim: err=%v", err)
+	}
+}
+
+// NRI's StopPodSandbox drops a pod from the store while the claim may still
+// list it in ReservedFor; it must not be recorded again.
+func TestRecordSharedClaimPods_StoppedPodNotRecordedAgain(t *testing.T) {
+	d := newTestDriver()
+	if res := d.prepareClaim(context.Background(), sharedClaim("pod-a")); res.Err != nil {
+		t.Fatalf("prepareClaim: %v", res.Err)
+	}
+	d.store.Delete("pod-a")
+
+	d.recordSharedClaimPods(context.Background(), sharedClaim("pod-a"))
+
+	if a := d.store.Get("pod-a"); a != nil {
+		t.Fatalf("stopped pod-a recorded again: %+v", a)
 	}
 }

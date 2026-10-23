@@ -2,6 +2,8 @@ package driver
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"testing"
 
 	resourceapi "k8s.io/api/resource/v1"
@@ -323,5 +325,61 @@ func TestClaimBinder_OnClaimDeleted_CleansPending(t *testing.T) {
 	cond := conditionFor(t, client, second, "cxi0", "Ready")
 	if cond == nil || cond.Status != metav1.ConditionTrue {
 		t.Fatalf("second claim after onClaimDeleted cleanup: Ready = %+v, want Status=True", cond)
+	}
+}
+
+// The ClaimBinder's watch is what sees the scheduler add a pod to ReservedFor.
+func TestClaimBinder_EvaluateClaim_RecordsSharedClaimPods(t *testing.T) {
+	claim := sharedClaim("pod-a")
+	binder, d, _ := newClaimBinderHarness(t, claim)
+	d.cniHintsDir = t.TempDir()
+	d.kubeClient = newTestDriver().kubeClient // carries the namespace VNI annotation
+	if res := d.prepareClaim(context.Background(), claim); res.Err != nil {
+		t.Fatalf("prepareClaim: %v", res.Err)
+	}
+
+	binder.evaluateClaim(context.Background(), sharedClaim("pod-a", "pod-b"))
+
+	if got := readHintFile(t, d.cniHintsDir, "pod-b"); len(got) != 1 || got[0].Device != "cxi0" {
+		t.Fatalf("pod-b hint = %+v, want one cxi0 entry", got)
+	}
+}
+
+// A failed hint write must not leave the pod marked as recorded: the claim
+// stays in the binder's retry set and the next pass writes the hint.
+func TestClaimBinder_SharedClaimHintWriteRetried(t *testing.T) {
+	claim := sharedClaim("pod-a", "pod-b")
+	binder, d, _ := newClaimBinderHarness(t, claim)
+	d.kubeClient = newTestDriver().kubeClient // carries the namespace VNI annotation
+	d.cniHintsDir = t.TempDir()
+	if res := d.prepareClaim(context.Background(), sharedClaim("pod-a")); res.Err != nil {
+		t.Fatalf("prepareClaim: %v", res.Err)
+	}
+
+	// A regular file in the path makes the hints directory uncreatable.
+	blocker := filepath.Join(t.TempDir(), "blocker")
+	if err := os.WriteFile(blocker, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	goodDir := d.cniHintsDir
+	d.cniHintsDir = filepath.Join(blocker, "hints")
+
+	binder.evaluateClaim(context.Background(), claim)
+
+	if d.store.HasClaimPod("claim-1", "pod-b") {
+		t.Fatal("pod-b marked recorded although its hint write failed")
+	}
+	binder.mu.Lock()
+	_, queued := binder.falseClaims[claim.UID]
+	binder.mu.Unlock()
+	if !queued {
+		t.Fatal("claim not queued for retry after a failed hint write")
+	}
+
+	d.cniHintsDir = goodDir
+	binder.reEvaluateFalse(context.Background())
+
+	if got := readHintFile(t, goodDir, "pod-b"); len(got) != 1 || got[0].Device != "cxi0" {
+		t.Fatalf("pod-b hint after retry = %+v, want one cxi0 entry", got)
 	}
 }

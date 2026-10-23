@@ -125,12 +125,23 @@ func (d *Driver) prepareClaim(ctx context.Context, claim *resourceapi.ResourceCl
 		podAllocs[i].VNI = vni
 	}
 
-	for _, ref := range claim.Status.ReservedFor {
+	d.store.SetClaimAllocs(claim.UID, podAllocs)
+	if err := d.recordClaimPods(ctx, claim, podAllocs, claim.Status.ReservedFor); err != nil {
+		return kubeletplugin.PrepareResult{Err: err}
+	}
+
+	return kubeletplugin.PrepareResult{Devices: kubeletDevices}
+}
+
+// recordClaimPods records allocs for every pod in refs and writes its CNI hint.
+func (d *Driver) recordClaimPods(ctx context.Context, claim *resourceapi.ResourceClaim, allocs []PodAllocation,
+	refs []resourceapi.ResourceClaimConsumerReference) error {
+	for _, ref := range refs {
 		if ref.Resource != "pods" {
 			continue
 		}
 		podUID := types.UID(ref.UID)
-		d.store.Set(podUID, podAllocs)
+		d.store.Set(podUID, allocs)
 		d.store.SetClaimPod(claim.UID, podUID)
 
 		// The hint file is the CNI plugin's read-side contract (no access to
@@ -139,15 +150,52 @@ func (d *Driver) prepareClaim(ctx context.Context, claim *resourceapi.ResourceCl
 		// without net-hints. The pod annotation below is a best-effort
 		// observability side channel only; it is never load-bearing.
 		if err := d.writeCNIHint(podUID); err != nil {
-			return kubeletplugin.PrepareResult{
-				Err: fmt.Errorf("claim %s/%s: writing CNI hint file for pod %s: %w",
-					claim.Namespace, claim.Name, podUID, err),
-			}
+			return fmt.Errorf("claim %s/%s: writing CNI hint file for pod %s: %w",
+				claim.Namespace, claim.Name, podUID, err)
 		}
 		d.annotatePodCNIHints(ctx, claim.Namespace, ref.Name, cniHintsFor(d.store.Get(podUID)))
 	}
+	return nil
+}
 
-	return kubeletplugin.PrepareResult{Devices: kubeletDevices}
+// recordSharedClaimPods records pods that reserved claim after it was prepared
+// on this node. Kubelet prepares a claim once per node, so a later pod sharing
+// it never reaches PrepareResourceClaims and would have no allocation or CNI
+// hint. A no-op for claims not prepared here.
+//
+// It reports false when a pod could not be recorded (its hint file write
+// failed). Those pods are forgotten so a later call retries them; the caller
+// must schedule that retry, because the claim watch alone may not fire again.
+func (d *Driver) recordSharedClaimPods(ctx context.Context, claim *resourceapi.ResourceClaim) bool {
+	allocs := d.store.ClaimAllocs(claim.UID)
+	if allocs == nil {
+		return true
+	}
+	var added []resourceapi.ResourceClaimConsumerReference
+	for _, ref := range claim.Status.ReservedFor {
+		if ref.Resource == "pods" && !d.store.HasClaimPod(claim.UID, types.UID(ref.UID)) {
+			added = append(added, ref)
+		}
+	}
+	if len(added) == 0 {
+		return true
+	}
+	if err := d.recordClaimPods(ctx, claim, allocs, added); err != nil {
+		d.logf("warning: %v; will retry", err)
+		// recordClaimPods marks a pod recorded before writing its hint and
+		// stops at the first failure. Forget the whole batch: pods it never
+		// reached are retried, and any recorded before the failure are simply
+		// re-recorded, which is idempotent.
+		for _, ref := range added {
+			d.store.ForgetClaimPod(claim.UID, types.UID(ref.UID))
+		}
+		return false
+	}
+	for _, ref := range added {
+		d.logf("claim %s/%s: recorded pod %s (%s), which reserved the claim after it was prepared",
+			claim.Namespace, claim.Name, ref.Name, ref.UID)
+	}
+	return true
 }
 
 // namespaceVNI returns the VNI assigned to the namespace by the allocator,
