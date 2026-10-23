@@ -2,6 +2,7 @@ package cxi
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -79,8 +80,8 @@ func Discover(systemSvcIDs []int) ([]*Device, error) {
 		}
 
 		if err := PairDevice(dev); err != nil {
-			// HSN pairing is best-effort; log but don't fail discovery.
-			_ = err
+			// Best-effort, but the CNI rejects a hint with an empty hsn_iface.
+			log.Printf("WARNING: device %s has no paired netdev (hsn_iface will be empty, CNI attach will fail): %v", name, err)
 		}
 
 		devices = append(devices, dev)
