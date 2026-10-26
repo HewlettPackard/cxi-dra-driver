@@ -161,7 +161,7 @@ At process startup, `main.go` performs, in order:
 5. `internal/driver.New(...)` — construct the `Driver`.
 6. If `--vni-range-start`/`-end` are non-zero: validate the range and start the namespace VNI allocator (leader election + namespace informer).
 7. `driver.NewClaimBinder(...)` and `internal/nri.New(...)` (connect to containerd's NRI socket); wire the NRI plugin's live-service view into the reaper; start the NRI plugin and `ClaimBinder.Run()` (cluster-wide `ResourceClaim` watch) in goroutines.
-8. `Driver.Run(ctx)`, which in order: runs `internal/cxi.Discover()` (walk sysfs, read hardware capacity, reserved (blessed) service consumption, NUMA node and PCI bus ID, pair each device with its HSN interface — or uses the mock devices); writes the per-device CDI specs plus the always-present shared `env` spec; writes the containerd CDI drop-in (SIGHUPing containerd only if it changed); starts the kubelet plugin (DRA gRPC server + registrar); publishes the `ResourceSlice` once — it holds only static attributes and capacities, so it is never republished; then drives the orphan-service reaper every `--resource-refresh-interval` until shutdown.
+8. `Driver.Run(ctx)`, which in order: runs `internal/cxi.Discover()` (walk sysfs, keep PFs by default or SR-IOV VFs with `--vf-only`, read hardware capacity, reserved (blessed) service consumption, NUMA node and PCI bus ID, pair each device with its HSN interface — or uses the mock devices); writes the per-device CDI specs plus the always-present shared `env` spec; writes the containerd CDI drop-in (SIGHUPing containerd only if it changed); starts the kubelet plugin (DRA gRPC server + registrar); publishes the `ResourceSlice` once — it holds only static attributes and capacities, so it is never republished; then drives the orphan-service reaper every `--resource-refresh-interval` until shutdown.
 
 See [dra-sequences.d2](dra-sequences.d2) for this same sequence rendered as a diagram, with the exact actor names (`os`, `main`, `cxi_pkg`, `driver`, `nri`, `binder`, `vni_allocator`, `kubelet`, `apiserver`).
 
@@ -225,7 +225,7 @@ Logging is the only observability signal today (structured via the standard libr
 
 | Type | File | Key fields | Purpose |
 |------|------|-----------|---------|
-| `Device` | `internal/cxi/device.go` | Name, index, dev path, sysfs path, NUMA node, PCI bus ID, HSN interface, `Capacity`, `Reserved` | The in-memory representation of one discovered CXI NIC; produced by `Discover()` and consumed by every other package |
+| `Device` | `internal/cxi/device.go` | Name, index, dev path, sysfs path, NUMA node, PCI bus ID, HSN interface, `Capacity`, `Reserved`, and for SR-IOV `FunctionType`, `PFName`, `VFIndex` | The in-memory representation of one discovered CXI NIC; produced by `Discover()` and consumed by every other package |
 | `ResourceSet` | `internal/cxi/resources.go` | `txqs`, `tgqs`, `eqs`, `cts`, `ptes`, `le_pools`, `tle_pools`, `acs` | The hardware quota a claim requests or a device has available; see §13 for how it flows through the system |
 | `PodAllocation` | `internal/driver/store.go` | Device, HSN interface, VNI, `ResourceSet` | What `PrepareResourceClaims` decided for one pod; keyed by pod UID in `AllocationStore` |
 | `AllocationStore` | `internal/driver/store.go` | `map[types.UID]PodAllocation` + `sync.RWMutex` | Thread-safe lookup shared by the kubelet prepare/unprepare hooks and the NRI plugin |
