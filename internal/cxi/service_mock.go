@@ -3,6 +3,8 @@ package cxi
 import (
 	"fmt"
 	"os"
+	"slices"
+	"sync"
 	"sync/atomic"
 )
 
@@ -95,4 +97,58 @@ func (MockServiceManager) DeleteService(deviceName string, svcID int) error {
 }
 func MockServicePath(deviceName string, svcID int) string {
 	return fmt.Sprintf("%s/%s-%d.yaml", mockServiceDir, deviceName, svcID)
+}
+
+// MockParent is one parent service on a mock PF.
+type MockParent struct {
+	PFName     string // e.g. "cxi0"
+	SvcID      int    // service id on the PF
+	Descriptor ParentDescriptor
+}
+
+// MockTopology is the in-memory VF topology behind the parent read path
+// (ReadParentBudget, ReadParentRemaining, ReadVFSystemReservation) in non-cxi
+// builds. Parent→VF assignment is not stored here: callers pass the VF names,
+// exactly as they do against real hardware.
+type MockTopology struct {
+	Parents    []MockParent
+	VFServices map[string][]ServiceReservation // keyed by VF device name, e.g. "cxi4"
+}
+
+var (
+	mockTopologyMu sync.RWMutex
+	mockTopology   MockTopology
+)
+
+// SetMockTopology installs the topology the mock parent reads answer from.
+func SetMockTopology(t MockTopology) {
+	mockTopologyMu.Lock()
+	defer mockTopologyMu.Unlock()
+	mockTopology = t
+}
+
+// ResetMockTopology clears the mock topology.
+func ResetMockTopology() {
+	SetMockTopology(MockTopology{})
+}
+
+// MockParentDescriptor returns the mock parent svcID on pfName, or an error if
+// the topology has none — the mock counterpart of cxil_get_svc failing.
+func MockParentDescriptor(pfName string, svcID int) (ParentDescriptor, error) {
+	mockTopologyMu.RLock()
+	defer mockTopologyMu.RUnlock()
+	for _, p := range mockTopology.Parents {
+		if p.PFName == pfName && p.SvcID == svcID {
+			return p.Descriptor, nil
+		}
+	}
+	return ParentDescriptor{}, fmt.Errorf("cxi-mock: no parent svc %d on %s", svcID, pfName)
+}
+
+// MockVFServices returns a copy of the mock service list of the VF vfName; a VF
+// the topology does not mention has no services.
+func MockVFServices(vfName string) []ServiceReservation {
+	mockTopologyMu.RLock()
+	defer mockTopologyMu.RUnlock()
+	return slices.Clone(mockTopology.VFServices[vfName])
 }
