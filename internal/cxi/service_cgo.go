@@ -290,6 +290,122 @@ static int cxi_destroy_service(const char *device, int svc_id)
     return rc;
 }
 
+// parent_desc_args carries the parts of a parent's cxi_svc_desc the driver
+// needs. A VNI restriction is either the vnis[] list (restricted_vnis set) or a
+// range (restricted_vnis unset, read via cxil_svc_get_vni_range).
+typedef struct {
+    resource_args limits;
+    int resource_limits;
+    int restricted_vnis;
+    int num_vnis;
+    uint16_t vnis[CXI_SVC_MAX_VNIS];
+    uint16_t vni_min;
+    uint16_t vni_max;
+    int vni_range_rc; // nonzero when the range could not be read; only meaningful if !restricted_vnis
+} parent_desc_args;
+
+// cxi_read_parent reads the service svc_id from the PF device by id. A failed
+// range read is reported in vni_range_rc rather than as the return code so the
+// caller can still see resource_limits (an unlimited parent is rejected before
+// its VNIs matter).
+static int cxi_read_parent(const char *device, int svc_id, parent_desc_args *out)
+{
+    memset(out, 0, sizeof(*out));
+    struct cxil_dev *dev = NULL;
+    int dev_idx = device_index(device);
+    if (dev_idx < 0 || svc_id < 1)
+        return -EINVAL;
+    int rc = cxil_open_device(dev_idx, &dev);
+    if (rc != 0)
+        return rc;
+
+    struct cxi_svc_desc desc;
+    memset(&desc, 0, sizeof(desc));
+    rc = cxil_get_svc(dev, (unsigned int)svc_id, &desc);
+    if (rc != 0) {
+        cxil_close_device(dev);
+        return rc;
+    }
+
+    out->resource_limits = desc.resource_limits ? 1 : 0;
+    out->restricted_vnis = desc.restricted_vnis ? 1 : 0;
+    out->limits.txqs = desc.limits.txqs.res;
+    out->limits.tgqs = desc.limits.tgqs.res;
+    out->limits.eqs  = desc.limits.eqs.res;
+    out->limits.cts  = desc.limits.cts.res;
+    out->limits.tles = desc.limits.tles.res;
+    out->limits.ptes = desc.limits.ptes.res;
+    out->limits.les  = desc.limits.les.res;
+    out->limits.acs  = desc.limits.acs.res;
+
+    if (desc.restricted_vnis) {
+        int n = desc.num_vld_vnis;
+        if (n > CXI_SVC_MAX_VNIS)
+            n = CXI_SVC_MAX_VNIS;
+        out->num_vnis = n;
+        for (int i = 0; i < n; i++)
+            out->vnis[i] = desc.vnis[i];
+    } else {
+        out->vni_range_rc = cxil_svc_get_vni_range(dev, (unsigned int)svc_id,
+                                                   &out->vni_min, &out->vni_max);
+    }
+
+    cxil_close_device(dev);
+    return 0;
+}
+
+// vf_svc_args is one entry of a VF's service list.
+typedef struct {
+    int svc_id;
+    int is_system_svc;
+    int resource_limits;
+    resource_args res;
+} vf_svc_args;
+
+// cxi_list_vf_services copies up to max_out entries of the device's service
+// list into out. *total receives the full list length, so the caller can detect
+// truncation. The VF's list holds its own services only (system children and
+// pod children); a parent or a sibling VF's services never appear on it.
+static int cxi_list_vf_services(const char *device, vf_svc_args *out,
+                                unsigned int max_out, unsigned int *total)
+{
+    *total = 0;
+    struct cxil_dev *dev = NULL;
+    int dev_idx = device_index(device);
+    if (dev_idx < 0)
+        return -EINVAL;
+    int rc = cxil_open_device(dev_idx, &dev);
+    if (rc != 0)
+        return rc;
+
+    struct cxil_svc_list *list = NULL;
+    rc = cxil_get_svc_list(dev, &list);
+    if (rc != 0) {
+        cxil_close_device(dev);
+        return rc;
+    }
+
+    *total = list->count;
+    for (unsigned int i = 0; i < list->count && i < max_out; i++) {
+        const struct cxi_svc_desc *d = &list->descs[i];
+        out[i].svc_id = (int)d->svc_id;
+        out[i].is_system_svc = d->is_system_svc ? 1 : 0;
+        out[i].resource_limits = d->resource_limits ? 1 : 0;
+        out[i].res.txqs = d->limits.txqs.res;
+        out[i].res.tgqs = d->limits.tgqs.res;
+        out[i].res.eqs  = d->limits.eqs.res;
+        out[i].res.cts  = d->limits.cts.res;
+        out[i].res.tles = d->limits.tles.res;
+        out[i].res.ptes = d->limits.ptes.res;
+        out[i].res.les  = d->limits.les.res;
+        out[i].res.acs  = d->limits.acs.res;
+    }
+
+    cxil_free_svc_list(list);
+    cxil_close_device(dev);
+    return 0;
+}
+
 // cxi_list_services enumerates every service on the device, writing svc_id,
 // vni (vnis[0], or 0 when the service has no restricted VNI) and is_system_svc
 // into the caller-provided parallel arrays. It does NOT filter out system or
@@ -556,4 +672,92 @@ func readServiceNetns(deviceName string, svcID int) (uint64, error) {
 		return 0, fmt.Errorf("cxi_service_netns(%s, svc_id=%d) returned %d", deviceName, svcID, int(rc))
 	}
 	return uint64(ns), nil
+}
+
+// rawResources converts the C resource bundle to a ResourceSet without any
+// LE/TLE pool rounding.
+func rawResources(raw C.resource_args) ResourceSet {
+	return ResourceSet{
+		TXQs: int64(raw.txqs),
+		TGQs: int64(raw.tgqs),
+		EQs:  int64(raw.eqs),
+		CTs:  int64(raw.cts),
+		TLEs: int64(raw.tles),
+		PTEs: int64(raw.ptes),
+		LEs:  int64(raw.les),
+		ACs:  int64(raw.acs),
+	}
+}
+
+// readParentDescriptor reads the parent service svcID from the PF device pfName
+// via cxil_get_svc, plus its VNI range via cxil_svc_get_vni_range when the
+// service is not list-restricted. The VNI set is left empty for an unlimited
+// parent so a VNI read failure there cannot mask the more useful
+// ErrParentUnlimited.
+func readParentDescriptor(pfName string, svcID int) (ParentDescriptor, error) {
+	cDev := C.CString(pfName)
+	defer C.free(unsafe.Pointer(cDev))
+
+	var raw C.parent_desc_args
+	rc := C.cxi_read_parent(cDev, C.int(svcID), &raw)
+	if rc != 0 {
+		return ParentDescriptor{}, fmt.Errorf("cxi_read_parent(%s, svc_id=%d) returned %d", pfName, svcID, int(rc))
+	}
+
+	desc := ParentDescriptor{
+		ResourceLimits: raw.resource_limits != 0,
+		Limits:         rawResources(raw.limits),
+	}
+	if !desc.ResourceLimits {
+		return desc, nil
+	}
+
+	if raw.restricted_vnis != 0 {
+		vnis := make([]uint16, int(raw.num_vnis))
+		for i := range vnis {
+			vnis[i] = uint16(raw.vnis[i])
+		}
+		desc.VNIs = NewVNIList(vnis)
+		return desc, nil
+	}
+	if raw.vni_range_rc != 0 {
+		return ParentDescriptor{}, fmt.Errorf("cxil_svc_get_vni_range(%s, svc_id=%d) returned %d",
+			pfName, svcID, int(raw.vni_range_rc))
+	}
+	set, err := NewVNIRange(uint16(raw.vni_min), uint16(raw.vni_max))
+	if err != nil {
+		return ParentDescriptor{}, fmt.Errorf("parent svc %d on %s: %w", svcID, pfName, err)
+	}
+	desc.VNIs = set
+	return desc, nil
+}
+
+// readVFServices returns every service in the service list of the VF device
+// vfName, with its reserved resources and system bit. See ReadParentRemaining
+// and ReadVFSystemReservation for how callers sum them.
+func readVFServices(vfName string) ([]ServiceReservation, error) {
+	cDev := C.CString(vfName)
+	defer C.free(unsafe.Pointer(cDev))
+
+	buf := make([]C.vf_svc_args, maxServicesPerDevice)
+	var total C.uint
+	rc := C.cxi_list_vf_services(cDev, &buf[0], C.uint(maxServicesPerDevice), &total)
+	if rc != 0 {
+		return nil, fmt.Errorf("cxi_list_vf_services(%s) returned %d", vfName, int(rc))
+	}
+	n := int(total)
+	if n > maxServicesPerDevice {
+		return nil, fmt.Errorf("cxi_list_vf_services(%s) returned count=%d, exceeds buffer cap %d (raise maxServicesPerDevice)",
+			vfName, n, maxServicesPerDevice)
+	}
+	svcs := make([]ServiceReservation, n)
+	for i := range svcs {
+		svcs[i] = ServiceReservation{
+			SvcID:          int(buf[i].svc_id),
+			IsSystem:       buf[i].is_system_svc != 0,
+			ResourceLimits: buf[i].resource_limits != 0,
+			Res:            rawResources(buf[i].res),
+		}
+	}
+	return svcs, nil
 }

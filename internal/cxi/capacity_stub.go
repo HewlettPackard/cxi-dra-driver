@@ -32,6 +32,19 @@ func ReadActiveServices(_ string) ([]ServiceInfo, error) {
 	return nil, nil
 }
 
+// readParentDescriptor answers from the mock topology in non-cxi builds (see
+// SetMockTopology). Production builds read the descriptor from the PF via
+// libcxi — see service_cgo.go.
+func readParentDescriptor(pfName string, svcID int) (ParentDescriptor, error) {
+	return MockParentDescriptor(pfName, svcID)
+}
+
+// readVFServices answers from the mock topology in non-cxi builds. Production
+// builds enumerate the VF's cxil_get_svc_list — see service_cgo.go.
+func readVFServices(vfName string) ([]ServiceReservation, error) {
+	return MockVFServices(vfName), nil
+}
+
 // ReadServiceNetns returns 0 in non-cxi builds — there are no live CXI
 // services in mock mode, so the reaper never reaches this path. Production
 // builds read cxil_svc_get_netns via libcxi — see capacity_cgo.go.

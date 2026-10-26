@@ -13,6 +13,9 @@ Hardware abstraction layer for CXI (HPE Slingshot NIC) devices. Everything else 
 | `capacity_cgo.go` / `capacity_stub.go` | Real (`tags cxi`, libcxi ioctls) vs. non-CGO fallback capacity reads |
 | `service_cgo.go` / `service_mock.go` / `service_stub.go` | Real, synthetic (`--mock-devices`), and no-op service implementations |
 | `mock.go` | `MockDevices(n)` — generates `n` synthetic devices for kind/local dev and tests |
+| `parent.go` | VF-mode read path (SR-IOV): `ReadParentBudget` (parent `res` + `VNISet`, `ErrParentUnlimited` when the parent has no resource limits), `ReadParentRemaining` (parent `res` − Σ `res` of every service on the parent's VFs, system children included, raw LE/TLE), `ReadVFSystemReservation` (Σ `res` of all system-bit services on a VF). The math is build-independent; only `readParentDescriptor`/`readVFServices` differ per mode (`service_cgo.go` / `capacity_stub.go`) |
+| `vniset.go` | `VNISet` — a parent's VNI set in range or list form (a contiguous list is normalized to a range): `Contains`, `Covers`, `Range`, `List`, and `String` (`"min-max"` or the delimiter-wrapped `",40,42,"` used for the `vni_set` slice attribute) |
+| `service_mock.go` (topology) | `SetMockTopology`/`ResetMockTopology` — the in-memory parents and per-VF service lists that the non-cxi build of the parent read path answers from |
 
 ## Build modes
 
@@ -28,4 +31,4 @@ New hardware-facing code should follow this same three-file split — see [.gith
 
 ## Testing
 
-No unit tests exist in this package today — `capacity_cgo.go`/`service_cgo.go` require real hardware, and the mock/stub paths are exercised indirectly through `internal/driver`'s tests and the sibling `cxi-dra-integration-tests` repo. `mock.go` is the fixture to reuse rather than hand-rolling synthetic devices.
+`vniset_test.go` and `parent_test.go` cover `VNISet` and the VF-mode math (parent minus children across VFs, system children, LE/TLE, unlimited parent) against the mock topology; `parent_test.go` is `!cxi`-only because it drives `SetMockTopology`. `hsn_test.go` covers pairing. The rest of `capacity_cgo.go`/`service_cgo.go` requires real hardware, and the mock/stub paths are exercised indirectly through `internal/driver`'s tests and the sibling `cxi-dra-integration-tests` repo. `mock.go` is the fixture to reuse rather than hand-rolling synthetic devices.
