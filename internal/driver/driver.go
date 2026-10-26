@@ -43,6 +43,7 @@ type Config struct {
 	KubeClient           kubernetes.Interface
 	MockDevices          []*cxi.Device
 	SystemSvcIDs         []int // blessed system-service svc_ids; their reserved resources are excluded from each device's usable ceiling
+	VFOnly               bool  // discover and publish SR-IOV VFs only (--vf-only); the default publishes PFs only
 	RefreshInterval      time.Duration
 	CDIEnvConfig         cdi.CDIEnvConfig // host libs and env vars for the env spec; zero value when --enable-cdi-env is unset
 	ContainerdConfigPath string           // path for the containerd CDI config drop-in; empty = skip
@@ -62,6 +63,7 @@ type Driver struct {
 	devices              []*cxi.Device
 	store                *AllocationStore
 	systemSvcIDs         []int         // blessed system-service svc_ids passed to cxi.Discover; reserved resources excluded from each device's usable ceiling
+	vfOnly               bool          // passed to cxi.Discover: publish SR-IOV VFs only
 	refreshInterval      time.Duration // how often the orphan-service reaper runs
 	cdiEnvConfig         cdi.CDIEnvConfig
 	containerdConfigPath string // path for the containerd CDI config drop-in; empty = skip
@@ -105,6 +107,7 @@ func New(cfg Config) *Driver {
 		mockDevices:          cfg.MockDevices,
 		store:                NewAllocationStore(),
 		systemSvcIDs:         cfg.SystemSvcIDs,
+		vfOnly:               cfg.VFOnly,
 		refreshInterval:      cfg.RefreshInterval,
 		cdiEnvConfig:         cfg.CDIEnvConfig,
 		containerdConfigPath: cfg.ContainerdConfigPath,
@@ -250,7 +253,7 @@ func (d *Driver) Run(ctx context.Context) error {
 	if d.mockDevices != nil {
 		d.devices = d.mockDevices
 	} else {
-		devices, err := cxi.Discover(d.systemSvcIDs)
+		devices, err := cxi.Discover(cxi.DiscoverOptions{SystemSvcIDs: d.systemSvcIDs, VFOnly: d.vfOnly})
 		if err != nil {
 			return fmt.Errorf("discovering CXI devices: %w", err)
 		}

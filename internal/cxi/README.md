@@ -6,7 +6,7 @@ Hardware abstraction layer for CXI (HPE Slingshot NIC) devices. Everything else 
 
 | File | Purpose |
 |------|---------|
-| `device.go` | `Device` struct (name, index, dev path, sysfs path, NUMA node, PCI bus ID, HSN interface, capacity, reserved) and `Discover()`, which walks `/sys/class/cxi_user`, reads capacity, NUMA node and PCI bus ID, and pairs each device with its HSN interface |
+| `device.go` | `Device` struct (name, index, dev path, sysfs path, NUMA node, PCI bus ID, HSN interface, capacity, reserved, and the SR-IOV fields `FunctionType`, `PFName`, `VFIndex`, `ParentSvcID`, `PodIfName`) and `Discover(DiscoverOptions)`, which walks `/sys/class/cxi_user`, classifies each device as a PF or a VF (`device/physfn` present), keeps PFs by default or VFs with `VFOnly` (never both), reads capacity, NUMA node and PCI bus ID, and pairs each device with its HSN interface. The `discoverer` type takes the sysfs directories and libcxi reads as seams for unit tests |
 | `resources.go` | `ResourceSet` struct (the per-device hardware quota counters: `txqs`, `tgqs`, `eqs`, `cts`, `ptes`, `le_pools`, `tle_pools`, `acs`) and its `Fits`/`Minus` operations — see [README.md](../../README.md#resource-field-reference) for the exact semantics of each field |
 | `hsn.go` | `PairDevice()` — pairs a CXI device with the netdev (any name, e.g. `hsn3` for a PF, `enp197s0f1` for a VF) whose resolved `device` symlink equals the CXI device's PCI function path |
 | `service.go` | `ServiceManager` interface — CXI service (virtual network interface) CRUD: create, destroy, enable/disable |

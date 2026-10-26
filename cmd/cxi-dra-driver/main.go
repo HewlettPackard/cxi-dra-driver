@@ -85,6 +85,11 @@ func main() {
 		systemSvcIDs = flag.String("system-svc-ids", "",
 			"Comma-separated svc_ids of blessed system services: never deleted, and their reserved resources are deducted from the per-device usable ceiling")
 
+		// SR-IOV mode switch. PFs and VFs are never published together: the
+		// default publishes PFs and skips VFs; --vf-only publishes VFs and skips
+		// PFs before any libcxi read, so the PF is never opened.
+		vfOnly = flag.Bool("vf-only", false, "Discover and publish SR-IOV VFs only (PFs are skipped); the default publishes PFs only")
+
 		// CDI env spec configuration. The env spec (kdreg2/gdrdrv/xpmem nodes, /dev/shm)
 		// is always attached to every CXI device; when --enable-cdi-env is true,
 		// --env-config must point to a JSON file (typically mounted from a
@@ -135,6 +140,12 @@ func main() {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: --system-svc-ids: %v\n", err)
 		os.Exit(1)
+	}
+	// The ids are PF svc_ids; a VF numbers its services on its own, so they would
+	// match pod children on a VF and keep the NRI plugin and reaper from deleting them.
+	if *vfOnly && len(sysSvcIDs) > 0 {
+		log.Printf("warning: ignoring --system-svc-ids %v with --vf-only: PF svc_ids do not identify services on a VF", sysSvcIDs)
+		sysSvcIDs = nil
 	}
 
 	var mockDevList []*cxi.Device
@@ -188,6 +199,7 @@ func main() {
 		KubeClient:           kubeClient,
 		MockDevices:          mockDevList,
 		SystemSvcIDs:         sysSvcIDs,
+		VFOnly:               *vfOnly,
 		RefreshInterval:      *refreshInterval,
 		ContainerdConfigPath: *containerdConfigPath,
 		CDIEnvConfig:         envConfig,
