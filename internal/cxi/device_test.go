@@ -35,14 +35,27 @@ func (f *fakeSysfs) sriovLink(pf, vf string, n int) {
 	}
 }
 
+// parentSvc writes the PF's vf/<n>/svc_id file; raw is written verbatim.
+func (f *fakeSysfs) parentSvc(pf string, n int, raw string) {
+	f.t.Helper()
+	dir := filepath.Join(f.root, "class", "cxi", pf, "vf", fmt.Sprint(n))
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		f.t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "svc_id"), []byte(raw), 0o644); err != nil {
+		f.t.Fatal(err)
+	}
+}
+
 // discoverer returns a discoverer over the fake tree that records every
 // libcxi-backed read (capacity by name, reserved as "reserved:<name>") and
 // every log line.
 func (f *fakeSysfs) discoverer() (*discoverer, *[]string, *[]string) {
 	var opened, logs []string
 	x := &discoverer{
-		classPath: filepath.Join(f.root, "class", "cxi_user"),
-		netPath:   f.netPath(),
+		classPath:   filepath.Join(f.root, "class", "cxi_user"),
+		netPath:     f.netPath(),
+		pfClassPath: filepath.Join(f.root, "class", "cxi"),
 		readCapacity: func(name string) (ResourceSet, error) {
 			opened = append(opened, name)
 			return DeviceCapacity(), nil
@@ -80,6 +93,7 @@ func sriovNode(t *testing.T) *fakeSysfs {
 	} {
 		vf := f.pciDev(v.bdf)
 		f.sriovLink(pf0, vf, i)
+		f.parentSvc("cxi0", i, "4\n")
 		f.link("cxi_user", v.cxi, vf)
 		if v.netdev != "" {
 			f.link("net", v.netdev, vf)
@@ -182,8 +196,8 @@ func TestDiscoverSRIOVNodeVFOnly(t *testing.T) {
 		if d.PCIBusID != want.pci || d.HSNIface != want.hsn {
 			t.Errorf("%s: pci=%q hsn=%q, want %q %q", d.Name, d.PCIBusID, d.HSNIface, want.pci, want.hsn)
 		}
-		if d.Capacity != (ResourceSet{}) || d.Reserved != (ResourceSet{}) || d.ParentSvcID != 0 || d.PodIfName != "" {
-			t.Errorf("%s: capacity=%+v reserved=%+v parent=%d podif=%q, want all zero until the parent budget lands",
+		if d.Capacity != (ResourceSet{}) || d.Reserved != (ResourceSet{}) || d.ParentSvcID != 4 || d.PodIfName != "" {
+			t.Errorf("%s: capacity=%+v reserved=%+v parent=%d podif=%q, want zero capacity/reserved/podif and parent 4",
 				d.Name, d.Capacity, d.Reserved, d.ParentSvcID, d.PodIfName)
 		}
 	}
@@ -205,6 +219,7 @@ func TestDiscoverVFWithoutPhysfnTarget(t *testing.T) {
 		f, pf0 := pfOnlyNode(t)
 		good := f.pciDev("0000:c5:00.2")
 		f.sriovLink(pf0, good, 1)
+		f.parentSvc("cxi0", 1, "4\n")
 		f.link("cxi_user", "cxi5", good)
 		// cxi4's physfn dangles: still a VF, but its PF cannot be resolved.
 		bad := f.pciDev("0000:c5:00.1")
