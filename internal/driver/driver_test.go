@@ -36,7 +36,7 @@ var hwAvailPlenty = cxi.ResourceSet{TXQs: 1000, TGQs: 1000, EQs: 1000, CTs: 1000
 
 func TestCheckAndAddPending_GrantsWhenFreeAndFits(t *testing.T) {
 	d := newDriverForTest()
-	if granted := d.checkAndAddPending("c1", "cxi0", fits, hwAvailPlenty); !granted {
+	if granted := d.checkAndAddPending("c1", "cxi0", "", fits, hwAvailPlenty); !granted {
 		t.Fatalf("checkAndAddPending = false, want granted")
 	}
 	if !hasPend(d, "c1", "cxi0") {
@@ -49,10 +49,10 @@ func TestCheckAndAddPending_GrantsWhenFreeAndFits(t *testing.T) {
 // Both claims are granted and both hold a pending entry.
 func TestCheckAndAddPending_TwoClaimsSameDeviceGrant(t *testing.T) {
 	d := newDriverForTest()
-	if granted := d.checkAndAddPending("c1", "cxi0", fits, hwAvailPlenty); !granted {
+	if granted := d.checkAndAddPending("c1", "cxi0", "", fits, hwAvailPlenty); !granted {
 		t.Fatalf("setup: first grant failed")
 	}
-	if granted := d.checkAndAddPending("c2", "cxi0", fits, hwAvailPlenty); !granted {
+	if granted := d.checkAndAddPending("c2", "cxi0", "", fits, hwAvailPlenty); !granted {
 		t.Fatalf("second claim on same device: got false, want granted")
 	}
 	if !hasPend(d, "c1", "cxi0") || !hasPend(d, "c2", "cxi0") {
@@ -66,7 +66,7 @@ func TestCheckAndAddPending_TwoClaimsSameDeviceGrant(t *testing.T) {
 func TestCheckAndAddPending_OverHardwareDoesNotIncrement(t *testing.T) {
 	d := newDriverForTest()
 	tooBig := cxi.ResourceSet{TXQs: 2000} // exceeds hwAvailPlenty.TXQs=1000
-	if granted := d.checkAndAddPending("c1", "cxi0", tooBig, hwAvailPlenty); granted {
+	if granted := d.checkAndAddPending("c1", "cxi0", "", tooBig, hwAvailPlenty); granted {
 		t.Fatalf("over hardware: got granted, want refused")
 	}
 	if hasPend(d, "c1", "cxi0") {
@@ -82,11 +82,11 @@ func TestCheckAndAddPending_PendingBlocksSecondGrant(t *testing.T) {
 	// hwAvail with exactly room for one "big" grant.
 	hw := cxi.ResourceSet{TXQs: 100, TGQs: 100, EQs: 100, CTs: 100, PTEs: 100, ACs: 100, LEs: 100, TLEs: 100}
 	big := cxi.ResourceSet{TXQs: 60}
-	if granted := d.checkAndAddPending("c1", "cxi0", big, hw); !granted {
+	if granted := d.checkAndAddPending("c1", "cxi0", "", big, hw); !granted {
 		t.Fatalf("setup: first grant failed")
 	}
 	// Second 60 would need 120 > 100 available; refused.
-	if granted := d.checkAndAddPending("c2", "cxi0", big, hw); granted {
+	if granted := d.checkAndAddPending("c2", "cxi0", "", big, hw); granted {
 		t.Fatalf("second grant should be refused: pending sum exceeds capacity")
 	}
 	if hasPend(d, "c2", "cxi0") {
@@ -98,9 +98,9 @@ func TestCheckAndAddPending_PendingBlocksSecondGrant(t *testing.T) {
 // one per device). Called by NRI after the pod's services are created.
 func TestRemovePending(t *testing.T) {
 	d := newDriverForTest()
-	d.checkAndAddPending("c1", "cxi0", fits, hwAvailPlenty)
-	d.checkAndAddPending("c1", "cxi1", fits, hwAvailPlenty)
-	d.checkAndAddPending("c2", "cxi0", fits, hwAvailPlenty)
+	d.checkAndAddPending("c1", "cxi0", "", fits, hwAvailPlenty)
+	d.checkAndAddPending("c1", "cxi1", "", fits, hwAvailPlenty)
+	d.checkAndAddPending("c2", "cxi0", "", fits, hwAvailPlenty)
 
 	d.RemovePending("c1")
 
@@ -118,19 +118,19 @@ func TestRemovePending(t *testing.T) {
 func TestReconcileClaimDevices_ReleasesDroppedDevicePending(t *testing.T) {
 	d := newDriverForTest()
 
-	d.checkAndAddPending("c1", "cxi0", fits, hwAvailPlenty)
+	d.checkAndAddPending("c1", "cxi0", "", fits, hwAvailPlenty)
 	if !hasPend(d, "c1", "cxi0") {
 		t.Fatalf("setup: pending[c1, cxi0] not recorded")
 	}
 
 	// Binder observes c1 now allocated to cxi1 only: reconcile to {cxi1}
 	// releases the stale cxi0 pending, then the new device is granted.
-	d.reconcileClaimDevices("c1", map[string]bool{"cxi1": true})
+	d.reconcileClaimDevices("c1", map[pendingKey]bool{{deviceName: "cxi1"}: true})
 	if hasPend(d, "c1", "cxi0") {
 		t.Errorf("stale pending[c1, cxi0] still present after reconcile to {cxi1}")
 	}
 
-	if granted := d.checkAndAddPending("c1", "cxi1", fits, hwAvailPlenty); !granted {
+	if granted := d.checkAndAddPending("c1", "cxi1", "", fits, hwAvailPlenty); !granted {
 		t.Fatalf("reallocation grant on cxi1 failed")
 	}
 	if !hasPend(d, "c1", "cxi1") {
@@ -143,10 +143,10 @@ func TestReconcileClaimDevices_ReleasesDroppedDevicePending(t *testing.T) {
 func TestCheckAndAddPending_SameClaimReEvaluationIsIdempotent(t *testing.T) {
 	d := newDriverForTest()
 
-	if granted := d.checkAndAddPending("c1", "cxi0", fits, hwAvailPlenty); !granted {
+	if granted := d.checkAndAddPending("c1", "cxi0", "", fits, hwAvailPlenty); !granted {
 		t.Fatalf("initial grant failed unexpectedly")
 	}
-	if granted := d.checkAndAddPending("c1", "cxi0", fits, hwAvailPlenty); !granted {
+	if granted := d.checkAndAddPending("c1", "cxi0", "", fits, hwAvailPlenty); !granted {
 		t.Fatalf("re-evaluation of same claim on same device: got false, want granted")
 	}
 

@@ -17,29 +17,32 @@ import (
 type DeviceStatusData struct {
 	VNI   int `json:"vni"`
 	SvcID int `json:"svc_id,omitempty"`
+	// VF is the VF backing a VF-mode parent allocation; empty in PF mode.
+	VF string `json:"vf,omitempty"`
 }
 
-// RecordSvcID publishes the VNI and svc_id for one (claim, device) pair to
-// the claim's status. Called by the NRI plugin after CreateService succeeds.
-// Best-effort: any API failure is logged and ignored — informational only.
-func (d *Driver) RecordSvcID(
-	ctx context.Context,
-	claimUID types.UID,
-	claimNs, claimName, deviceName string,
-	vni, svcID int,
-) {
-	d.writeDeviceStatus(ctx, claimNs, claimName, claimUID,
-		map[string]DeviceStatusData{deviceName: {VNI: vni, SvcID: svcID}})
+// RecordSvcID publishes the VNI, svc_id and (VF mode) the backing VF for one
+// allocation of a claim to the claim's status. Called by the NRI plugin after
+// CreateService succeeds. Best-effort: any API failure is logged and ignored —
+// informational only.
+func (d *Driver) RecordSvcID(ctx context.Context, alloc PodAllocation, svcID int) {
+	data := DeviceStatusData{VNI: alloc.VNI, SvcID: svcID}
+	if alloc.ParentName != "" {
+		data.VF = alloc.DeviceName
+	}
+	d.writeDeviceStatus(ctx, alloc.ClaimNamespace, alloc.ClaimName, alloc.ClaimUID,
+		map[pendingKey]DeviceStatusData{{deviceName: alloc.AllocatedDevice(), shareID: alloc.ShareID}: data})
 }
 
-// writeDeviceStatus best-effort merges per-device status entries into the
-// claim's status. Retries on conflict because the ClaimBinder concurrently
-// writes BindingConditions on the same subresource.
+// writeDeviceStatus best-effort merges status entries, keyed by allocation
+// result (device and ShareID), into the claim's status. Retries on conflict
+// because the ClaimBinder concurrently writes BindingConditions on the same
+// subresource.
 func (d *Driver) writeDeviceStatus(
 	ctx context.Context,
 	claimNs, claimName string,
 	claimUID types.UID,
-	deviceData map[string]DeviceStatusData,
+	deviceData map[pendingKey]DeviceStatusData,
 ) {
 	const maxRetries = 3
 	for attempt := 0; attempt < maxRetries; attempt++ {
@@ -61,7 +64,7 @@ func (d *Driver) writeDeviceStatus(
 			if r.Driver != d.driverName {
 				continue
 			}
-			data, ok := deviceData[r.Device]
+			data, ok := deviceData[pendingKey{deviceName: r.Device, shareID: shareIDOf(*r)}]
 			if !ok {
 				continue
 			}

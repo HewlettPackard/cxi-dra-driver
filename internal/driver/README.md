@@ -14,7 +14,9 @@ The core DRA (Dynamic Resource Allocation) plugin. This package owns device publ
 | `prepare.go` | `PrepareResourceClaims` — kubelet plugin hook; reads the namespace's VNI annotation, resolves the request from the allocation's `consumedCapacity`, performs the static ceiling check, stores a `PodAllocation`, writes the CNI hint file, returns CDI device IDs; `recordSharedClaimPods` does the same for pods that reserve an already-prepared claim (called from the claim watch) |
 | `unprepare.go` | `UnprepareResourceClaims` — kubelet plugin hook; removes the `PodAllocation` and deletes the pod's CNI hint file (best-effort) on pod deletion |
 | `cnihints.go` | Writes/deletes the per-pod CNI hint file (the read-side contract for `slingshot-cni`, see `internal/cni`) and the observability-only pod annotation — see [docs/cni/cnidra-cni-hint-contract.md](../../docs/cni/cnidra-cni-hint-contract.md) |
-| `store.go` | `AllocationStore` — thread-safe in-memory map of pod UID → `PodAllocation` (device, HSN, VNI, resources) |
+| `store.go` | `AllocationStore` — thread-safe in-memory map of pod UID → `PodAllocation` (device, HSN, VNI, resources; in VF mode also the parent and ShareID) |
+| `views.go` | Published vs programmable devices: PFs in PF mode; in VF mode parents are published (`parentSet`, ceiling from the parent budget) and VFs are programmed. `liveAvailable` / `AvailableFor` read the parent's remaining budget |
+| `vfselect.go` | VF mode: per-parent locking and lowest-free-VF selection at Prepare (`programmableFor`), and startup recovery of VF occupancy from hint files, claims and VF service lists (`recoverVFState`) |
 | `reaper.go` | Backstop that runs every `--resource-refresh-interval`: destroys CXI services whose pod netns is gone for several consecutive cycles, never touching blessed, kernel-system, or NRI-tracked live services |
 | `vniallocator.go` | Leader-elected namespace controller — assigns the lowest free VNI to each namespace and writes the `cxi.slingshot.hpe.com/vni` annotation |
 | `vnipool.go` | Shared leader-election and lease-management plumbing used by the VNI allocator; the Lease is named `<driverName>-vni-allocator-leader` |
@@ -26,4 +28,4 @@ Pods never carry their own VNI. `vniallocator.go` assigns exactly one VNI per na
 
 ## Testing
 
-`capacity_test.go`, `driver_test.go`, `claimbinder_test.go`, `prepare_test.go`, `resourceslice_test.go`, `store_test.go`, `vniallocator_test.go`, `vni_test.go`, and `cnihints_test.go` cover this package — the strongest unit-test coverage in the repository. `devicestatus.go`, `unprepare.go`, and `reaper.go` currently have no dedicated tests; consider these first when adding coverage.
+`capacity_test.go`, `driver_test.go`, `claimbinder_test.go`, `prepare_test.go`, `resourceslice_test.go`, `store_test.go`, `vfselect_test.go`, `vniallocator_test.go`, `vni_test.go`, and `cnihints_test.go` cover this package — the strongest unit-test coverage in the repository. `devicestatus.go`, `unprepare.go`, and `reaper.go` currently have no dedicated tests; consider these first when adding coverage.

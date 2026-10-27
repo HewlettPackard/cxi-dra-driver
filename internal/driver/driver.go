@@ -25,11 +25,13 @@ type pendingEntry struct {
 }
 
 // pendingKey identifies one in-flight grant. A claim that allocates more than
-// one CXI device (a count>1 request) holds one pending entry per device, so
-// the map is keyed by (claim, device) rather than claim alone.
+// one CXI device (a count>1 request) holds one pending entry per allocation
+// result. Results on one shared device (a VF-mode parent) differ only by
+// ShareID, so it is part of the key.
 type pendingKey struct {
 	claimUID   types.UID
 	deviceName string
+	shareID    string
 }
 
 // Config holds all configuration for a Driver instance.
@@ -70,7 +72,19 @@ type Driver struct {
 	cniHintsDir          string // host dir for per-pod CNI hint files; empty disables the hint-file write/delete
 
 	pendingMu sync.Mutex
-	pending   map[pendingKey]pendingEntry // (claim, device) → in-flight grant not yet backed by a service
+	pending   map[pendingKey]pendingEntry // (claim, device, share) → in-flight grant not yet backed by a service
+
+	// parents are the VF-mode published devices (empty in PF mode). parentLocks
+	// holds one *sync.Mutex per parent name: Prepare holds it across VF
+	// selection, store.Set and the hint write, so concurrent Prepares under one
+	// parent never pick the same VF.
+	parents     parentSet
+	parentLocks sync.Map
+
+	// recoveredBusy marks VFs found at startup with a pod child but no hint
+	// file: busy for selection until the reaper has removed the child.
+	recoveredMu   sync.Mutex
+	recoveredBusy map[string]string // VF name → reason
 
 	// Orphan-service reaper state. The reaper runs on the same Run ticker as
 	// the periodic ResourceSlice republish and destroys CXI services whose
@@ -113,6 +127,7 @@ func New(cfg Config) *Driver {
 		containerdConfigPath: cfg.ContainerdConfigPath,
 		cniHintsDir:          cfg.CNIHintsDir,
 		pending:              make(map[pendingKey]pendingEntry),
+		recoveredBusy:        make(map[string]string),
 		reapSvcMgr:           cxi.NewServiceManager(),
 		reaperMisses:         make(map[reapKey]int),
 	}
@@ -149,14 +164,13 @@ func (d *Driver) RemovePending(claimUID types.UID) {
 	}
 }
 
-// checkAndAddPending atomically validates a grant request for one
-// (claim, device) against capacity:
+// checkAndAddPending atomically validates a grant request for one allocation
+// result (claim, device, share) against capacity:
 //
 //	requested must fit within (hwAvail − sum of pending grants on this
-//	device, excluding this claim's own prior entry for this device).
+//	device, excluding this result's own prior entry).
 //
-// A claim that allocates more than one device calls this once per device; the
-// grants are independent because each targets a distinct device.
+// A claim that allocates more than one device calls this once per result.
 //
 // Multiple claims from the same namespace MAY co-locate on one device: the
 // SHS14 VNI-per-device-uniqueness constraint has been lifted, so there is no
@@ -176,17 +190,18 @@ func (d *Driver) RemovePending(claimUID types.UID) {
 // cannot fit" (Unschedulable) by a second check against hwAvail alone.
 func (d *Driver) checkAndAddPending(
 	claimUID types.UID,
-	deviceName string,
+	deviceName, shareID string,
 	requested, hwAvail cxi.ResourceSet,
 ) (granted bool) {
 	d.pendingMu.Lock()
 	defer d.pendingMu.Unlock()
+	key := pendingKey{claimUID: claimUID, deviceName: deviceName, shareID: shareID}
 
-	// Idempotent re-grant: this claim already holds a pending entry for this
-	// device. Nothing to change — re-evaluation of an already-granted device
+	// Idempotent re-grant: this result already holds a pending entry. Nothing
+	// to change — re-evaluation of an already-granted device
 	// (e.g. while another device of the same claim is still settling) must
 	// not double-count its pending entry.
-	if _, ok := d.pending[pendingKey{claimUID: claimUID, deviceName: deviceName}]; ok {
+	if _, ok := d.pending[key]; ok {
 		return true
 	}
 
@@ -205,39 +220,40 @@ func (d *Driver) checkAndAddPending(
 		return false
 	}
 
-	d.pending[pendingKey{claimUID: claimUID, deviceName: deviceName}] = pendingEntry{
+	d.pending[key] = pendingEntry{
 		deviceName: deviceName,
 		resources:  requested,
 	}
 	return true
 }
 
-// reconcileClaimDevices releases any pending grant the claim holds for a
-// device NOT in currentDevices. It covers a subset reallocation: the scheduler
-// can move a claim from device set {A,B} to {A,C} without our ever seeing
-// Allocation=nil in between, which would otherwise leak B's pending grant and
-// understate B's effective capacity. Called by the ClaimBinder before it
-// (re)evaluates the claim's current device set.
-func (d *Driver) reconcileClaimDevices(claimUID types.UID, currentDevices map[string]bool) {
+// reconcileClaimDevices releases any pending grant the claim holds for an
+// allocation result NOT in current (keyed by device and ShareID). It covers a
+// subset reallocation: the scheduler can move a claim from device set {A,B} to
+// {A,C} without our ever seeing Allocation=nil in between, which would
+// otherwise leak B's pending grant and understate B's effective capacity.
+// Called by the ClaimBinder before it (re)evaluates the claim's current
+// results.
+func (d *Driver) reconcileClaimDevices(claimUID types.UID, current map[pendingKey]bool) {
 	d.pendingMu.Lock()
 	defer d.pendingMu.Unlock()
 
-	// Drop pending entries for devices the claim no longer holds so they
+	// Drop pending entries for results the claim no longer holds so they
 	// don't inflate the per-device pendingSum or linger after the service is
 	// gone.
 	for k := range d.pending {
-		if k.claimUID == claimUID && !currentDevices[k.deviceName] {
+		if k.claimUID == claimUID && !current[pendingKey{deviceName: k.deviceName, shareID: k.shareID}] {
 			delete(d.pending, k)
 		}
 	}
 }
 
 // hasPending reports whether there is an active in-flight pending grant for
-// the given (claim, device).
-func (d *Driver) hasPending(claimUID types.UID, deviceName string) bool {
+// the given allocation result.
+func (d *Driver) hasPending(claimUID types.UID, deviceName, shareID string) bool {
 	d.pendingMu.Lock()
 	defer d.pendingMu.Unlock()
-	_, ok := d.pending[pendingKey{claimUID: claimUID, deviceName: deviceName}]
+	_, ok := d.pending[pendingKey{claimUID: claimUID, deviceName: deviceName, shareID: shareID}]
 	return ok
 }
 
@@ -259,8 +275,9 @@ func (d *Driver) Run(ctx context.Context) error {
 		}
 		d.devices = devices
 	}
+	d.setupParents()
 
-	for _, dev := range d.devices {
+	for _, dev := range d.programmableDevices() {
 		if err := cdi.WriteSpec(d.cdiRoot, d.driverName, dev); err != nil {
 			return fmt.Errorf("writing CDI spec for %s: %w", dev.Name, err)
 		}
@@ -307,6 +324,8 @@ func (d *Driver) Run(ctx context.Context) error {
 	if d.podUID != "" {
 		opts = append(opts, kubeletplugin.RollingUpdate(types.UID(d.podUID)))
 	}
+	// Rebuild which VFs are taken before kubelet can call Prepare.
+	d.recoverVFState(ctx)
 	helper, err := kubeletplugin.Start(ctx, d, opts...)
 	if err != nil {
 		return fmt.Errorf("starting kubelet plugin: %w", err)
