@@ -82,12 +82,13 @@ func (d *Driver) reapOrphanServices() {
 	nriLive := d.liveSvcIDs()
 
 	seen := make(map[reapKey]bool)
-	for _, dev := range d.devices {
+	for _, dev := range d.programmableDevices() {
 		svcs, err := cxi.ReadActiveServices(dev.Name)
 		if err != nil {
 			d.logf("warning: reaper reading services for %s: %v", dev.Name, err)
 			continue
 		}
+		d.releaseRecovered(dev.Name, svcs)
 		for _, svc := range svcs {
 			key := reapKey{deviceName: dev.Name, svcID: svc.SvcID}
 			seen[key] = true

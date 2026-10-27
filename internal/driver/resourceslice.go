@@ -33,14 +33,19 @@ func (d *Driver) buildDriverResources() resourceslice.DriverResources {
 	}
 }
 
-// buildDevices constructs the Device list for the ResourceSlice.
+// buildDevices constructs the Device list for the ResourceSlice from the
+// published view: PFs, or the VF-mode parents.
 func (d *Driver) buildDevices() []resourceapi.Device {
-	out := make([]resourceapi.Device, 0, len(d.devices))
-	for _, dev := range d.devices {
+	published := d.publishedDevices()
+	out := make([]resourceapi.Device, 0, len(published))
+	for _, dev := range published {
 		attrs := map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
 			"type": {StringValue: ptr.To("device")},
-			// Topology — usable in CEL placement selectors.
-			"hsn_iface": {StringValue: ptr.To(dev.HSNIface)},
+		}
+		// Topology — usable in CEL placement selectors. A parent spans several
+		// VF netdevs, so it has none.
+		if dev.hsnIface != "" || !d.vfOnly {
+			attrs["hsn_iface"] = resourceapi.DeviceAttribute{StringValue: ptr.To(dev.hsnIface)}
 		}
 
 		// Standard cross-driver attributes (Kubernetes v1.37+ DRA standard
@@ -48,15 +53,15 @@ func (d *Driver) buildDevices() []resourceapi.Device {
 		// when the topology is unknown, since a present-but-meaningless value
 		// would still participate in scheduler matchAttribute comparisons
 		// against other devices/drivers.
-		if dev.NUMANode >= 0 {
-			attrs["resource.kubernetes.io/numaNode"] = resourceapi.DeviceAttribute{IntValue: ptr.To(int64(dev.NUMANode))}
+		if dev.numaNode >= 0 {
+			attrs["resource.kubernetes.io/numaNode"] = resourceapi.DeviceAttribute{IntValue: ptr.To(int64(dev.numaNode))}
 		}
-		if dev.PCIBusID != "" {
-			attrs["resource.kubernetes.io/pciBusID"] = resourceapi.DeviceAttribute{StringValue: ptr.To(dev.PCIBusID)}
+		if dev.pciBusID != "" {
+			attrs["resource.kubernetes.io/pciBusID"] = resourceapi.DeviceAttribute{StringValue: ptr.To(dev.pciBusID)}
 		}
 
 		out = append(out, resourceapi.Device{
-			Name:       dev.Name,
+			Name:       dev.name,
 			Attributes: attrs,
 			// BindingConditions: the scheduler will not bind a pod until the
 			// ClaimBinder sets Ready=True, confirming capacity is available.
@@ -67,7 +72,7 @@ func (d *Driver) buildDevices() []resourceapi.Device {
 			BindingConditions:        []string{"Ready"},
 			BindingFailureConditions: []string{"Unschedulable"},
 			AllowMultipleAllocations: ptr.To(true),
-			Capacity:                 buildCapacity(d.usableCeiling(dev.Name)),
+			Capacity:                 buildCapacity(d.usableCeiling(dev.name)),
 		})
 	}
 	return out

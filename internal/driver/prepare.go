@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"slices"
 	"strconv"
+	"strings"
 	"time"
 
 	resourceapi "k8s.io/api/resource/v1"
@@ -52,17 +53,8 @@ func (d *Driver) prepareClaim(ctx context.Context, claim *resourceapi.ResourceCl
 		}
 	}
 
-	var kubeletDevices []kubeletplugin.Device
-	var podAllocs []PodAllocation
-
-	// The shared env CDI spec is a driver-global singleton. For a multi-device
-	// claim (count > 1) each device's resolveCDIDeviceIDs returns the same env
-	// ID, but containerd must reference the spec only once — applying its
-	// bind-mounts twice makes container creation fail. seenCDIIDs dedupes
-	// across devices; the per-device cxi= ID is unique so it always passes
-	// through.
-	seenCDIIDs := make(map[string]bool)
-
+	var results []resourceapi.DeviceRequestAllocationResult
+	var requests []cxi.ResourceSet
 	for _, alloc := range claim.Status.Allocation.Devices.Results {
 		if alloc.Driver != d.driverName {
 			continue
@@ -83,8 +75,41 @@ func (d *Driver) prepareClaim(ctx context.Context, claim *resourceapi.ResourceCl
 					claim.Namespace, claim.Name, alloc.Device, requested, ceiling),
 			}
 		}
+		results = append(results, alloc)
+		requests = append(requests, requested)
+	}
 
-		cdiIDs := d.resolveCDIDeviceIDs(alloc.Device)
+	// The VNI is namespace-scoped: a namespace is one cluster allocation, so
+	// every pod in it shares the VNI and can form RDMA connections. The claim
+	// and the pods that reserved it share claim.Namespace. Read before taking
+	// the parent locks: it may wait for the allocator to annotate the namespace.
+	vni, err := d.namespaceVNI(ctx, claim.Namespace)
+	if err != nil {
+		return kubeletplugin.PrepareResult{Err: err}
+	}
+
+	unlock := d.lockParents(results)
+	progs, err := d.programmableFor(claim.UID, results)
+	if err != nil {
+		unlock()
+		return kubeletplugin.PrepareResult{Err: fmt.Errorf("claim %s/%s: %w", claim.Namespace, claim.Name, err)}
+	}
+
+	var kubeletDevices []kubeletplugin.Device
+	var podAllocs []PodAllocation
+
+	// The shared env CDI spec is a driver-global singleton. For a multi-device
+	// claim (count > 1) each device's resolveCDIDeviceIDs returns the same env
+	// ID, but containerd must reference the spec only once — applying its
+	// bind-mounts twice makes container creation fail. seenCDIIDs dedupes
+	// across devices; the per-device cxi= ID is unique so it always passes
+	// through.
+	seenCDIIDs := make(map[string]bool)
+
+	for i, alloc := range results {
+		// The pod gets the programmable device (the VF in VF mode); kubelet
+		// still identifies the allocation by the published device.
+		cdiIDs := d.resolveCDIDeviceIDs(progs[i])
 
 		// Drop any CDI ID already referenced by an earlier device in this
 		// claim. The shared env spec is emitted once; per-device cxi= IDs
@@ -106,35 +131,44 @@ func (d *Driver) prepareClaim(ctx context.Context, claim *resourceapi.ResourceCl
 			CDIDeviceIDs: cdiIDs,
 		})
 
-		pa := d.podAllocationBase(alloc.Device)
-		pa.Resources = requested
+		pa := d.podAllocationBase(progs[i])
+		pa.Resources = requests[i]
+		pa.VNI = vni
 		pa.ClaimUID = claim.UID
 		pa.ClaimNamespace = claim.Namespace
 		pa.ClaimName = claim.Name
+		if progs[i] != alloc.Device {
+			pa.ParentName = alloc.Device
+		}
+		pa.ShareID = shareIDOf(alloc)
 		podAllocs = append(podAllocs, pa)
 	}
 
-	// The VNI is namespace-scoped: a namespace is one cluster allocation, so
-	// every pod in it shares the VNI and can form RDMA connections. The claim
-	// and the pods that reserved it share claim.Namespace.
-	vni, err := d.namespaceVNI(ctx, claim.Namespace)
+	d.store.SetClaimAllocs(claim.UID, podAllocs)
+	err = d.recordClaimPods(claim, podAllocs, claim.Status.ReservedFor)
+	unlock()
 	if err != nil {
 		return kubeletplugin.PrepareResult{Err: err}
 	}
-	for i := range podAllocs {
-		podAllocs[i].VNI = vni
+	if d.vfOnly {
+		d.logf("claim %s/%s: %s", claim.Namespace, claim.Name, describeAllocs(podAllocs))
 	}
-
-	d.store.SetClaimAllocs(claim.UID, podAllocs)
-	if err := d.recordClaimPods(ctx, claim, podAllocs, claim.Status.ReservedFor); err != nil {
-		return kubeletplugin.PrepareResult{Err: err}
-	}
+	d.annotateClaimPods(ctx, claim.Namespace, claim.Status.ReservedFor)
 
 	return kubeletplugin.PrepareResult{Devices: kubeletDevices}
 }
 
+// describeAllocs renders "parent→VF" pairs for the Prepare log line.
+func describeAllocs(allocs []PodAllocation) string {
+	parts := make([]string, len(allocs))
+	for i, a := range allocs {
+		parts[i] = a.AllocatedDevice() + "→" + a.DeviceName
+	}
+	return strings.Join(parts, ", ")
+}
+
 // recordClaimPods records allocs for every pod in refs and writes its CNI hint.
-func (d *Driver) recordClaimPods(ctx context.Context, claim *resourceapi.ResourceClaim, allocs []PodAllocation,
+func (d *Driver) recordClaimPods(claim *resourceapi.ResourceClaim, allocs []PodAllocation,
 	refs []resourceapi.ResourceClaimConsumerReference) error {
 	for _, ref := range refs {
 		if ref.Resource != "pods" {
@@ -147,15 +181,23 @@ func (d *Driver) recordClaimPods(ctx context.Context, claim *resourceapi.Resourc
 		// The hint file is the CNI plugin's read-side contract (no access to
 		// this in-process store) — a write failure must fail the claim so
 		// kubelet retries, rather than silently handing the pod to CRI
-		// without net-hints. The pod annotation below is a best-effort
-		// observability side channel only; it is never load-bearing.
+		// without net-hints.
 		if err := d.writeCNIHint(podUID); err != nil {
 			return fmt.Errorf("claim %s/%s: writing CNI hint file for pod %s: %w",
 				claim.Namespace, claim.Name, podUID, err)
 		}
-		d.annotatePodCNIHints(ctx, claim.Namespace, ref.Name, cniHintsFor(d.store.Get(podUID)))
 	}
 	return nil
+}
+
+// annotateClaimPods best-effort mirrors each pod's hints into its annotation,
+// an observability side channel only; never load-bearing.
+func (d *Driver) annotateClaimPods(ctx context.Context, namespace string, refs []resourceapi.ResourceClaimConsumerReference) {
+	for _, ref := range refs {
+		if ref.Resource == "pods" {
+			d.annotatePodCNIHints(ctx, namespace, ref.Name, cniHintsFor(d.store.Get(types.UID(ref.UID))))
+		}
+	}
 }
 
 // recordSharedClaimPods records pods that reserved claim after it was prepared
@@ -180,7 +222,7 @@ func (d *Driver) recordSharedClaimPods(ctx context.Context, claim *resourceapi.R
 	if len(added) == 0 {
 		return true
 	}
-	if err := d.recordClaimPods(ctx, claim, allocs, added); err != nil {
+	if err := d.recordClaimPods(claim, allocs, added); err != nil {
 		d.logf("warning: %v; will retry", err)
 		// recordClaimPods marks a pod recorded before writing its hint and
 		// stops at the first failure. Forget the whole batch: pods it never
@@ -195,6 +237,7 @@ func (d *Driver) recordSharedClaimPods(ctx context.Context, claim *resourceapi.R
 		d.logf("claim %s/%s: recorded pod %s (%s), which reserved the claim after it was prepared",
 			claim.Namespace, claim.Name, ref.Name, ref.UID)
 	}
+	d.annotateClaimPods(ctx, claim.Namespace, added)
 	return true
 }
 
@@ -396,16 +439,20 @@ func parseResourceConfig(raw []byte) (cxi.ResourceSet, error) {
 }
 
 // usableCeiling returns the maximum resources a service can ever request on
-// a device: hardware total minus the resources reserved by the blessed system
-// services (--system-svc-ids), summed once at discovery time.
+// a published device: for a VF-mode parent its published ceiling, otherwise
+// hardware total minus the resources reserved by the blessed system services
+// (--system-svc-ids), summed once at discovery time.
 func (d *Driver) usableCeiling(deviceName string) cxi.ResourceSet {
+	if p, ok := d.parents.get(deviceName); ok {
+		return p.ceiling
+	}
 	total := d.deviceCapacity(deviceName)
 	return total.Sub(d.deviceReserved(deviceName))
 }
 
-// podAllocationBase builds a PodAllocation skeleton for a device name.
+// podAllocationBase builds a PodAllocation skeleton for a programmable device.
 func (d *Driver) podAllocationBase(deviceName string) PodAllocation {
-	for _, dev := range d.devices {
+	for _, dev := range d.programmableDevices() {
 		if dev.Name == deviceName {
 			return PodAllocation{DeviceName: dev.Name, DevPath: dev.DevPath, HSNIface: dev.HSNIface}
 		}

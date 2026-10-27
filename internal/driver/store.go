@@ -14,7 +14,7 @@ import (
 // source claim so the NRI plugin can publish the assigned svc_id to
 // the right RC.Status.Devices[] entry after CreateService.
 type PodAllocation struct {
-	DeviceName     string          // e.g. "cxi0"
+	DeviceName     string          // programmable device: the PF ("cxi0") or, in VF mode, the VF chosen at Prepare ("cxi5")
 	DevPath        string          // e.g. "/dev/cxi0" — host path of the character device
 	HSNIface       string          // e.g. "hsn2"
 	VNI            int             // Virtual Network Identifier for the Slingshot fabric service
@@ -22,6 +22,22 @@ type PodAllocation struct {
 	ClaimUID       types.UID
 	ClaimNamespace string
 	ClaimName      string
+
+	// ParentName is the published parent ("cxi0-svc4") the VF was selected
+	// under; empty in PF mode, where the allocated device is DeviceName.
+	ParentName string
+	// ShareID is the allocation result's ShareID ("" when unset). Results of
+	// one claim on the same parent differ only by it.
+	ShareID string
+}
+
+// AllocatedDevice is the device name the scheduler allocated: the parent in VF
+// mode, the PF otherwise.
+func (a PodAllocation) AllocatedDevice() string {
+	if a.ParentName != "" {
+		return a.ParentName
+	}
+	return a.DeviceName
 }
 
 // AllocationStore is a concurrency-safe map of pod UID → allocated CXI devices.
@@ -169,4 +185,27 @@ func (s *AllocationStore) DeleteClaim(claimUID types.UID) {
 	defer s.mu.Unlock()
 	delete(s.claimToPods, claimUID)
 	delete(s.claimAllocs, claimUID)
+}
+
+// DeviceHolders maps every programmable device named in a stored allocation to
+// who holds it ("pod <uid>", "claim <uid>"). A prepared claim counts until
+// DeleteClaim, so a VF stays held between Prepare and the pod's first record.
+func (s *AllocationStore) DeviceHolders() map[string][]string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make(map[string][]string)
+	for uid, allocs := range s.byPodUID {
+		for _, a := range allocs {
+			out[a.DeviceName] = append(out[a.DeviceName], "pod "+string(uid))
+		}
+	}
+	for uid, allocs := range s.claimAllocs {
+		for _, a := range allocs {
+			out[a.DeviceName] = append(out[a.DeviceName], "claim "+string(uid))
+		}
+	}
+	for _, h := range out {
+		slices.Sort(h)
+	}
+	return out
 }

@@ -229,7 +229,7 @@ func main() {
 
 	binder := driver.NewClaimBinder(d, kubeClient, *driverName, *nodeName)
 
-	nriPlugin, err := nri.New(d.Store(), mock, d.RemovePending, binder.TriggerRetry, d.RecordSvcID, sysSvcIDs, *netnsSysfsRoot)
+	nriPlugin, err := nri.New(d.Store(), mock, d.RemovePending, binder.TriggerRetry, d.RecordSvcID, d.AvailableFor, sysSvcIDs, *netnsSysfsRoot)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: failed to create NRI plugin: %v\n", err)
 		os.Exit(1)

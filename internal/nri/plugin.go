@@ -51,8 +51,9 @@ type Plugin struct {
 	systemSvcIDs     map[int]bool    // blessed system-service svc_ids (--system-svc-ids); destroyService refuses to delete these
 	onServiceCreated func(types.UID) // called with claimUID after service creation
 	onServiceDeleted func()          // called after any service is deleted, triggers binder retry
-	recordSvcID      func(ctx context.Context, claimUID types.UID, claimNs, claimName, deviceName string, vni, svcID int)
-	netSysfsRoot     string // root dir for per-pod synthetic /sys/class/net trees; "" disables HSN sysfs injection
+	recordSvcID      func(ctx context.Context, alloc driver.PodAllocation, svcID int)
+	availableFor     func(driver.PodAllocation) (cxi.ResourceSet, error) // live capacity an allocation must fit
+	netSysfsRoot     string                                              // root dir for per-pod synthetic /sys/class/net trees; "" disables HSN sysfs injection
 	mu               sync.Mutex
 	podStates        map[types.UID]*podState
 	deviceMu         sync.Map // map[string]*sync.Mutex — one mutex per device name
@@ -66,9 +67,13 @@ type Plugin struct {
 // onServiceDeleted is called after any service is deleted so the ClaimBinder
 // can immediately re-evaluate claims waiting in Ready=False.
 //
-// recordSvcID is called per (claim, device) after CreateService succeeds, to
-// publish the VNI and svc_id on the claim's status for operator introspection
-// (`kubectl describe resourceclaim`). Best-effort; informational only.
+// recordSvcID is called per allocation after CreateService succeeds, to
+// publish the VNI, svc_id and backing VF on the claim's status for operator
+// introspection (`kubectl describe resourceclaim`). Best-effort; informational only.
+//
+// availableFor returns the live capacity an allocation must fit before its
+// service is created: the parent's remaining budget in VF mode, the PF's free
+// resources otherwise.
 //
 // systemSvcIDs are the blessed system-service svc_ids (--system-svc-ids). The
 // plugin never deletes a service whose id is in this set — see destroyService.
@@ -83,7 +88,8 @@ func New(
 	mock bool,
 	onServiceCreated func(types.UID),
 	onServiceDeleted func(),
-	recordSvcID func(ctx context.Context, claimUID types.UID, claimNs, claimName, deviceName string, vni, svcID int),
+	recordSvcID func(ctx context.Context, alloc driver.PodAllocation, svcID int),
+	availableFor func(driver.PodAllocation) (cxi.ResourceSet, error),
 	systemSvcIDs []int,
 	netSysfsRoot string,
 ) (*Plugin, error) {
@@ -113,6 +119,7 @@ func New(
 		onServiceCreated: onServiceCreated,
 		onServiceDeleted: onServiceDeleted,
 		recordSvcID:      recordSvcID,
+		availableFor:     availableFor,
 		netSysfsRoot:     netSysfsRoot,
 		podStates:        make(map[types.UID]*podState),
 	}
@@ -155,12 +162,22 @@ func (p *Plugin) Run(ctx context.Context) error {
 	}
 }
 
-// getDeviceLock returns the per-device mutex, creating it if needed.
-// Serialising RunPodSandbox calls per device makes the fit-check + service
-// creation atomic with respect to other concurrent pod starts on the same device.
+// getDeviceLock returns the mutex for a lock key, creating it if needed.
+// Serialising RunPodSandbox calls per key makes the fit-check + service
+// creation atomic with respect to other concurrent pod starts drawing on the
+// same budget.
 func (p *Plugin) getDeviceLock(name string) *sync.Mutex {
 	v, _ := p.deviceMu.LoadOrStore(name, &sync.Mutex{})
 	return v.(*sync.Mutex)
+}
+
+// lockKey is the budget an allocation draws on: its parent in VF mode (sibling
+// VFs share it), its device otherwise.
+func lockKey(alloc driver.PodAllocation) string {
+	if alloc.ParentName != "" {
+		return alloc.ParentName
+	}
+	return alloc.DeviceName
 }
 
 // destroyService deletes the service identified by (devName, svcID), unless
@@ -247,12 +264,12 @@ func (p *Plugin) RunPodSandbox(ctx context.Context, pod *api.PodSandbox) error {
 				alloc.DeviceName, alloc.VNI, driver.MinVNI, driver.MaxVNI)
 		}
 
-		// Per-device mutex: serialise fit-check + CreateService so that
-		// concurrent pod starts on the same device don't race each other.
-		mu := p.getDeviceLock(alloc.DeviceName)
+		// Per-budget mutex: serialise fit-check + CreateService so that
+		// concurrent pod starts on the same device (or parent) don't race.
+		mu := p.getDeviceLock(lockKey(alloc))
 		mu.Lock()
 
-		avail, err := cxi.ReadAvailableCapacity(alloc.DeviceName)
+		avail, err := p.availableFor(alloc)
 		if err != nil {
 			mu.Unlock()
 			rollback()
@@ -276,10 +293,9 @@ func (p *Plugin) RunPodSandbox(ctx context.Context, pod *api.PodSandbox) error {
 		}
 		state.svcIDs[alloc.DeviceName] = svcID
 
-		// Publish VNI + svc_id on the claim's status for operator introspection.
+		// Publish VNI, svc_id and the VF on the claim's status for operator introspection.
 		if alloc.ClaimUID != "" {
-			p.recordSvcID(ctx, alloc.ClaimUID, alloc.ClaimNamespace, alloc.ClaimName,
-				alloc.DeviceName, alloc.VNI, svcID)
+			p.recordSvcID(ctx, alloc, svcID)
 		}
 	}
 

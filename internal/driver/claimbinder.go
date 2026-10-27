@@ -186,15 +186,15 @@ func (b *ClaimBinder) evaluateClaim(ctx context.Context, claim *resourceapi.Reso
 	// Keep the claim in falseClaims when a pod's hint could not be written, so
 	// the ticker retries it; the watch would not fire again on its own.
 	anyPending := !b.driver.recordSharedClaimPods(ctx, claim)
-	// Release any pending grant this claim held for a device that is no longer
+	// Release any pending grant this claim held for a result that is no longer
 	// in the current allocation (subset reallocation without an intervening
 	// Allocation=nil). Without this, the dropped device's pending grant would
 	// leak and understate its effective capacity.
-	currentDevs := make(map[string]bool, len(devices))
+	current := make(map[pendingKey]bool, len(devices))
 	for _, dr := range devices {
-		currentDevs[dr.result.Device] = true
+		current[pendingKey{deviceName: dr.result.Device, shareID: shareIDOf(*dr.result)}] = true
 	}
-	b.driver.reconcileClaimDevices(claim.UID, currentDevs)
+	b.driver.reconcileClaimDevices(claim.UID, current)
 
 	// A claim with a count>1 request allocates several devices. The scheduler
 	// will not bind the pod until EVERY allocated device's Ready binding
@@ -203,9 +203,10 @@ func (b *ClaimBinder) evaluateClaim(ctx context.Context, claim *resourceapi.Reso
 	// so the claim stays in falseClaims for retry.
 	for _, dr := range devices {
 		result, requested := dr.result, dr.requested
+		shareID := shareIDOf(*result)
 
 		// Already granted — pending entry exists, service not yet created.
-		if b.driver.hasPending(claim.UID, result.Device) {
+		if b.driver.hasPending(claim.UID, result.Device, shareID) {
 			continue
 		}
 		// Already granted and service was created (or being torn down).
@@ -213,11 +214,12 @@ func (b *ClaimBinder) evaluateClaim(ctx context.Context, claim *resourceapi.Reso
 			continue
 		}
 
-		// Read hardware capacity outside the lock to avoid blocking the mutex
-		// during I/O. Do NOT subtract the device's reserved set —
-		// ReadAvailableCapacity already reflects all running service consumption
-		// including the blessed system services (--system-svc-ids).
-		hwAvail, readErr := cxi.ReadAvailableCapacity(result.Device)
+		// Read live capacity outside the lock to avoid blocking the mutex
+		// during I/O: the parent's remaining budget in VF mode, the PF's free
+		// resources otherwise. Do NOT subtract the device's reserved set —
+		// it already reflects all running service consumption including the
+		// blessed system services (--system-svc-ids).
+		hwAvail, readErr := b.driver.liveAvailable(result.Device)
 		if readErr != nil {
 			// Skip this device this cycle; using zero capacity would
 			// incorrectly trigger Unschedulable for a transient read failure.
@@ -236,7 +238,7 @@ func (b *ClaimBinder) evaluateClaim(ctx context.Context, claim *resourceapi.Reso
 		//  3. hwAvail               can't fit alone      → Unschedulable
 		//                                                 (DeviceAtCapacity)
 		granted := b.driver.checkAndAddPending(
-			claim.UID, result.Device, requested, hwAvail,
+			claim.UID, result.Device, shareID, requested, hwAvail,
 		)
 		switch {
 		case granted:
@@ -354,14 +356,15 @@ func (b *ClaimBinder) findOurDevices(claim *resourceapi.ResourceClaim) ([]device
 }
 
 // getCondition returns the named condition from the claim's AllocatedDeviceStatus
-// for the given allocation result, or nil if not found.
+// for the given allocation result (matched on ShareID too), or nil if not found.
 func (b *ClaimBinder) getCondition(
 	claim *resourceapi.ResourceClaim,
 	result *resourceapi.DeviceRequestAllocationResult,
 	condType string,
 ) *metav1.Condition {
 	for _, dev := range claim.Status.Devices {
-		if dev.Driver != result.Driver || dev.Pool != result.Pool || dev.Device != result.Device {
+		if dev.Driver != result.Driver || dev.Pool != result.Pool || dev.Device != result.Device ||
+			deref(dev.ShareID) != shareIDOf(*result) {
 			continue
 		}
 		for i, c := range dev.Conditions {
@@ -419,9 +422,11 @@ func (b *ClaimBinder) setCondition(
 
 		// Re-find the current allocation result for this device in the
 		// latest claim. The ShareID may differ from result if the scheduler
-		// re-allocated the claim between evaluateClaim and this write.
+		// re-allocated the claim between evaluateClaim and this write; a
+		// result with the same ShareID is preferred so two results on one
+		// shared device each get their own condition.
 		// If the device is no longer allocated, the condition is moot.
-		latestResult := findAllocationResult(latest, result.Driver, result.Pool, result.Device)
+		latestResult := findAllocationResult(latest, result.Driver, result.Pool, result.Device, shareIDOf(*result))
 		if latestResult == nil {
 			return
 		}
@@ -443,21 +448,36 @@ func (b *ClaimBinder) setCondition(
 		condType, claim.Namespace, claim.Name, maxRetries)
 }
 
-// findAllocationResult returns the first allocation result in the claim that
-// matches the given driver, pool, and device name, or nil if not found.
+// findAllocationResult returns the allocation result in the claim for the
+// given driver, pool and device with ShareID shareID, or else the first one
+// for that device, or nil if the device is not allocated.
 func findAllocationResult(
 	claim *resourceapi.ResourceClaim,
-	driver, pool, device string,
+	driver, pool, device, shareID string,
 ) *resourceapi.DeviceRequestAllocationResult {
 	if claim.Status.Allocation == nil {
 		return nil
 	}
+	var first *resourceapi.DeviceRequestAllocationResult
 	for i, r := range claim.Status.Allocation.Devices.Results {
-		if r.Driver == driver && r.Pool == pool && r.Device == device {
+		if r.Driver != driver || r.Pool != pool || r.Device != device {
+			continue
+		}
+		if shareIDOf(r) == shareID {
 			return &claim.Status.Allocation.Devices.Results[i]
 		}
+		if first == nil {
+			first = &claim.Status.Allocation.Devices.Results[i]
+		}
 	}
-	return nil
+	return first
+}
+
+func deref(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
 }
 
 // upsertDeviceCondition sets or updates a condition in the claim's
