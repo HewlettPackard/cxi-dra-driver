@@ -1,6 +1,7 @@
 package cxi
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -38,7 +39,8 @@ type Device struct {
 	// In non-cxi builds DeviceCapacity() is used. Discovery hard-fails if
 	// capacity cannot be read in production. Zero for a VF until its parent
 	// service's budget is read: a VF's own devinfo reports
-	// whole-NIC limits that its parent cannot honour, so no request may fit yet.
+	// whole-NIC limits that its parent cannot honour, so no request may fit
+	// until VF parent-budget accounting is wired into the driver.
 	Capacity ResourceSet
 
 	// Reserved holds the resources consumed by the blessed system services
@@ -60,7 +62,8 @@ type Device struct {
 	VFIndex int
 
 	// ParentSvcID is the svc_id of the parent service assigned to a VF.
-	// Placeholder: resolved from the PF sysfs by parent-service resolution; 0 until then.
+	// Read from the PF's sysfs vf/<N>/svc_id; always non-zero for a discovered
+	// VF (unassigned VFs are dropped) and 0 for a PF.
 	ParentSvcID int
 
 	// PodIfName is the pod-side interface name the CNI gives this device.
@@ -104,19 +107,38 @@ type discoverer struct {
 	netPath      string
 	readCapacity func(name string) (ResourceSet, error)
 	readReserved func(name string, svcIDs []int) (ResourceSet, error)
-	logf         func(format string, args ...any)
+	// pfClassPath holds the PFs' vf/<N>/svc_id files.
+	pfClassPath string
+	// parentHasLimits reports whether the kernel enforces resource limits on
+	// a parent service. Production discovery wires this to ReadParentBudget;
+	// tests can inject the result to isolate sysfs discovery behavior.
+	parentHasLimits func(pfName string, svcID int) (bool, error)
+	logf            func(format string, args ...any)
 }
 
 func newDiscoverer() *discoverer {
 	return &discoverer{
-		classPath:    sysfsClassPath,
-		netPath:      sysfsNetPath(),
-		readCapacity: readDeviceCapacity,
-		readReserved: readReservedForSvcs,
+		classPath:       sysfsClassPath,
+		netPath:         sysfsNetPath(),
+		readCapacity:    readDeviceCapacity,
+		readReserved:    readReservedForSvcs,
+		pfClassPath:     sysfsPFClassPath,
+		parentHasLimits: parentHasResourceLimits,
 		logf: func(format string, args ...any) {
 			log.Printf("cxi-dra-driver: "+format, args...)
 		},
 	}
+}
+
+func parentHasResourceLimits(pfName string, svcID int) (bool, error) {
+	_, _, err := ReadParentBudget(pfName, svcID)
+	if errors.Is(err, ErrParentUnlimited) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // candidate is one cxi* sysfs entry, classified from sysfs alone.
@@ -187,13 +209,19 @@ func (x *discoverer) discover(opts DiscoverOptions) ([]*Device, error) {
 			}
 		}
 
+		devices = append(devices, dev)
+	}
+
+	if opts.VFOnly {
+		devices = x.dropUnlimitedParents(devices)
+		x.warnPFsWithoutVFs(cands)
+	}
+	for _, dev := range devices {
 		if err := pairDevice(dev, x.netPath); err != nil {
 			// Best-effort, but the CNI rejects a hint with an empty hsn_iface.
 			x.logf("WARNING: device %s has no paired netdev (hsn_iface will be empty, CNI attach will fail): %v", dev.Name, err)
 		}
-		devices = append(devices, dev)
 	}
-
 	if opts.VFOnly && len(devices) == 0 {
 		x.logf("ERROR: --vf-only found no usable SR-IOV VF; publishing an empty ResourceSlice")
 	}
@@ -259,11 +287,66 @@ func (x *discoverer) buildVF(c candidate, pfByPCI map[string]string) (*Device, e
 	if err != nil {
 		return nil, fmt.Errorf("PF %s: %w", pfName, err)
 	}
+	svcID, err := readParentSvcID(x.pfClassPath, pfName, vfIdx)
+	if err != nil {
+		return nil, fmt.Errorf("PF %s vf %d: %w", pfName, vfIdx, err)
+	}
 	dev := baseDevice(c)
 	dev.FunctionType = FunctionVF
 	dev.PFName = pfName
 	dev.VFIndex = vfIdx
+	dev.ParentSvcID = svcID
 	return dev, nil
+}
+
+// dropUnlimitedParents drops the VFs of every parent without resource limits:
+// the budget model needs the kernel to enforce a per-parent budget.
+func (x *discoverer) dropUnlimitedParents(vfs []*Device) []*Device {
+	if x.parentHasLimits == nil {
+		return vfs
+	}
+	drop := make(map[*Device]bool)
+	for _, p := range Parents(vfs) {
+		ok, err := x.parentHasLimits(p.PFName, p.SvcID)
+		var reason string
+		switch {
+		case err != nil:
+			reason = fmt.Sprintf("cannot read its resource limits: %v", err)
+		case !ok:
+			reason = "it has no resource limits (Resource Limits: No)"
+		default:
+			continue
+		}
+		for _, d := range p.VFs {
+			drop[d] = true
+			x.logf("ERROR: skipping VF %s: parent service %d on PF %s: %s", d.Name, p.SvcID, p.PFName, reason)
+		}
+	}
+	if len(drop) == 0 {
+		return vfs
+	}
+	kept := vfs[:0:0]
+	for _, d := range vfs {
+		if !drop[d] {
+			kept = append(kept, d)
+		}
+	}
+	return kept
+}
+
+// warnPFsWithoutVFs logs every PF that has no VF at all.
+func (x *discoverer) warnPFsWithoutVFs(cands []candidate) {
+	hasVF := make(map[string]bool)
+	for _, c := range cands {
+		if c.isVF {
+			hasVF[c.pfPCI] = true
+		}
+	}
+	for _, c := range cands {
+		if !c.isVF && !hasVF[c.pciPath] {
+			x.logf("WARNING: --vf-only: PF %s has no SR-IOV VFs", c.name)
+		}
+	}
 }
 
 // vfIndex returns N for the PF's virtfnN link that resolves to vfPCI.

@@ -31,4 +31,10 @@ New hardware-facing code should follow this same three-file split — see [.gith
 
 ## Testing
 
+`device_test.go` and `parents_test.go` cover PF/VF discovery, sysfs parent-service
+resolution, and stable grouping by (PF, service ID). `parents_limits_test.go`
+checks discovery's rejection of unlimited or unreadable parents through the
+mock topology. `parents.go` defines `Parent` / `Parents()` and reads each VF's
+assignment from `/sys/class/cxi/<pf>/vf/<N>/svc_id`.
+
 `vniset_test.go` and `parent_test.go` cover `VNISet` and the VF-mode math (parent minus children across VFs, system children, LE/TLE, unlimited parent) against the mock topology; `parent_test.go` is `!cxi`-only because it drives `SetMockTopology`. `hsn_test.go` covers pairing. The rest of `capacity_cgo.go`/`service_cgo.go` requires real hardware, and the mock/stub paths are exercised indirectly through `internal/driver`'s tests and the sibling `cxi-dra-integration-tests` repo. `mock.go` is the fixture to reuse rather than hand-rolling synthetic devices.
