@@ -45,18 +45,19 @@ type podState struct {
 //   - CreateContainer — inject SLINGSHOT_DEVICES, SLINGSHOT_VNIS, SLINGSHOT_SVC_IDS env vars into each container.
 //   - StopPodSandbox  — tear down CXI service when the pod sandbox stops.
 type Plugin struct {
-	stub             stub.Stub
-	store            *driver.AllocationStore
-	svcMgr           cxi.ServiceManager
-	systemSvcIDs     map[int]bool    // blessed system-service svc_ids (--system-svc-ids); destroyService refuses to delete these
-	onServiceCreated func(types.UID) // called with claimUID after service creation
-	onServiceDeleted func()          // called after any service is deleted, triggers binder retry
-	recordSvcID      func(ctx context.Context, alloc driver.PodAllocation, svcID int)
-	availableFor     func(driver.PodAllocation) (cxi.ResourceSet, error) // live capacity an allocation must fit
-	netSysfsRoot     string                                              // root dir for per-pod synthetic /sys/class/net trees; "" disables HSN sysfs injection
-	mu               sync.Mutex
-	podStates        map[types.UID]*podState
-	deviceMu         sync.Map // map[string]*sync.Mutex — one mutex per device name
+	stub              stub.Stub
+	store             *driver.AllocationStore
+	svcMgr            cxi.ServiceManager
+	systemSvcIDs      map[int]bool    // blessed system-service svc_ids (--system-svc-ids); destroyService refuses to delete these
+	onServiceCreated  func(types.UID) // called with claimUID after service creation
+	onServiceDeleted  func()          // called after any service is deleted, triggers binder retry
+	recordSvcID       func(ctx context.Context, alloc driver.PodAllocation, svcID int)
+	availableFor      func(driver.PodAllocation) (cxi.ResourceSet, error) // live capacity an allocation must fit
+	serviceOptionsFor func(driver.PodAllocation) (cxi.ServiceOptions, error)
+	netSysfsRoot      string // root dir for per-pod synthetic /sys/class/net trees; "" disables HSN sysfs injection
+	mu                sync.Mutex
+	podStates         map[types.UID]*podState
+	deviceMu          sync.Map // map[string]*sync.Mutex — one mutex per device name
 }
 
 // New creates a new NRI plugin.
@@ -75,6 +76,9 @@ type Plugin struct {
 // service is created: the parent's remaining budget in VF mode, the PF's free
 // resources otherwise.
 //
+// serviceOptionsFor supplies the discovered parent and sibling VF list for VF
+// child creation, or empty options for unchanged PF service behavior.
+//
 // systemSvcIDs are the blessed system-service svc_ids (--system-svc-ids). The
 // plugin never deletes a service whose id is in this set — see destroyService.
 // In mock mode the mock svc_id counter is seeded past the highest blessed id so
@@ -90,6 +94,7 @@ func New(
 	onServiceDeleted func(),
 	recordSvcID func(ctx context.Context, alloc driver.PodAllocation, svcID int),
 	availableFor func(driver.PodAllocation) (cxi.ResourceSet, error),
+	serviceOptionsFor func(driver.PodAllocation) (cxi.ServiceOptions, error),
 	systemSvcIDs []int,
 	netSysfsRoot string,
 ) (*Plugin, error) {
@@ -113,15 +118,16 @@ func New(
 		blessed[id] = true
 	}
 	p := &Plugin{
-		store:            store,
-		svcMgr:           svcMgr,
-		systemSvcIDs:     blessed,
-		onServiceCreated: onServiceCreated,
-		onServiceDeleted: onServiceDeleted,
-		recordSvcID:      recordSvcID,
-		availableFor:     availableFor,
-		netSysfsRoot:     netSysfsRoot,
-		podStates:        make(map[types.UID]*podState),
+		store:             store,
+		svcMgr:            svcMgr,
+		systemSvcIDs:      blessed,
+		onServiceCreated:  onServiceCreated,
+		onServiceDeleted:  onServiceDeleted,
+		recordSvcID:       recordSvcID,
+		availableFor:      availableFor,
+		serviceOptionsFor: serviceOptionsFor,
+		netSysfsRoot:      netSysfsRoot,
+		podStates:         make(map[types.UID]*podState),
 	}
 	var err error
 	p.stub, err = stub.New(p,
@@ -284,7 +290,13 @@ func (p *Plugin) RunPodSandbox(ctx context.Context, pod *api.PodSandbox) error {
 
 		fmt.Printf("cxi-nri: creating service: pod=%s device=%s hsn=%s netns=%s inode=%d vni=%d\n",
 			podUID, alloc.DeviceName, alloc.HSNIface, netnsPath, inode, alloc.VNI)
-		svcID, err := p.svcMgr.CreateService(alloc.DeviceName, inode, alloc.VNI, alloc.Resources)
+		options, err := p.serviceOptionsFor(alloc)
+		if err != nil {
+			mu.Unlock()
+			rollback()
+			return fmt.Errorf("resolving CXI service parent for %s: %w", alloc.DeviceName, err)
+		}
+		svcID, err := p.svcMgr.CreateService(alloc.DeviceName, inode, alloc.VNI, alloc.Resources, options)
 		mu.Unlock()
 
 		if err != nil {

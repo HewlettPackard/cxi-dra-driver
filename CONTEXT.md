@@ -41,6 +41,12 @@ This repository implements the **CXI DRA driver** — a Kubernetes Dynamic Resou
 
 ## Domain model
 
+VF service creation passes the discovered `cxi.Parent` through
+`Driver.ServiceOptionsFor` and NRI to `ServiceManager.CreateService` as optional
+`ServiceOptions`. `ParentDescriptor.LEMax` is the parent's LE maximum, distinct
+from its reserved LE budget: children use that maximum and reserve zero LEs/TLEs.
+PF calls without options retain their existing behavior.
+
 | Concept | Meaning |
 |---------|---------|
 | **DRA** | Kubernetes `resource.k8s.io` API for allocating specialized hardware (here, CXI NICs) via `ResourceClaim`/`ResourceClaimTemplate` |

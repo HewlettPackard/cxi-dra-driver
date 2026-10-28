@@ -163,5 +163,19 @@ func (d *Driver) AvailableFor(alloc PodAllocation) (cxi.ResourceSet, error) {
 	if alloc.ParentName != "" {
 		return d.liveAvailable(alloc.ParentName)
 	}
+
 	return cxi.ReadAvailableCapacity(alloc.DeviceName)
+}
+
+// ServiceOptionsFor supplies the discovered parent and sibling VFs for child
+// creation. PF allocations retain the default service behavior.
+func (d *Driver) ServiceOptionsFor(alloc PodAllocation) (cxi.ServiceOptions, error) {
+	if alloc.ParentName == "" {
+		return cxi.ServiceOptions{}, nil
+	}
+	parent, ok := d.parents.get(alloc.ParentName)
+	if !ok {
+		return cxi.ServiceOptions{}, fmt.Errorf("no discovered parent %s for VF %s", alloc.ParentName, alloc.DeviceName)
+	}
+	return cxi.ServiceOptions{Parent: parent.Parent}, nil
 }

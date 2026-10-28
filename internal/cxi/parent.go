@@ -19,6 +19,8 @@ type ParentDescriptor struct {
 	ResourceLimits bool
 	// Limits holds limits.*.res — the budget shared by the parent's VFs.
 	Limits ResourceSet
+	// LEMax is limits.les.max, not the reserved LE budget in Limits.LEs.
+	LEMax int64
 	// VNIs is the set of VNIs the parent allows.
 	VNIs VNISet
 }
