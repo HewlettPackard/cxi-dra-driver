@@ -31,6 +31,25 @@ New hardware-facing code should follow this same three-file split — see [.gith
 
 ## Testing
 
+VF child creation accepts `ServiceOptions{Parent: parent}`; existing calls without
+options preserve PF behavior. The child uses the parent's `limits.les.max`
+(`ParentDescriptor.LEMax`), reserves no LEs/TLEs, and restricts itself to one VNI.
+The six tracked resources retain `res == max`. The mock serializes budget checks
+and updates across sibling VFs, includes system reservations, rejects out-of-set
+VNIs/overcommit, and releases reservations on deletion.
+VF creation errors identify the failing operation; parent-budget and VNI/descriptor
+diagnostics apply only to allocation errors, not later configuration failures.
+The optional argument preserves existing PF calls, but implementations of the
+`ServiceManager` interface must accept the variadic `ServiceOptions` parameter.
+
+`service_failure_test.go` compiles the production C creation routine against fake
+libcxi calls using `cc` (no hardware or libcxi headers needed). It forces open,
+allocation, disable, netns-binding, enable, and destroy failures for PF and VF
+requests. It checks operation ordering, destruction of the allocated service,
+simulated reservation release, device closure, preservation of the original
+error, and orphan warnings when destruction fails. These checks skip explicitly
+if `cc` is unavailable. They do not prove real-kernel cleanup under failure.
+
 `device_test.go` and `parents_test.go` cover PF/VF discovery, sysfs parent-service
 resolution, and stable grouping by (PF, service ID). `parents_limits_test.go`
 checks discovery's rejection of unlimited or unreadable parents through the

@@ -89,7 +89,7 @@ This produces a real netdev with an IP on the HSN, for anything that needs IP ov
 containerd calls this driver's NRI plugin at `RunPodSandbox`, once the pod's network namespace exists. The plugin:
 
 1. Reads the `PodAllocation` `PrepareResourceClaims` stored in `AllocationStore`.
-2. Creates the CXI service on the hardware (`internal/cxi.ServiceManager` — `cxil_alloc_svc` → `cxil_svc_set_netns` → `cxil_svc_enable`), scoped to the pod's netns and the namespace's VNI.
+2. Creates the CXI service on the hardware (`internal/cxi.ServiceManager` — allocate → disable → set netns → enable), scoped to the pod's netns and the namespace's VNI. For VF allocations, `Driver.ServiceOptionsFor` supplies the discovered parent and sibling VFs: the child reserves zero LEs/TLEs and uses the parent's LE maximum rather than device-wide devinfo. PF calls retain their existing behavior.
 3. Performs a **live** fit-check (the hardware might have less room than the static check in §3.4 assumed, if concurrent pods started since).
 4. Builds a synthetic `/sys/class/net` tree (`internal/netsysfs.Build`) replicating the pod's real interfaces plus a synthetic HSN entry with `operstate=up`/`carrier=1`/a `device` symlink, and bind-mounts it over the pod's own `/sys/class/net` (`netns_linux.go`) — this is required because stock (unpatched) libfabric expects to find the HSN interface there, and the real `/sys/class/net` is read-only and namespace-scoped.
 

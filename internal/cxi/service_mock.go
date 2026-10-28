@@ -27,7 +27,40 @@ func SeedMockSvcIDCounter(base int64) {
 	atomic.StoreInt64(&mockSvcIDCounter, base)
 }
 
-func (MockServiceManager) CreateService(deviceName string, netnsInode uint64, vni int, resources ResourceSet) (int, error) {
+func (MockServiceManager) CreateService(deviceName string, netnsInode uint64, vni int, resources ResourceSet, options ...ServiceOptions) (int, error) {
+	parent, err := serviceParent(deviceName, resources, options)
+	if err != nil {
+		return 0, err
+	}
+	leMax := resources.LEs
+	if parent != nil {
+		mockTopologyMu.Lock()
+		defer mockTopologyMu.Unlock()
+		var desc ParentDescriptor
+		found := false
+		for _, p := range mockTopology.Parents {
+			if p.PFName == parent.PFName && p.SvcID == parent.SvcID {
+				desc, found = p.Descriptor, true
+				break
+			}
+		}
+		if !found {
+			return 0, fmt.Errorf("cxi-mock: no parent %s", parent.Name())
+		}
+		if err := validateChild(parent, desc, vni); err != nil {
+			return 0, err
+		}
+		var used ResourceSet
+		for _, vf := range parent.VFs {
+			used = used.Add(sumReservations(mockTopology.VFServices[vf.Name], false))
+		}
+		remaining := desc.Limits.Sub(used)
+		remaining.LEs, remaining.TLEs = 0, 0
+		if !resources.Fits(remaining) {
+			return 0, fmt.Errorf("cxi-mock: VF %s exceeds shared parent %s budget (ENOSPC): requested %s, remaining %s", deviceName, parent.Name(), resources, remaining)
+		}
+		leMax = desc.LEMax
+	}
 	if err := os.MkdirAll(mockServiceDir, 0o755); err != nil {
 		return 0, fmt.Errorf("creating mock service dir: %w", err)
 	}
@@ -73,24 +106,45 @@ members:
 		resources.ACs, resources.ACs,
 		resources.CTs, resources.CTs,
 		resources.EQs, resources.EQs,
-		resources.LEs, resources.LEs,
+		leMax, resources.LEs,
 		resources.PTEs, resources.PTEs,
 		resources.TGQs, resources.TGQs,
 		resources.TXQs, resources.TXQs,
 		resources.TLEs, resources.TLEs,
 		vni, netnsInode)
 	svcID := int(atomic.AddInt64(&mockSvcIDCounter, 1))
+	if parent != nil {
+		for slices.ContainsFunc(mockTopology.VFServices[deviceName], func(s ServiceReservation) bool { return s.SvcID == svcID }) {
+			svcID = int(atomic.AddInt64(&mockSvcIDCounter, 1))
+		}
+	}
 	path := MockServicePath(deviceName, svcID)
 	if err := os.WriteFile(path, []byte(yaml), 0o644); err != nil {
 		return 0, fmt.Errorf("writing mock service file %s: %w", path, err)
+	}
+	if parent != nil {
+		if mockTopology.VFServices == nil {
+			mockTopology.VFServices = make(map[string][]ServiceReservation)
+		}
+		mockTopology.VFServices[deviceName] = append(mockTopology.VFServices[deviceName],
+			ServiceReservation{SvcID: svcID, ResourceLimits: true, Res: resources})
+		mockCreatedServices[MockServicePath(deviceName, svcID)] = true
 	}
 	fmt.Printf("cxi-mock: wrote CXI service file: %s\n", path)
 	return svcID, nil
 }
 func (MockServiceManager) DeleteService(deviceName string, svcID int) error {
+	mockTopologyMu.Lock()
+	defer mockTopologyMu.Unlock()
 	path := MockServicePath(deviceName, svcID)
 	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("removing mock service file %s: %w", path, err)
+	}
+	if mockCreatedServices[path] {
+		mockTopology.VFServices[deviceName] = slices.DeleteFunc(mockTopology.VFServices[deviceName], func(s ServiceReservation) bool {
+			return s.SvcID == svcID
+		})
+		delete(mockCreatedServices, path)
 	}
 	fmt.Printf("cxi-mock: removed CXI service file: %s\n", path)
 	return nil
@@ -116,8 +170,9 @@ type MockTopology struct {
 }
 
 var (
-	mockTopologyMu sync.RWMutex
-	mockTopology   MockTopology
+	mockTopologyMu      sync.RWMutex
+	mockTopology        MockTopology
+	mockCreatedServices = make(map[string]bool)
 )
 
 // SetMockTopology installs the topology the mock parent reads answer from.
@@ -125,6 +180,7 @@ func SetMockTopology(t MockTopology) {
 	mockTopologyMu.Lock()
 	defer mockTopologyMu.Unlock()
 	mockTopology = t
+	mockCreatedServices = make(map[string]bool)
 }
 
 // ResetMockTopology clears the mock topology.

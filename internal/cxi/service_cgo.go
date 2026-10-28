@@ -168,8 +168,10 @@ static int cxi_reserved_for_svcs(const char *device, const int *ids, int n,
 // accepts the call. SHS14 requires the service to be disabled before
 // cxil_svc_set_netns and re-enabled after.
 static int cxi_create_service(const char *device, uint64_t netns_inode, int vni,
-                               resource_args res)
+                               resource_args res, int is_vf, uint32_t parent_le_max,
+                               const char **failed_operation)
 {
+    *failed_operation = "open device";
     struct cxil_dev *dev = NULL;
     int dev_idx = device_index(device);
     if (dev_idx < 0)
@@ -210,8 +212,15 @@ static int cxi_create_service(const char *device, uint64_t netns_inode, int vni,
     desc.limits.ptes.res = (uint16_t)res.ptes; desc.limits.ptes.max = (uint16_t)res.ptes;
     desc.limits.les.res  = (uint32_t)res.les;  desc.limits.les.max  = (uint32_t)dev->info.num_les;
     desc.limits.acs.res  = (uint16_t)res.acs;  desc.limits.acs.max  = (uint16_t)res.acs;
+    if (is_vf) {
+        desc.limits.les.res = 0;
+        desc.limits.les.max = parent_le_max;
+        desc.limits.tles.res = 0;
+        desc.limits.tles.max = 0;
+    }
 
     struct cxi_svc_fail_info fail_info = {0};
+    *failed_operation = "allocate";
     rc = cxil_alloc_svc(dev, &desc, &fail_info);
     if (rc <= 0) {
         fprintf(stderr, "cxi_wrapper: cxil_alloc_svc failed: %d\n", rc);
@@ -223,6 +232,7 @@ static int cxi_create_service(const char *device, uint64_t netns_inode, int vni,
 
     // SHS14: cxil_svc_set_netns requires the service to be disabled first;
     // re-enable after. See libcxi tests/libcxi_test_svc.c and utils/cxi_service.c.
+    *failed_operation = "disable";
     rc = cxil_svc_enable(dev, svc_id, false);
     if (rc != 0) {
         fprintf(stderr, "cxi_wrapper: cxil_svc_enable(%d, false) failed: %d\n", svc_id, rc);
@@ -234,6 +244,7 @@ static int cxi_create_service(const char *device, uint64_t netns_inode, int vni,
     }
 
     // SHS14: associate the pod network namespace with this service.
+    *failed_operation = "set netns";
     rc = cxil_svc_set_netns(dev, svc_id, (unsigned int)netns_inode);
     if (rc != 0) {
         fprintf(stderr, "cxi_wrapper: cxil_svc_set_netns(%d, inode=%llu) failed: %d\n",
@@ -246,6 +257,7 @@ static int cxi_create_service(const char *device, uint64_t netns_inode, int vni,
         return rc;
     }
 
+    *failed_operation = "enable";
     rc = cxil_svc_enable(dev, svc_id, true);
     if (rc != 0) {
         fprintf(stderr, "cxi_wrapper: cxil_svc_enable(%d, true) failed: %d\n", svc_id, rc);
@@ -295,6 +307,7 @@ static int cxi_destroy_service(const char *device, int svc_id)
 // range (restricted_vnis unset, read via cxil_svc_get_vni_range).
 typedef struct {
     resource_args limits;
+    uint32_t le_max;
     int resource_limits;
     int restricted_vnis;
     int num_vnis;
@@ -336,6 +349,7 @@ static int cxi_read_parent(const char *device, int svc_id, parent_desc_args *out
     out->limits.tles = desc.limits.tles.res;
     out->limits.ptes = desc.limits.ptes.res;
     out->limits.les  = desc.limits.les.res;
+    out->le_max = desc.limits.les.max;
     out->limits.acs  = desc.limits.acs.res;
 
     if (desc.restricted_vnis) {
@@ -580,7 +594,23 @@ func readReservedForSvcs(deviceName string, svcIDs []int) (ResourceSet, error) {
 	}, nil
 }
 
-func (CXIServiceManager) CreateService(deviceName string, netnsInode uint64, vni int, resources ResourceSet) (int, error) {
+func (CXIServiceManager) CreateService(deviceName string, netnsInode uint64, vni int, resources ResourceSet, options ...ServiceOptions) (int, error) {
+	parent, err := serviceParent(deviceName, resources, options)
+	if err != nil {
+		return 0, err
+	}
+	var isVF C.int
+	var leMax C.uint32_t
+	if parent != nil {
+		desc, err := readParentDescriptor(parent.PFName, parent.SvcID)
+		if err != nil {
+			return 0, fmt.Errorf("reading parent %s before child creation: %w", parent.Name(), err)
+		}
+		if err := validateChild(parent, desc, vni); err != nil {
+			return 0, err
+		}
+		isVF, leMax = 1, C.uint32_t(desc.LEMax)
+	}
 	cDev := C.CString(deviceName)
 	defer C.free(unsafe.Pointer(cDev))
 
@@ -594,8 +624,12 @@ func (CXIServiceManager) CreateService(deviceName string, netnsInode uint64, vni
 		les:  C.int64_t(resources.LEs),
 		acs:  C.int64_t(resources.ACs),
 	}
-	rc := C.cxi_create_service(cDev, C.uint64_t(netnsInode), C.int(vni), res)
+	var operation *C.char
+	rc := C.cxi_create_service(cDev, C.uint64_t(netnsInode), C.int(vni), res, isVF, leMax, &operation)
 	if rc <= 0 {
+		if parent != nil {
+			return 0, childCreationError(deviceName, parent, vni, C.GoString(operation), int(rc))
+		}
 		return 0, fmt.Errorf("cxi_create_service(%s, inode=%d, vni=%d) returned %d",
 			deviceName, netnsInode, vni, int(rc))
 	}
@@ -707,6 +741,7 @@ func readParentDescriptor(pfName string, svcID int) (ParentDescriptor, error) {
 	desc := ParentDescriptor{
 		ResourceLimits: raw.resource_limits != 0,
 		Limits:         rawResources(raw.limits),
+		LEMax:          int64(raw.le_max),
 	}
 	if !desc.ResourceLimits {
 		return desc, nil
