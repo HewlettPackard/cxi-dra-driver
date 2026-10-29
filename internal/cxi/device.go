@@ -38,7 +38,7 @@ type Device struct {
 	// read from cxil_devinfo via libcxi at discovery time (production builds).
 	// In non-cxi builds DeviceCapacity() is used. Discovery hard-fails if
 	// capacity cannot be read in production. Zero for a VF until its parent
-	// service's budget is read (SSHOTECO-120/123): a VF's own devinfo reports
+	// service's budget is read: a VF's own devinfo reports
 	// whole-NIC limits that its parent cannot honour, so no request may fit
 	// until VF parent-budget accounting is wired into the driver.
 	Capacity ResourceSet
@@ -67,7 +67,7 @@ type Device struct {
 	ParentSvcID int
 
 	// PodIfName is the pod-side interface name the CNI gives this device.
-	// Placeholder for SSHOTECO-125; empty until then.
+	// Placeholder for now; empty until implemented.
 	PodIfName string
 }
 

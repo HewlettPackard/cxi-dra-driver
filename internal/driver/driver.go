@@ -107,6 +107,15 @@ type Driver struct {
 	reapSvcMgr   cxi.ServiceManager
 	liveSvcIDs   func() map[string]map[int]bool
 	reaperMisses map[reapKey]int
+
+	// reaperCycle counts reap passes that scanned services; reaperWarned records the
+	// cycle each unattributable VF child was last reported on, so the warning
+	// is not repeated every cycle.
+	reaperCycle  int
+	reaperWarned map[reapKey]int
+
+	// logFn replaces the stdout logger when set; for tests.
+	logFn func(format string, args ...any)
 }
 
 func New(cfg Config) *Driver {
@@ -259,6 +268,10 @@ func (d *Driver) hasPending(claimUID types.UID, deviceName, shareID string) bool
 
 // logf prints a formatted driver log line to stdout.
 func (d *Driver) logf(format string, args ...any) {
+	if d.logFn != nil {
+		d.logFn(format, args...)
+		return
+	}
 	fmt.Printf("cxi-dra-driver: "+format+"\n", args...)
 }
 

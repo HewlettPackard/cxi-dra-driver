@@ -17,7 +17,7 @@ The core DRA (Dynamic Resource Allocation) plugin. This package owns device publ
 | `store.go` | `AllocationStore` — thread-safe in-memory map of pod UID → `PodAllocation` (device, HSN, VNI, resources; in VF mode also the parent and ShareID) |
 | `views.go` | Published vs programmable devices: PFs in PF mode; in VF mode parents are published (`parentSet`, ceiling from the parent budget) and VFs are programmed. `liveAvailable` / `AvailableFor` read the parent's remaining budget |
 | `vfselect.go` | VF mode: per-parent locking and lowest-free-VF selection at Prepare (`programmableFor`), and startup recovery of VF occupancy from hint files, claims and VF service lists (`recoverVFState`) |
-| `reaper.go` | Backstop that runs every `--resource-refresh-interval`: destroys CXI services whose pod netns is gone for several consecutive cycles, never touching blessed, kernel-system, or NRI-tracked live services |
+| `reaper.go` | Backstop that runs every `--resource-refresh-interval`: destroys CXI services whose pod netns is gone for several consecutive cycles, never touching blessed (PF mode only; ignored with `--vf-only`), kernel-system (incl. the VF Ethernet child), or NRI-tracked live services. In VF mode it warns (first sight, then every `reapWarnEveryCycles`) about non-system VF children that no live pod or hint file accounts for |
 | `vniallocator.go` | Leader-elected namespace controller — assigns the lowest free VNI to each namespace and writes the `cxi.slingshot.hpe.com/vni` annotation |
 | `vnipool.go` | Shared leader-election and lease-management plumbing used by the VNI allocator; the Lease is named `<driverName>-vni-allocator-leader` |
 | `vni.go` | VNI bounds and validation (`MinVNI`/`MaxVNI`, `ValidVNI`, `ValidateVNIRange`) guarding the uint16 hardware field |
@@ -28,4 +28,4 @@ Pods never carry their own VNI. `vniallocator.go` assigns exactly one VNI per na
 
 ## Testing
 
-`capacity_test.go`, `driver_test.go`, `claimbinder_test.go`, `prepare_test.go`, `resourceslice_test.go`, `store_test.go`, `vfselect_test.go`, `vniallocator_test.go`, `vni_test.go`, and `cnihints_test.go` cover this package — the strongest unit-test coverage in the repository. `devicestatus.go`, `unprepare.go`, and `reaper.go` currently have no dedicated tests; consider these first when adding coverage.
+`capacity_test.go`, `driver_test.go`, `claimbinder_test.go`, `prepare_test.go`, `resourceslice_test.go`, `store_test.go`, `vfselect_test.go`, `reaper_test.go`, `vniallocator_test.go`, `vni_test.go`, and `cnihints_test.go` cover this package — the strongest unit-test coverage in the repository. `devicestatus.go` and `unprepare.go` currently have no dedicated tests; consider these first when adding coverage.
