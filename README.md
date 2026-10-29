@@ -497,7 +497,7 @@ List their svc_ids in the `--system-svc-ids` flag on the DaemonSet (comma-separa
 
 At discovery time the driver reads each blessed service's actual `resource_limits[]` from the kernel and sums them into a per-device reserved set. The usable ceiling for claims is then `hardware_total − reserved`. A claim requesting more than the usable ceiling is rejected immediately with a "request will never fit on this hardware" error, before any libcxi call is attempted.
 
-Blessed services are also protected from teardown: the NRI plugin and the orphan-service reaper never delete a service whose svc_id is in this set, so a stale in-memory mapping can never reap a system service. An empty list (the default) blesses nothing — the driver reserves no capacity and may reap pre-existing services it does not recognise.
+Blessed services are also protected from teardown: the NRI plugin and the orphan-service reaper never delete a service whose svc_id is in this set, so a stale in-memory mapping can never reap a system service. With `--vf-only` the list is ignored (VFs number their own services); the reaper there relies on the kernel's system bit, which marks the VF Ethernet child. An empty list (the default) blesses nothing — the driver reserves no capacity and may reap pre-existing services it does not recognise.
 
 ## How Device Injection Works
 

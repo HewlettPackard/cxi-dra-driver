@@ -67,7 +67,7 @@ type Device struct {
 	ParentSvcID int
 
 	// PodIfName is the pod-side interface name the CNI gives this device.
-	// Placeholder for VF interface naming; empty until then.
+	// Placeholder for now; empty until implemented.
 	PodIfName string
 }
 

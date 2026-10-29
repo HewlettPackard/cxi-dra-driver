@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 
 	"github.com/slingshot/cxi-dra-driver/internal/cxi"
@@ -17,6 +18,17 @@ import (
 // window between cxil_alloc_svc and the kernel recording the pod netns during a
 // normal pod start, so a pod mid-start is never mistaken for an orphan.
 const reapGraceCycles = 3
+
+// reapWarnEveryCycles is how often (in reconcile cycles, ~10 minutes at the
+// default 10s interval) the reaper repeats its warning about a VF child it
+// cannot attribute to a pod. The first sighting is always logged immediately.
+const reapWarnEveryCycles = 60
+
+// Seams for tests; production values talk to the kernel and /proc.
+var (
+	readServiceNetns = cxi.ReadServiceNetns
+	listLiveNetns    = func() (map[uint64]bool, error) { return liveNetnsInodes("/proc") }
+)
 
 // netnsInodeMask keeps only the low 32 bits of an inode. The kernel stores a
 // service's netns as an unsigned int (see cxi_create_service, which truncates
@@ -40,8 +52,10 @@ type reapKey struct {
 //
 // A service is preserved if ANY of these hold, so the reaper only ever deletes
 // a service it is certain is an orphan:
-//   - its svc_id is blessed (--system-svc-ids),
-//   - its kernel is_system_svc bit is set (Ethernet/default services),
+//   - its svc_id is blessed (--system-svc-ids; ignored in VF mode, where svc_ids
+//     are numbered per VF and a PF id would shield an unrelated pod child),
+//   - its kernel is_system_svc bit is set (Ethernet/default services, including
+//     the Ethernet child the kernel creates on every VF),
 //   - the NRI plugin still owns it for a live pod (LiveSvcIDs),
 //   - the netns the kernel recorded for it is still live on the node,
 //   - that netns cannot be determined (read error or 0) — indeterminate state
@@ -49,6 +63,12 @@ type reapKey struct {
 //
 // Even once a service's netns is confirmed dead, it is destroyed only after
 // reapGraceCycles consecutive confirmations.
+//
+// In VF mode the reaper lists only the VFs, never a PF, so it cannot see the
+// parent service. A non-system child that no live pod (NRI) and no hint file
+// accounts for was created by another consumer under the same parent; it is
+// not touched unless its netns is dead, but it shares the parent's budget, so
+// it is reported (see warnUnattributed).
 //
 // Inert in mock mode (no real services) and until SetLiveSvcIDsFunc has wired
 // the NRI live-svc-id source — without it the reaper cannot tell a live pod's
@@ -61,7 +81,7 @@ func (d *Driver) reapOrphanServices() {
 		return
 	}
 
-	live, err := liveNetnsInodes("/proc")
+	live, err := listLiveNetns()
 	if err != nil {
 		d.logf("warning: reaper enumerating live netns: %v — skipping reap pass", err)
 		return
@@ -76,14 +96,23 @@ func (d *Driver) reapOrphanServices() {
 	}
 
 	blessed := make(map[int]bool, len(d.systemSvcIDs))
-	for _, id := range d.systemSvcIDs {
-		blessed[id] = true
+	if !d.vfOnly {
+		for _, id := range d.systemSvcIDs {
+			blessed[id] = true
+		}
 	}
 	nriLive := d.liveSvcIDs()
 
+	d.reaperCycle++
+	var hinted map[string]bool
+	if d.vfOnly {
+		hinted = d.hintedDevices()
+	}
+	var unattributed []reapKey
+
 	seen := make(map[reapKey]bool)
 	for _, dev := range d.programmableDevices() {
-		svcs, err := cxi.ReadActiveServices(dev.Name)
+		svcs, err := readActiveServices(dev.Name)
 		if err != nil {
 			d.logf("warning: reaper reading services for %s: %v", dev.Name, err)
 			continue
@@ -103,13 +132,15 @@ func (d *Driver) reapOrphanServices() {
 			// Resolve the netns the kernel recorded for this service. An error
 			// or a zero inode is indeterminate (e.g. a service mid-creation,
 			// before cxil_svc_set_netns) and is treated as live.
-			ns, err := cxi.ReadServiceNetns(dev.Name, svc.SvcID)
-			if err != nil || ns == 0 {
+			// A child no pod of ours accounts for is reported if it survives
+			// this cycle; one with a dead netns follows the reap path below.
+			foreign := d.vfOnly && !hinted[dev.Name]
+			ns, err := readServiceNetns(dev.Name, svc.SvcID)
+			if err != nil || ns == 0 || live[ns&netnsInodeMask] {
 				delete(d.reaperMisses, key)
-				continue
-			}
-			if live[ns&netnsInodeMask] {
-				delete(d.reaperMisses, key)
+				if foreign {
+					unattributed = append(unattributed, key)
+				}
 				continue
 			}
 
@@ -132,6 +163,8 @@ func (d *Driver) reapOrphanServices() {
 		}
 	}
 
+	d.warnUnattributed(unattributed)
+
 	// Drop miss counts for services that no longer appear on any device — they
 	// were destroyed (by us, the NRI plugin, or out of band) — so the map can't
 	// grow without bound over the driver's lifetime.
@@ -139,6 +172,48 @@ func (d *Driver) reapOrphanServices() {
 		if !seen[key] {
 			delete(d.reaperMisses, key)
 		}
+	}
+}
+
+// hintedDevices returns the VFs named by a CNI hint file: each belongs to a
+// pod the driver prepared, so a pod child on it is presumed that pod's.
+func (d *Driver) hintedDevices() map[string]bool {
+	out := make(map[string]bool)
+	for _, hs := range d.readHintFiles() {
+		for _, h := range hs {
+			out[h.Device] = true
+		}
+	}
+	return out
+}
+
+// warnUnattributed logs, in one line per cycle, the VF children that no pod
+// accounts for and that were first seen, or last reported, reapWarnEveryCycles
+// ago. Children that are gone, or that a pod now accounts for, are forgotten so
+// a later reappearance is reported again.
+func (d *Driver) warnUnattributed(keys []reapKey) {
+	if d.reaperWarned == nil {
+		d.reaperWarned = make(map[reapKey]int)
+	}
+	current := make(map[reapKey]bool, len(keys))
+	var due []string
+	for _, k := range keys {
+		current[k] = true
+		last, ok := d.reaperWarned[k]
+		if ok && d.reaperCycle-last < reapWarnEveryCycles {
+			continue
+		}
+		d.reaperWarned[k] = d.reaperCycle
+		due = append(due, fmt.Sprintf("%s/svc %d", k.deviceName, k.svcID))
+	}
+	for k := range d.reaperWarned {
+		if !current[k] {
+			delete(d.reaperWarned, k)
+		}
+	}
+	if len(due) > 0 {
+		d.logf("warning: reaper: %s carry non-system child service(s) that no live pod or hint file accounts for "+
+			"(created by another consumer under the same parent); they reduce the parent's shared budget", strings.Join(due, ", "))
 	}
 }
 
