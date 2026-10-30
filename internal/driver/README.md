@@ -7,7 +7,7 @@ The core DRA (Dynamic Resource Allocation) plugin. This package owns device publ
 | File | Purpose |
 |------|---------|
 | `driver.go` | `Driver` — top-level type; owns devices and pending grants; wires the other files together, publishes the `ResourceSlice` once, and runs the reaper ticker |
-| `claimbinder.go` | `ClaimBinder` — watches `ResourceClaim`s cluster-wide as a live-hardware safety net and sets DRA BindingConditions: `Ready=True`, `Ready=False` (`InsufficientCapacity`), or `Unschedulable` (`DeviceAtCapacity`) |
+| `claimbinder.go` | `ClaimBinder` — watches `ResourceClaim`s cluster-wide as a live-hardware safety net and sets DRA BindingConditions: `Ready=True`, `Ready=False` (`InsufficientCapacity`), or `Unschedulable` (`DeviceAtCapacity`; `VNINotInParentSet` in VF mode) |
 | `capacity.go` | Consumable-capacity model: capacity names, per-allocation request defaults, `buildCapacity` (usable ceiling → `DeviceCapacity` with request policy; LE/TLE step of one pool) and `resourceSetFromConsumed` (an allocation's `consumedCapacity` → `ResourceSet`) |
 | `resourceslice.go` | Builds the static per-node `ResourceSlice`: topology attributes (`type`, `hsn_iface`, `resource.kubernetes.io/numaNode`, `resource.kubernetes.io/pciBusID`), consumable capacity, and the `Ready`/`Unschedulable` binding conditions |
 | `devicestatus.go` | Publishes per-device status (VNI, svc_id) onto the `ResourceClaim` status for operator introspection (`RecordSvcID`, called by the NRI plugin) |

@@ -87,6 +87,17 @@ func (d *Driver) prepareClaim(ctx context.Context, claim *resourceapi.ResourceCl
 	if err != nil {
 		return kubeletplugin.PrepareResult{Err: err}
 	}
+	// Fallback for claims allocated before the namespace was annotated; the
+	// admission VNI selector normally keeps the scheduler off such a parent.
+	for _, alloc := range results {
+		if p, ok := d.parents.get(alloc.Device); ok {
+			if err := p.checkVNI(vni); err != nil {
+				return kubeletplugin.PrepareResult{
+					Err: fmt.Errorf("claim %s/%s device %s: %w", claim.Namespace, claim.Name, alloc.Device, err),
+				}
+			}
+		}
+	}
 
 	unlock := d.lockParents(results)
 	progs, err := d.programmableFor(claim.UID, results)
@@ -255,14 +266,9 @@ func (d *Driver) namespaceVNI(ctx context.Context, namespace string) (int, error
 		ns, err := d.kubeClient.CoreV1().Namespaces().Get(ctx, namespace, metav1.GetOptions{})
 		if err != nil {
 			lastErr = fmt.Errorf("getting namespace %s: %w", namespace, err)
-		} else if v, ok := ns.Annotations[vniAnnotationKey]; ok {
-			vni, perr := strconv.Atoi(v)
-			if perr != nil {
-				return 0, fmt.Errorf("namespace %s has invalid VNI annotation %q: %w", namespace, v, perr)
-			}
-			if !ValidVNI(vni) {
-				return 0, fmt.Errorf("namespace %s VNI %d out of range [%d,%d]", namespace, vni, MinVNI, MaxVNI)
-			}
+		} else if vni, ok, perr := vniFromAnnotations(namespace, ns.Annotations); perr != nil {
+			return 0, perr
+		} else if ok {
 			return vni, nil
 		} else {
 			lastErr = fmt.Errorf("namespace %s has no %s annotation yet", namespace, vniAnnotationKey)
@@ -274,6 +280,23 @@ func (d *Driver) namespaceVNI(ctx context.Context, namespace string) (int, error
 		}
 	}
 	return 0, fmt.Errorf("VNI not available for namespace %s after %d attempts: %w", namespace, attempts, lastErr)
+}
+
+// vniFromAnnotations parses the namespace VNI annotation; ok is false when the
+// namespace has not been annotated yet.
+func vniFromAnnotations(namespace string, annotations map[string]string) (vni int, ok bool, err error) {
+	v, ok := annotations[vniAnnotationKey]
+	if !ok {
+		return 0, false, nil
+	}
+	vni, err = strconv.Atoi(v)
+	if err != nil {
+		return 0, false, fmt.Errorf("namespace %s has invalid VNI annotation %q: %w", namespace, v, err)
+	}
+	if !ValidVNI(vni) {
+		return 0, false, fmt.Errorf("namespace %s VNI %d out of range [%d,%d]", namespace, vni, MinVNI, MaxVNI)
+	}
+	return vni, true, nil
 }
 
 // resolveClaim returns the ResourceSet for a single device allocation.
@@ -293,6 +316,10 @@ func (d *Driver) resolveClaim(
 	alloc resourceapi.DeviceRequestAllocationResult,
 ) (cxi.ResourceSet, error) {
 	legacy, hasLegacy, legacyErr := d.legacyResourceConfig(claim, alloc.Request)
+	parent, isParent := d.parents.get(alloc.Device)
+	if isParent && hasLegacy && legacyErr == nil && (legacy.LEs != 0 || legacy.TLEs != 0) {
+		return cxi.ResourceSet{}, inheritedPoolsError(parent, "opaque config le_pools/tle_pools", legacy)
+	}
 
 	if len(alloc.ConsumedCapacity) == 0 {
 		if legacyErr != nil {
@@ -310,6 +337,10 @@ func (d *Driver) resolveClaim(
 	if err != nil {
 		return cxi.ResourceSet{}, err
 	}
+	// The scheduler already blocks this (the parent publishes zero LEs/TLEs).
+	if isParent && (consumed.LEs != 0 || consumed.TLEs != 0) {
+		return cxi.ResourceSet{}, inheritedPoolsError(parent, "consumed capacity les/tles", consumed)
+	}
 	// Opaque config without resource fields is fine when capacity was
 	// requested; any other problem with it (a removed cdi_profiles entry, bad
 	// JSON) still rejects the claim.
@@ -323,6 +354,13 @@ func (d *Driver) resolveClaim(
 			legacy, consumed)
 	}
 	return consumed, nil
+}
+
+// inheritedPoolsError rejects LEs/TLEs on a VF-mode parent: child services on
+// its VFs take their LE/TLE pools from the parent service.
+func inheritedPoolsError(p *parentInfo, source string, rs cxi.ResourceSet) error {
+	return fmt.Errorf("device %s is a parent of SR-IOV VFs: %s request %d LEs / %d TLEs, but LE and TLE pools are inherited from parent service %s/%d and must be 0",
+		p.Name(), source, rs.LEs, rs.TLEs, p.PFName, p.SvcID)
 }
 
 // legacyResourceConfig parses the claim's opaque CXI config for request, if

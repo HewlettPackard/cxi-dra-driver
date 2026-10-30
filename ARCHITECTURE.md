@@ -54,6 +54,7 @@ The scheduler's consumable-capacity accounting is the primary capacity check, bu
 - `Ready=True` — the request fits live capacity minus in-flight pending grants; the pod may proceed to kubelet binding.
 - `Ready=False` (`InsufficientCapacity`) — live capacity would fit the request, but in-flight pending grants (not yet backed by a CXI service) are blocking it. A hold, not a deallocation: re-evaluated every 2s and immediately on `TriggerRetry` when a service is torn down.
 - `Unschedulable=True` (`DeviceAtCapacity`) — the device's live capacity cannot fit the request even without pending grants; the scheduler deallocates the claim and retries.
+- `Unschedulable=True` (`VNINotInParentSet`) — `--vf-only` only: the namespace VNI is outside the parent's VNI set. A fallback for claims allocated before the namespace was annotated, logged as a warning; Prepare rejects the same claim.
 
 There is no per-namespace device exclusion: SHS 14.0.1 lifted the one-VNI-per-device constraint, so any number of claims from one namespace may share a device while capacity allows. The pending-grant map lives on `Driver` (guarded by its own mutex, released by NRI `RunPodSandbox` or the binder's watch); `ClaimBinder` itself tracks the `Ready=False` claims awaiting re-evaluation.
 
