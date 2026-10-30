@@ -46,6 +46,8 @@ type Config struct {
 	MockDevices          []*cxi.Device
 	SystemSvcIDs         []int // blessed system-service svc_ids; their reserved resources are excluded from each device's usable ceiling
 	VFOnly               bool  // discover and publish SR-IOV VFs only (--vf-only); the default publishes PFs only
+	VNIRangeStart        int   // --vni-range-start; with VNIRangeEnd, checked against each parent's VNI set at startup (0 = unset)
+	VNIRangeEnd          int   // --vni-range-end
 	RefreshInterval      time.Duration
 	CDIEnvConfig         cdi.CDIEnvConfig // host libs and env vars for the env spec; zero value when --enable-cdi-env is unset
 	ContainerdConfigPath string           // path for the containerd CDI config drop-in; empty = skip
@@ -66,6 +68,8 @@ type Driver struct {
 	store                *AllocationStore
 	systemSvcIDs         []int         // blessed system-service svc_ids passed to cxi.Discover; reserved resources excluded from each device's usable ceiling
 	vfOnly               bool          // passed to cxi.Discover: publish SR-IOV VFs only
+	vniRangeStart        int           // cluster VNI range, for the parent coverage warning
+	vniRangeEnd          int           // 0 with vniRangeStart when unset
 	refreshInterval      time.Duration // how often the orphan-service reaper runs
 	cdiEnvConfig         cdi.CDIEnvConfig
 	containerdConfigPath string // path for the containerd CDI config drop-in; empty = skip
@@ -131,6 +135,8 @@ func New(cfg Config) *Driver {
 		store:                NewAllocationStore(),
 		systemSvcIDs:         cfg.SystemSvcIDs,
 		vfOnly:               cfg.VFOnly,
+		vniRangeStart:        cfg.VNIRangeStart,
+		vniRangeEnd:          cfg.VNIRangeEnd,
 		refreshInterval:      cfg.RefreshInterval,
 		cdiEnvConfig:         cfg.CDIEnvConfig,
 		containerdConfigPath: cfg.ContainerdConfigPath,

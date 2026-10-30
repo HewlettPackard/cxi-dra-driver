@@ -33,6 +33,8 @@ var (
 	vfTestBudget = cxi.ResourceSet{TXQs: 100, TGQs: 100, EQs: 100, CTs: 100, PTEs: 100, ACs: 100, LEs: 100, TLEs: 10}
 	// vfTestEth is the Ethernet system child the kernel creates on every VF.
 	vfTestEth = cxi.ResourceSet{TXQs: 1, TGQs: 1, EQs: 2, CTs: 1, PTEs: 1, ACs: 1, LEs: 16}
+	// vfTestVNIs is the parent's VNI set; it covers testVNI.
+	vfTestVNIs, _ = cxi.NewVNIRange(32, 63)
 )
 
 // newVFTestDriver returns a --vf-only driver with one parent, cxi0-svc4, whose
@@ -52,7 +54,7 @@ func newVFTestDriver(t *testing.T, nVFs int, objs ...runtime.Object) *Driver {
 	cxi.SetMockTopology(cxi.MockTopology{
 		Parents: []cxi.MockParent{{
 			PFName: "cxi0", SvcID: 4,
-			Descriptor: cxi.ParentDescriptor{ResourceLimits: true, Limits: vfTestBudget},
+			Descriptor: cxi.ParentDescriptor{ResourceLimits: true, Limits: vfTestBudget, VNIs: vfTestVNIs},
 		}},
 		VFServices: vfSvcs,
 	})

@@ -52,6 +52,11 @@ import (
 //     include the out-of-band consumption that filled the device, so the
 //     retry can land on the same device again until that consumption goes.
 //
+//   - Unschedulable=True (VNINotInParentSet): VF mode only, the namespace VNI
+//     is outside the parent's VNI set. A fallback for claims allocated before
+//     the namespace was annotated: the admission VNI selector normally keeps
+//     the scheduler off such a parent, so reaching it is logged as a warning.
+//
 // Pods carry exactly one ResourceClaim: the CXI device. The VNI is assigned
 // per namespace (see NamespaceVNIConfig) and read at prepare time, so it is
 // not part of any ResourceClaim. When Unschedulable=True is set on a full
@@ -196,6 +201,17 @@ func (b *ClaimBinder) evaluateClaim(ctx context.Context, claim *resourceapi.Reso
 	}
 	b.driver.reconcileClaimDevices(claim.UID, current)
 
+	// Read once per evaluation and without waiting: an unannotated namespace
+	// skips the VNI check here and Prepare waits for the annotation instead.
+	var vni int
+	vniKnown := false
+	for _, dr := range devices {
+		if _, ok := b.driver.parents.get(dr.result.Device); ok {
+			vni, vniKnown = b.namespaceVNI(ctx, claim.Namespace)
+			break
+		}
+	}
+
 	// A claim with a count>1 request allocates several devices. The scheduler
 	// will not bind the pod until EVERY allocated device's Ready binding
 	// condition is True, so we must evaluate and set a condition for each one.
@@ -212,6 +228,16 @@ func (b *ClaimBinder) evaluateClaim(ctx context.Context, claim *resourceapi.Reso
 		// Already granted and service was created (or being torn down).
 		if cond := b.getCondition(claim, result, "Ready"); cond != nil && cond.Status == metav1.ConditionTrue {
 			continue
+		}
+
+		if p, ok := b.driver.parents.get(result.Device); ok && vniKnown {
+			if verr := p.checkVNI(vni); verr != nil {
+				b.logf("warning: Unschedulable: claim=%s/%s device=%s: %v; the admission VNI selector is not installed or does not match",
+					claim.Namespace, claim.Name, result.Device, verr)
+				b.setCondition(ctx, claim, result, "Unschedulable", metav1.ConditionTrue,
+					"VNINotInParentSet", verr.Error()+"; the scheduler will reallocate to a different device")
+				continue
+			}
 		}
 
 		// Read live capacity outside the lock to avoid blocking the mutex
@@ -353,6 +379,22 @@ func (b *ClaimBinder) findOurDevices(claim *resourceapi.ResourceClaim) ([]device
 		})
 	}
 	return out, nil
+}
+
+// namespaceVNI reads the namespace VNI once; ok is false when it is not
+// annotated yet or cannot be read.
+func (b *ClaimBinder) namespaceVNI(ctx context.Context, namespace string) (int, bool) {
+	ns, err := b.client.CoreV1().Namespaces().Get(ctx, namespace, metav1.GetOptions{})
+	if err != nil {
+		b.logf("warning: getting namespace %s: %v; skipping the parent VNI check", namespace, err)
+		return 0, false
+	}
+	vni, ok, err := vniFromAnnotations(namespace, ns.Annotations)
+	if err != nil {
+		b.logf("warning: %v; skipping the parent VNI check", err)
+		return 0, false
+	}
+	return vni, ok
 }
 
 // getCondition returns the named condition from the claim's AllocatedDeviceStatus

@@ -200,6 +200,8 @@ func main() {
 		MockDevices:          mockDevList,
 		SystemSvcIDs:         sysSvcIDs,
 		VFOnly:               *vfOnly,
+		VNIRangeStart:        *vniRangeStart,
+		VNIRangeEnd:          *vniRangeEnd,
 		RefreshInterval:      *refreshInterval,
 		ContainerdConfigPath: *containerdConfigPath,
 		CDIEnvConfig:         envConfig,

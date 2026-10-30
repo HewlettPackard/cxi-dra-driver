@@ -8,10 +8,24 @@ import (
 )
 
 // parentInfo is one VF-mode parent as the driver uses it: the VFs grouped
-// under it by discovery and the ceiling published for it.
+// under it by discovery, its budget and VNI set, and the ceiling published for it.
 type parentInfo struct {
 	*cxi.Parent
-	ceiling cxi.ResourceSet
+	budget   cxi.ResourceSet
+	ethPerVF cxi.ResourceSet // Ethernet-child reservation held for every VF
+	ceiling  cxi.ResourceSet
+	vnis     cxi.VNISet
+}
+
+// checkVNI reports why a namespace VNI cannot be used on this parent, or nil.
+func (p *parentInfo) checkVNI(vni int) error {
+	if p.vnis.IsEmpty() {
+		return fmt.Errorf("the VNI set of parent service %s/%d could not be read", p.PFName, p.SvcID)
+	}
+	if vni < 0 || vni > 0xffff || !p.vnis.Contains(uint16(vni)) {
+		return fmt.Errorf("namespace VNI %d is not in the VNI set {%s} of parent service %s/%d", vni, p.vnis, p.PFName, p.SvcID)
+	}
+	return nil
 }
 
 func (p *parentInfo) vfNames() []string {
@@ -99,8 +113,8 @@ func (d *Driver) programmableDevices() []*cxi.Device {
 	return d.devices
 }
 
-// setupParents groups the discovered VFs by parent and reads each parent's
-// ceiling. A no-op in PF mode.
+// setupParents groups the discovered VFs by parent, reads each parent's budget
+// and VNI set, and logs what it publishes. A no-op in PF mode.
 func (d *Driver) setupParents() {
 	if !d.vfOnly {
 		return
@@ -108,44 +122,69 @@ func (d *Driver) setupParents() {
 	var parents []*parentInfo
 	for _, p := range cxi.Parents(d.programmableDevices()) {
 		info := &parentInfo{Parent: p}
-		ceiling, err := parentCeiling(p)
-		if err != nil {
+		if err := readParent(info); err != nil {
 			d.logf("ERROR: parent %s: %v; publishing it with zero capacity", p.Name(), err)
-		} else {
-			info.ceiling = ceiling
 		}
-		d.logf("parent %s: VFs %v, published ceiling (%s)", p.Name(), info.vfNames(), info.ceiling)
+		d.logf("parent %s: VFs %v, budget (%s), Ethernet-child reservation (%s) per VF, published ceiling (%s), VNI set {%s}",
+			p.Name(), info.vfNames(), info.budget, info.ethPerVF, info.ceiling, info.vnis)
+		d.warnParent(info)
 		parents = append(parents, info)
 	}
 	d.parents.set(parents)
 }
 
-// parentCeiling is the parent's budget minus one Ethernet-child reservation
-// per VF (measured on any VF whose netdev is up), with LEs and TLEs forced to
-// 0 because children inherit them from the parent.
-func parentCeiling(p *cxi.Parent) (cxi.ResourceSet, error) {
-	budget, _, err := cxi.ReadParentBudget(p.PFName, p.SvcID)
-	if err != nil {
-		return cxi.ResourceSet{}, err
+// warnParent logs the startup warnings for a parent: a VNI set that does not
+// cover the cluster VNI range, and fewer remaining LEs than one pool.
+func (d *Driver) warnParent(p *parentInfo) {
+	if p.vnis.IsEmpty() {
+		return
 	}
-	var perVF cxi.ResourceSet
+	if d.vniRangeStart != 0 || d.vniRangeEnd != 0 {
+		if !ValidVNI(d.vniRangeStart) || !ValidVNI(d.vniRangeEnd) ||
+			!p.vnis.Covers(uint16(d.vniRangeStart), uint16(d.vniRangeEnd)) {
+			d.logf("warning: parent %s VNI set {%s} does not cover --vni-range-start..--vni-range-end %d-%d; claims from namespaces outside it fail on this parent",
+				p.Name(), p.vnis, d.vniRangeStart, d.vniRangeEnd)
+		}
+	}
+	remaining, err := cxi.ReadParentRemaining(p.PFName, p.SvcID, p.vfNames())
+	if err != nil {
+		d.logf("warning: parent %s: reading remaining budget: %v", p.Name(), err)
+		return
+	}
+	if remaining.LEs < cxi.LEPoolSize {
+		d.logf("warning: parent %s has %d LEs left after its VFs' Ethernet children, less than one pool (%d); pod services on its VFs may fail to create",
+			p.Name(), remaining.LEs, cxi.LEPoolSize)
+	}
+}
+
+// readParent fills in the parent's budget, VNI set, Ethernet-child reservation
+// and ceiling: the budget minus one Ethernet-child reservation per VF
+// (measured on any VF whose netdev is up), with LEs and TLEs forced to 0
+// because children inherit them from the parent.
+func readParent(p *parentInfo) error {
+	budget, vnis, err := cxi.ReadParentBudget(p.PFName, p.SvcID)
+	if err != nil {
+		return err
+	}
+	p.budget, p.vnis = budget, vnis
 	for _, vf := range p.VFs {
 		r, err := cxi.ReadVFSystemReservation(vf.Name)
 		if err != nil {
-			return cxi.ResourceSet{}, fmt.Errorf("reading the Ethernet child on %s: %w", vf.Name, err)
+			return fmt.Errorf("reading the Ethernet child on %s: %w", vf.Name, err)
 		}
 		if r != (cxi.ResourceSet{}) {
-			perVF = r
+			p.ethPerVF = r
 			break
 		}
 	}
 	var reserved cxi.ResourceSet
 	for range p.VFs {
-		reserved = reserved.Add(perVF)
+		reserved = reserved.Add(p.ethPerVF)
 	}
 	c := budget.Sub(reserved).ClampToZero()
 	c.LEs, c.TLEs = 0, 0
-	return c, nil
+	p.ceiling = c
+	return nil
 }
 
 // liveAvailable is the capacity left right now on a published device: the
