@@ -32,7 +32,7 @@ different consumers and continue to run side by side:
 
 | Mechanism | Owned by | Provides | Consumed by |
 |---|---|---|---|
-| Synthetic `/sys/class/net/<hsn>` tree | driver (NRI `RunPodSandbox` / `CreateContainer`) | sysfs metadata (`operstate`, `carrier`, `device → BDF`) | stock libfabric's CXI provider, which globs sysfs to discover the HSN; RDMA datapath is kernel-bypass |
+| Synthetic `/sys/class/net/<ifname>` tree | driver (NRI `RunPodSandbox` / `CreateContainer`) | sysfs metadata (`operstate`, `carrier`, `device → BDF`) | stock libfabric's CXI provider, which globs sysfs to discover the HSN; RDMA datapath is kernel-bypass |
 | IPVLAN netdev + IP address | `slingshot-cni` (CNI `ADD`) | a real netdev with an L3 address | anything that needs IP over the HSN: out-of-band job launchers, control-plane traffic, tooling |
 
 libfabric's HSN discovery does not depend on the IPVLAN interface, and the
@@ -79,16 +79,20 @@ All three commands start the same way:
 The optional `ifname` separates the pod-side name from the host parent:
 `{"schema_version":1,"device":"cxi4","hsn_iface":"enp197s0f1np0","ifname":"cxi4","vni":137}`
 creates `cxi4` (fallback `cxi4_inet`) on host parent `enp197s0f1np0`.
+In VF mode the driver sets `ifname` to the chosen `cxiN` device name and
+keeps `hsn_iface` as the VF host netdev; the synthetic sysfs entry is also
+named `cxiN` and retains the VF's PCI BDF metadata. PF hints omit `ifname`
+and keep the existing host-interface name.
 The base name must be at most **10 bytes**, leaving five bytes for `_inet`.
 The host parent's length is not subject to that fallback constraint when
 `ifname` is set.
 
 Hints without `ifname` and without `schema_version` remain supported;
-absent or empty `ifname` preserves PF naming. Optional per-entry
-`schema_version` (absent is treated as `1`) supports version `1`, which
-includes optional naming. Newer versions are logged and rejected, including on
-`DEL`, rather than interpreted as a missing hint. Upgrade the CNI before
-enabling a custom-name writer; older binaries ignore the new fields.
+absent or empty `ifname` preserves PF naming. The CNI accepts schema version
+1; the driver writes version 1 for VF hints carrying `ifname`. Newer
+versions are logged and rejected, including on `DEL`, rather than interpreted
+as a missing hint. Use a CNI supporting the version-1 `ifname` field before
+enabling the writer.
 See the [hint contract](./cnidra-cni-hint-contract.md#naming-and-compatibility)
 for the full compatibility rules.
 

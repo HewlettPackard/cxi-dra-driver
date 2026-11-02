@@ -485,7 +485,7 @@ func (p *Plugin) buildNetSysfs(podUID types.UID, pid uint32, allocs []driver.Pod
 				podUID, alloc.DeviceName)
 			continue
 		}
-		hsn, err := netsysfs.HostHSN(alloc.HSNIface)
+		hsn, err := netsysfs.HostHSNForPod(alloc.HSNIface, alloc.PodIfName)
 		if err != nil {
 			return "", fmt.Errorf("reading host HSN %s for device %s: %w", alloc.HSNIface, alloc.DeviceName, err)
 		}

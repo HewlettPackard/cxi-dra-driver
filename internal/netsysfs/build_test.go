@@ -136,6 +136,59 @@ func TestHostHSNResolvesBDFAndSpeed(t *testing.T) {
 	}
 }
 
+func TestHostHSNForPodUsesPodNameAndHostMetadata(t *testing.T) {
+	root := t.TempDir()
+	netClass := filepath.Join(root, "class", "net")
+	bdf := "0000:c5:00.1"
+	pciDir := filepath.Join(root, "devices", "pci0000:c5", bdf)
+	if err := os.MkdirAll(pciDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	hostIface := "enp197s0f1"
+	ifaceDir := filepath.Join(netClass, hostIface)
+	if err := os.MkdirAll(ifaceDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(pciDir, filepath.Join(ifaceDir, "device")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(ifaceDir, "speed"), []byte("200000\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		name       string
+		podIface   string
+		wantIfName string
+	}{
+		{name: "VF pod name", podIface: "cxi4", wantIfName: "cxi4"},
+		{name: "PF legacy name", wantIfName: hostIface},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			hsn, err := hostHSNForPod(netClass, hostIface, tc.podIface)
+			if err != nil {
+				t.Fatalf("hostHSNForPod: %v", err)
+			}
+			if hsn.Iface != tc.wantIfName || hsn.Speed != "200000" || filepath.Base(hsn.DevicePath) != bdf {
+				t.Fatalf("HSN = %+v, want name %q, speed 200000 and BDF %s", hsn, tc.wantIfName, bdf)
+			}
+
+			dir := filepath.Join(t.TempDir(), "net")
+			if err := Build(dir, nil, []HSN{hsn}); err != nil {
+				t.Fatalf("Build: %v", err)
+			}
+			devicePath, err := os.Readlink(filepath.Join(dir, tc.wantIfName, "device"))
+			if err != nil {
+				t.Fatalf("reading synthetic device link: %v", err)
+			}
+			if filepath.Base(devicePath) != bdf {
+				t.Errorf("synthetic device BDF = %q, want VF BDF %q", filepath.Base(devicePath), bdf)
+			}
+			assertFile(t, filepath.Join(dir, tc.wantIfName, "speed"), "200000\n")
+		})
+	}
+}
+
 func TestHostHSNErrorsWhenDeviceLinkMissing(t *testing.T) {
 	netClass := filepath.Join(t.TempDir(), "class", "net")
 	if err := os.MkdirAll(filepath.Join(netClass, "hsn0"), 0o755); err != nil {

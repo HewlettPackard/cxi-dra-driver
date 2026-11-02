@@ -18,8 +18,8 @@ description: "Glossary of CXI/DRA/Kubernetes domain terms used throughout this d
 | **HSN** | Slingshot High-Speed Network fabric; the physical interface (`hsnN` netdev) each CXI device is paired with |
 | **HSN sysfs injection** | `internal/netsysfs`: a per-pod synthetic `/sys/class/net` overmount so stock libfabric discovers the HSN inside the pod; gives no real netdev |
 | **Slingshot CNI / `slingshot-cni`** | Separate host CNI plugin (`cmd/slingshot-cni` + `internal/cni`) exec'd by containerd/Multus; gives the pod a real IP-addressed netdev per claimed device. Complementary to HSN sysfs injection, not a replacement |
-| **CNI hint file** | `<--cni-hints-dir>/<podUID>.json`, written by `PrepareResourceClaims`, one `{device, hsn_iface, vni}` per device; the only handoff from the driver daemon to the CNI process |
-| **IPVLAN (L2)** | Kernel virtual-interface type `slingshot-cni` creates on the host HSN and moves into the pod netns, named `<hsn_iface>` (fallback `<hsn_iface>_inet`) |
+| **CNI hint file** | `<--cni-hints-dir>/<podUID>.json`, written by `PrepareResourceClaims`; PF entries carry `{device, hsn_iface, vni}`, while VF entries also carry `schema_version: 1` and `ifname: cxiN`. `hsn_iface` is the host CNI parent; `ifname` is the preferred pod-side name |
+| **IPVLAN (L2)** | Kernel virtual-interface type `slingshot-cni` creates on the host HSN and moves into the pod netns, named by `ifname` when set or otherwise `hsn_iface` (fallback `<name>_inet`) |
 | **Whereabouts** | Cluster-wide CNI IPAM plugin `slingshot-cni` delegates to for HSN addresses; keys reservations on `(containerID, ifname)`, hence the per-device `CNI_IFNAME` override |
 | **VNI** | Virtual Network Identifier — assigned once per namespace (not per pod/claim) by the leader-elected namespace allocator |
 | **Reaper** | Backstop that destroys orphaned CXI services (pod netns gone for several consecutive cycles) left behind by pods that didn't tear down cleanly; runs every `--resource-refresh-interval` |

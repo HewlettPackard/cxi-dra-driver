@@ -44,7 +44,7 @@ slingshot-cni (host CNI plugin, invoked by containerd/Multus — see docs/cni/cn
     ├── reads the driver's per-pod hint file (/var/run/cxi/net-hints/<podUID>.json,
     │   written by PrepareResourceClaims before RunPodSandbox fires)
     ├── ADD: per claimed device, creates an L2 IPVLAN sub-interface on the paired
-    │        host HSN, moves it into the pod netns as <hsn_iface> (or <hsn_iface>_inet),
+    │        host HSN, moves it into the pod netns as <ifname> (or <ifname>_inet),
     │        and delegates addressing to Whereabouts IPAM (cluster-wide HSN pool)
     └── DEL: releases the Whereabouts address and removes the interface (idempotent)
     (owns L3 addressing only — complementary to the NRI sysfs injection above,
@@ -533,8 +533,8 @@ The sysfs injection above is what stock libfabric needs; it deliberately does no
 
 How it works, per pod:
 
-1. `PrepareResourceClaims` writes a **hint file** `<--cni-hints-dir>/<podUID>.json` with one `{device, hsn_iface, vni}` entry per claimed device — the only handoff from the driver daemon to the CNI process. Kubelet waits for prepare to return before `RunPodSandbox`, so the file always exists before CNI `ADD` fires ([contract](docs/cni/cnidra-cni-hint-contract.md)).
-2. On CNI **`ADD`**, for every entry: an **L2 IPVLAN** sub-interface is created on the paired host HSN, moved into the pod netns as `<hsn_iface>` (e.g. `hsn2`; falls back to `hsn2_inet` if that name is taken), and given an address by the **Whereabouts** IPAM plugin from a cluster-wide HSN pool. A `count: 2` claim yields two interfaces and two reservations. Any partial failure is fully unwound.
+1. `PrepareResourceClaims` writes a **hint file** `<--cni-hints-dir>/<podUID>.json` with one `{device, hsn_iface, vni}` entry per PF device, or a versioned entry with `ifname` in VF mode — the only handoff from the driver daemon to the CNI process. Kubelet waits for prepare to return before `RunPodSandbox`, so the file always exists before CNI `ADD` fires ([contract](docs/cni/cnidra-cni-hint-contract.md)).
+2. On CNI **`ADD`**, for every entry: an **L2 IPVLAN** sub-interface is created on the paired host link, moved into the pod netns as `<ifname>` (or `<hsn_iface>` when `ifname` is absent; the CNI falls back to `<name>_inet` if needed), and given an address by the **Whereabouts** IPAM plugin from a cluster-wide HSN pool. In VF mode the driver sets `ifname` to the selected `cxiN` device while `hsn_iface` remains the VF host netdev. A `count: 2` claim yields two interfaces and two reservations. Any partial failure is fully unwound.
 3. On CNI **`DEL`**, each reservation is released and each interface removed — best-effort and idempotent.
 
 Minimal `NetworkAttachmentDefinition` config (full field reference in [docs/cni/cni-plugin.md](docs/cni/cni-plugin.md)):

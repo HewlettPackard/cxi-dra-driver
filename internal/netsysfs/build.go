@@ -136,6 +136,23 @@ func HostHSN(iface string) (HSN, error) {
 	return hostHSN(DefaultNetClassDir, iface)
 }
 
+// HostHSNForPod reads metadata from the host link and optionally gives the
+// synthetic entry a different pod-side name.
+func HostHSNForPod(hostIface, podIface string) (HSN, error) {
+	return hostHSNForPod(DefaultNetClassDir, hostIface, podIface)
+}
+
+func hostHSNForPod(netClassDir, hostIface, podIface string) (HSN, error) {
+	hsn, err := hostHSN(netClassDir, hostIface)
+	if err != nil {
+		return HSN{}, err
+	}
+	if podIface != "" {
+		hsn.Iface = podIface
+	}
+	return hsn, nil
+}
+
 // hostHSN is the testable core of HostHSN, parameterised on the net-class dir.
 func hostHSN(netClassDir, iface string) (HSN, error) {
 	base := filepath.Join(netClassDir, iface)

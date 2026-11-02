@@ -64,8 +64,8 @@ Once bound, kubelet calls this driver's `PrepareResourceClaims` gRPC hook (via t
 
 1. Reads the pod's namespace `cxi.slingshot.hpe.com/vni` annotation (written by the VNI allocator — see §3.8). It does **not** read a per-claim VNI; VNIs are namespace-scoped.
 2. Resolves the requested `ResourceSet` from the allocation's `consumedCapacity` (falling back to the claim's opaque config only for claims allocated before the device published capacity) and performs a static ceiling check against the device's usable capacity (hardware total minus `--system-svc-ids` reservations). If legacy opaque config asks for more than was consumed, the claim is rejected rather than silently given less.
-3. Stores a `PodAllocation` (device, HSN interface, VNI, resources) in the in-memory `AllocationStore` (`internal/driver/store.go`), keyed by pod UID.
-4. Writes the pod's **CNI hint file** `<--cni-hints-dir>/<podUID>.json` (`cnihints.go`) — a JSON array with one `{device, hsn_iface, vni}` entry per claimed device — atomically (temp file + rename). This is the only handoff to `slingshot-cni` (§3.5b), which runs as a separate process and cannot see the `AllocationStore`. A write failure fails the claim so kubelet retries rather than starting a sandbox with no hint. Contract: [docs/cni/cnidra-cni-hint-contract.md](docs/cni/cnidra-cni-hint-contract.md).
+3. Stores a `PodAllocation` (device, host HSN link, optional pod-side interface name, VNI, resources) in the in-memory `AllocationStore` (`internal/driver/store.go`), keyed by pod UID.
+4. Writes the pod's **CNI hint file** `<--cni-hints-dir>/<podUID>.json` (`cnihints.go`) atomically (temp file + rename). PF entries remain unversioned `{device, hsn_iface, vni}`; VF entries include schema version 1 and `ifname` (the selected `cxiN` name), while `hsn_iface` remains the VF host netdev used as the IPVLAN parent. This is the only handoff to `slingshot-cni` (§3.5b), which runs as a separate process and cannot see the `AllocationStore`. A write failure fails the claim so kubelet retries rather than starting a sandbox with no hint. Contract: [docs/cni/cnidra-cni-hint-contract.md](docs/cni/cnidra-cni-hint-contract.md).
 5. Returns the CDI device IDs kubelet should ask the container runtime to attach — these reference the CDI specs `internal/cdi` already wrote (see §3.5).
 
 Because kubelet waits for this hook to return before calling CRI `RunPodSandbox`, the hint file is guaranteed to exist before CNI `ADD` fires — ordering is a kubelet sequencing guarantee, not a race the plugin has to defend against (it still has a bounded retry as a safety net for driver crashes).
@@ -79,7 +79,7 @@ Before any of the above, at driver startup (see §5) and per-device as devices a
 When containerd sets up the sandbox's network — before this driver's NRI `RunPodSandbox` hook in §3.6 fires — it invokes every CNI plugin in the pod's network attachment list. If a `NetworkAttachmentDefinition` of `type: slingshot-cni` is attached, `internal/cni.CmdAdd` runs **as a separate host process** with no access to the driver's memory:
 
 1. Parses its stdin config (`ipam.type` is mandatory) and `CNI_ARGS` (`K8S_POD_UID`), then reads the hint file from §3.4, retrying briefly if absent.
-2. For **every** hint entry (a `count > 1` claim yields several): looks up the host parent netdev named `hsn_iface`, creates an **L2 IPVLAN** sub-interface on it, moves it into the pod netns, renames it to the optional `ifname` (otherwise `hsn_iface`, falling back to `<name>_inet` if that name is taken), and brings it up (`network_linux.go`, via `vishvananda/netlink`). Effective base names must be at most 10 bytes so the fallback fits Linux's 15-byte limit. The CNI accepts legacy unversioned hints and schema versions through `2`, logging and rejecting newer versions.
+2. For **every** hint entry (a `count > 1` claim yields several): looks up the host parent netdev named `hsn_iface`, creates an **L2 IPVLAN** sub-interface on it, moves it into the pod netns, renames it to the optional `ifname` (otherwise `hsn_iface`, falling back to `<name>_inet` if that name is taken), and brings it up (`network_linux.go`, via `vishvananda/netlink`). Effective base names must be at most 10 bytes so the fallback fits Linux's 15-byte limit. The CNI accepts legacy unversioned hints and schema versions through `1`, logging and rejecting newer versions.
 3. Execs the configured IPAM plugin (**Whereabouts**) with the unmodified stdin config and `CNI_IFNAME` overridden to the in-pod name — Whereabouts keys reservations on `(containerID, ifname)`, so each device needs its own — and applies the returned address and routes (`ipam.go`).
 4. Prints one aggregated CNI 1.0.0 result. Any failure partway unwinds every interface and reservation already made in this invocation.
 
@@ -92,7 +92,7 @@ containerd calls this driver's NRI plugin at `RunPodSandbox`, once the pod's net
 1. Reads the `PodAllocation` `PrepareResourceClaims` stored in `AllocationStore`.
 2. Creates the CXI service on the hardware (`internal/cxi.ServiceManager` — allocate → disable → set netns → enable), scoped to the pod's netns and the namespace's VNI. For VF allocations, `Driver.ServiceOptionsFor` supplies the discovered parent and sibling VFs: the child reserves zero LEs/TLEs and uses the parent's LE maximum rather than device-wide devinfo. PF calls retain their existing behavior.
 3. Performs a **live** fit-check (the hardware might have less room than the static check in §3.4 assumed, if concurrent pods started since).
-4. Builds a synthetic `/sys/class/net` tree (`internal/netsysfs.Build`) replicating the pod's real interfaces plus a synthetic HSN entry with `operstate=up`/`carrier=1`/a `device` symlink, and bind-mounts it over the pod's own `/sys/class/net` (`netns_linux.go`) — this is required because stock (unpatched) libfabric expects to find the HSN interface there, and the real `/sys/class/net` is read-only and namespace-scoped.
+4. Builds a synthetic `/sys/class/net` tree (`internal/netsysfs.Build`) replicating the pod's real interfaces plus a synthetic HSN entry with `operstate=up`/`carrier=1`/a `device` symlink, and bind-mounts it over the pod's own `/sys/class/net` (`netns_linux.go`) — this is required because stock (unpatched) libfabric expects to find the HSN interface there, and the real `/sys/class/net` is read-only and namespace-scoped. The entry uses `PodAllocation.PodIfName` when set (the VF's `cxiN` interface) but derives its PCI function and speed from the host netdev in `HSNIface`; PF mode leaves the override empty and retains its prior name.
 
 A per-device mutex in the plugin serializes concurrent pod starts targeting the same device to prevent races in steps 2–4.
 
@@ -141,7 +141,7 @@ Scheduler ──allocates──► ResourceSlice (cxi0, cxi1, …; static, consu
                               ▼
                          slingshot-cni (host CNI plugin; cmd/slingshot-cni + internal/cni)
                          ├── ADD   per device: L2 IPVLAN on host <hsn_iface> → pod netns as
-                         │         <hsn_iface> (or <hsn_iface>_inet) → Whereabouts IPAM address
+                         │         <ifname> (or <ifname>_inet; defaults to <hsn_iface>) → Whereabouts IPAM address
                          ├── DEL   release Whereabouts address, delete IPVLAN (idempotent)
                          └── CHECK verify link up + IPAM state
 

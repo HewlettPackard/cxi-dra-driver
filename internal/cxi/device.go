@@ -75,7 +75,7 @@ type Device struct {
 	ParentSvcID int
 
 	// PodIfName is the pod-side interface name the CNI gives this device.
-	// Placeholder for now; empty until implemented.
+	// VFs use their CXI device name; PFs leave it empty to retain legacy naming.
 	PodIfName string
 }
 
@@ -311,6 +311,7 @@ func (x *discoverer) buildVF(c candidate, pfByPCI map[string]string) (*Device, e
 	dev.PFName = pfName
 	dev.VFIndex = vfIdx
 	dev.ParentSvcID = svcID
+	dev.PodIfName = dev.Name
 	return dev, nil
 }
 
