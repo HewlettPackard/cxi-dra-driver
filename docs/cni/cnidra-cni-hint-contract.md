@@ -88,7 +88,7 @@ the pod, matching how `AllocationStore` merges per-pod state across claims):
 
 | Field | Type | Meaning |
 |---|---|---|
-| `schema_version` | int, optional | Per-entry schema version; absent is treated as `1`. Version `1` includes the optional `ifname`. The CNI supports versions through `1`. |
+| `schema_version` | int, optional | Per-entry schema version; absent is the legacy unversioned format. Version `1` includes the optional `ifname`; the driver writes version `1` for VF hints. The CNI supports versions through `1`. |
 | `device` | string | CXI device name, e.g. `cxi0` — matches the `ResourceSlice` device name |
 | `hsn_iface` | string | The host link the CNI attaches the pod interface to: a PF netdev in PF mode or a VF netdev in VF mode. Same value as the device's `hsn_iface` `ResourceSlice` attribute; not necessarily the pod-side name. |
 | `ifname` | string, optional | Preferred pod-side interface name. When absent or empty, the CNI uses `hsn_iface`. |
@@ -98,7 +98,7 @@ the pod, matching how `AllocationStore` merges per-pod state across claims):
 
 The file remains a JSON array. Existing unversioned hints without `ifname`
 continue to work with the same names (`hsn2`, fallback `hsn2_inet`).
-For a distinct pod-side name, the version-1 contract accepts:
+For a distinct pod-side name, the driver writes version 1:
 
 ```json
 [
@@ -120,12 +120,16 @@ The CNI logs an explicit error and rejects entries with a newer
 `schema_version`; negative versions are also rejected. Hint schema versions
 are independent of the network config's `cniVersion`.
 
-The current PF driver writer continues to emit unversioned hints without
-`ifname`; emitting VF-specific names is separate driver work. Upgrade the
-host-installed CNI before enabling a writer that emits custom names:
-older CNI binaries ignore unknown JSON fields, including `ifname`, so they
-would still use the host name. Do not change a live pod's effective name
-between `ADD` and `DEL`/`CHECK`.
+The PF driver writer continues to emit unversioned hints without `ifname`,
+preserving its existing JSON. In VF mode the driver writes version-1 hints
+with `ifname` set to the selected VF's CXI device name (for example `cxi4`);
+`hsn_iface` remains the host VF netdev used as the IPVLAN parent. The NRI
+synthetic sysfs entry uses that same `ifname`, with its PCI device link and
+speed read from the host netdev. Use a host-installed CNI supporting the
+version-1 `ifname` field before enabling this writer: older binaries without
+schema validation may ignore unknown JSON fields, including `ifname`, and use
+the host name instead. Do not change a live pod's effective name between
+`ADD` and `DEL`/`CHECK`.
 
 ## hostPath directory convention
 

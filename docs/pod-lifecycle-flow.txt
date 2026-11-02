@@ -114,7 +114,7 @@ claim's status.allocation.devices.results[].consumedCapacity.
       │  reads hint file for K8S_POD_UID (bounded retry)
       │  per device:
       │    L2 IPVLAN sub-interface on host <hsn_iface> → moved into pod netns
-      │      renamed <hsn_iface>  (fallback <hsn_iface>_inet if taken), set up
+      │      renamed <ifname> or <hsn_iface> (fallback <name>_inet if taken), set up
       │    DelegateAdd(ipam.type=whereabouts, CNI_IFNAME=<in-pod name>)
       │      ▲ per-device CNI_IFNAME: Whereabouts keys on (containerID, ifname)
       │    apply returned address + routes
@@ -172,7 +172,8 @@ claim's status.allocation.devices.results[].consumedCapacity.
   Pod running ✓
       /dev/cxiN accessible, SLINGSHOT_DEVICES/VNIS/SVC_IDS set, netns-scoped VNI bound,
       stock libfabric discovers the HSN via the injected /sys/class/net,
-      <hsn_iface> IPVLAN netdev carries a Whereabouts address for IP over the HSN
+      <ifname> (or default <hsn_iface>) IPVLAN netdev carries a Whereabouts address
+      for IP over the HSN
 
 
 ══════════════════════════════════════════════════════════════════════════════════════
@@ -317,7 +318,7 @@ idempotent.
                             a separate host process exec'd by containerd/
                             Multus. ADD: per claimed device, L2 IPVLAN on the
                             host hsn_iface moved into the pod netns as
-                            <hsn_iface> (or <hsn_iface>_inet) + Whereabouts
+                            <ifname> (default hsn_iface, fallback <name>_inet) + Whereabouts
                             IPAM address; unwinds on partial failure. DEL:
                             release + delete, idempotent (missing hint/netns/
                             link = success; only IPVLAN links deleted). Owns

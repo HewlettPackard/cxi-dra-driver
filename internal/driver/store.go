@@ -16,7 +16,8 @@ import (
 type PodAllocation struct {
 	DeviceName     string          // programmable device: the PF ("cxi0") or, in VF mode, the VF chosen at Prepare ("cxi5")
 	DevPath        string          // e.g. "/dev/cxi0" — host path of the character device
-	HSNIface       string          // e.g. "hsn2"
+	HSNIface       string          // host link the CNI attaches to, e.g. "hsn2" or a VF netdev
+	PodIfName      string          // pod-side CNI/sysfs name; empty preserves PF-mode HSNIface naming
 	VNI            int             // Virtual Network Identifier for the Slingshot fabric service
 	Resources      cxi.ResourceSet // negotiated per-service resource limits
 	ClaimUID       types.UID

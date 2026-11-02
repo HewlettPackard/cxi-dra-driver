@@ -46,7 +46,7 @@ func newVFTestDriver(t *testing.T, nVFs int, objs ...runtime.Object) *Driver {
 	for i := range vfs {
 		name := fmt.Sprintf("cxi%d", i+1)
 		vfs[i] = &cxi.Device{
-			Name: name, Index: i + 1,
+			Name: name, Index: i + 1, PodIfName: name,
 			FunctionType: cxi.FunctionVF, PFName: "cxi0", ParentSvcID: 4,
 		}
 		vfSvcs[name] = []cxi.ServiceReservation{{IsSystem: true, ResourceLimits: true, Res: vfTestEth}}
@@ -136,7 +136,7 @@ func TestVFSelect_AllocationRecordsParentAndVF(t *testing.T) {
 		t.Fatalf("store = %+v, want one allocation", got)
 	}
 	a := got[0]
-	if a.DeviceName != "cxi1" || a.ParentName != vfTestParent || a.ShareID != "share-a" || a.AllocatedDevice() != vfTestParent {
+	if a.DeviceName != "cxi1" || a.PodIfName != "cxi1" || a.ParentName != vfTestParent || a.ShareID != "share-a" || a.AllocatedDevice() != vfTestParent {
 		t.Errorf("allocation = %+v, want VF cxi1 under %s with ShareID share-a", a, vfTestParent)
 	}
 }

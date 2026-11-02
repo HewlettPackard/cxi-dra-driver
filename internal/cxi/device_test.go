@@ -131,8 +131,8 @@ func TestDiscoverPFOnlyNode(t *testing.T) {
 			t.Fatalf("devices = %v, want [cxi0 cxi1]", got)
 		}
 		d := devs[0]
-		if d.IsVF() || d.FunctionType != FunctionPF || d.VFIndex != -1 || d.PFName != "" {
-			t.Errorf("cxi0 = %+v, want a PF with VFIndex -1 and no PFName", d)
+		if d.IsVF() || d.FunctionType != FunctionPF || d.VFIndex != -1 || d.PFName != "" || d.PodIfName != "" {
+			t.Errorf("cxi0 = %+v, want a PF with VFIndex -1 and no PFName or PodIfName", d)
 		}
 		if d.HSNIface != "hsn3" || d.PCIBusID != "0000:c5:00.0" || d.NUMANode != 3 {
 			t.Errorf("cxi0 hsn=%q pci=%q numa=%d, want hsn3 0000:c5:00.0 3", d.HSNIface, d.PCIBusID, d.NUMANode)
@@ -186,8 +186,8 @@ func TestDiscoverSRIOVNodeVFOnly(t *testing.T) {
 	if got := deviceNames(devs); !reflect.DeepEqual(got, []string{"cxi4", "cxi5", "cxi10"}) {
 		t.Fatalf("devices = %v, want [cxi4 cxi5 cxi10] in index order", got)
 	}
-	for i, want := range []struct{ pci, hsn string }{
-		{"0000:c5:00.1", "enp197s0f1"}, {"0000:c5:00.2", "enp197s0f2"}, {"0000:c5:00.3", ""},
+	for i, want := range []struct{ pci, hsn, ifname string }{
+		{"0000:c5:00.1", "enp197s0f1", "cxi4"}, {"0000:c5:00.2", "enp197s0f2", "cxi5"}, {"0000:c5:00.3", "", "cxi10"},
 	} {
 		d := devs[i]
 		if !d.IsVF() || d.PFName != "cxi0" || d.VFIndex != i {
@@ -196,9 +196,9 @@ func TestDiscoverSRIOVNodeVFOnly(t *testing.T) {
 		if d.PCIBusID != want.pci || d.HSNIface != want.hsn {
 			t.Errorf("%s: pci=%q hsn=%q, want %q %q", d.Name, d.PCIBusID, d.HSNIface, want.pci, want.hsn)
 		}
-		if d.Capacity != (ResourceSet{}) || d.Reserved != (ResourceSet{}) || d.ParentSvcID != 4 || d.PodIfName != "" {
-			t.Errorf("%s: capacity=%+v reserved=%+v parent=%d podif=%q, want zero capacity/reserved/podif and parent 4",
-				d.Name, d.Capacity, d.Reserved, d.ParentSvcID, d.PodIfName)
+		if d.Capacity != (ResourceSet{}) || d.Reserved != (ResourceSet{}) || d.ParentSvcID != 4 || d.PodIfName != want.ifname {
+			t.Errorf("%s: capacity=%+v reserved=%+v parent=%d podif=%q, want zero capacity/reserved, parent 4 and podif %q",
+				d.Name, d.Capacity, d.Reserved, d.ParentSvcID, d.PodIfName, want.ifname)
 		}
 	}
 	if len(*opened) != 0 {

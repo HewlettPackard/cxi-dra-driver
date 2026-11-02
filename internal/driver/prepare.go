@@ -492,7 +492,12 @@ func (d *Driver) usableCeiling(deviceName string) cxi.ResourceSet {
 func (d *Driver) podAllocationBase(deviceName string) PodAllocation {
 	for _, dev := range d.programmableDevices() {
 		if dev.Name == deviceName {
-			return PodAllocation{DeviceName: dev.Name, DevPath: dev.DevPath, HSNIface: dev.HSNIface}
+			return PodAllocation{
+				DeviceName: dev.Name,
+				DevPath:    dev.DevPath,
+				HSNIface:   dev.HSNIface,
+				PodIfName:  dev.PodIfName,
+			}
 		}
 	}
 	return PodAllocation{DeviceName: deviceName}

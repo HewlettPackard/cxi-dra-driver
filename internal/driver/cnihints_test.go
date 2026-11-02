@@ -7,10 +7,13 @@ import (
 	"path/filepath"
 	"testing"
 
+	corev1 "k8s.io/api/core/v1"
 	resourceapi "k8s.io/api/resource/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/dynamic-resource-allocation/kubeletplugin"
+
+	"github.com/slingshot/cxi-dra-driver/internal/cni"
 )
 
 func readHintFile(t *testing.T, dir string, podUID types.UID) []CNIHint {
@@ -40,6 +43,77 @@ func TestWriteCNIHint_SingleDevice(t *testing.T) {
 	want := []CNIHint{{Device: "cxi0", HSNIface: "hsn0", VNI: 137}}
 	if len(got) != 1 || got[0] != want[0] {
 		t.Fatalf("hint file = %+v, want %+v", got, want)
+	}
+	data, err := os.ReadFile(d.cniHintPath(pod))
+	if err != nil {
+		t.Fatalf("reading hint JSON: %v", err)
+	}
+	const wantJSON = `[
+  {
+    "device": "cxi0",
+    "hsn_iface": "hsn0",
+    "vni": 137
+  }
+]`
+	if string(data) != wantJSON {
+		t.Errorf("PF hint JSON = %s, want unchanged unversioned schema:\n%s", data, wantJSON)
+	}
+}
+
+func TestWriteCNIHint_VFNameRoundTrip(t *testing.T) {
+	d := newTestDriver()
+	d.cniHintsDir = t.TempDir()
+	pod := types.UID("pod-vf")
+	d.store.Set(pod, []PodAllocation{{
+		DeviceName: "cxi4",
+		HSNIface:   "enp197s0f1",
+		PodIfName:  "cxi4",
+		VNI:        137,
+	}})
+
+	if err := d.writeCNIHint(pod); err != nil {
+		t.Fatalf("writeCNIHint: %v", err)
+	}
+
+	got, err := cni.ReadHint(d.cniHintsDir, string(pod), 0, 0)
+	if err != nil {
+		t.Fatalf("CNI ReadHint: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("CNI parsed %d hints, want one", len(got))
+	}
+	if got[0].SchemaVersion != 1 ||
+		got[0].Device != "cxi4" ||
+		got[0].HSNIface != "enp197s0f1" ||
+		got[0].IfName != "cxi4" ||
+		got[0].VNI != 137 {
+		t.Errorf("CNI parsed hint = %+v, want v1 cxi4 on host parent enp197s0f1, VNI 137", got[0])
+	}
+
+	if _, err := d.kubeClient.CoreV1().Pods(testNamespace).Create(
+		context.Background(),
+		&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "vf-pod", Namespace: testNamespace}},
+		metav1.CreateOptions{},
+	); err != nil {
+		t.Fatalf("creating pod for annotation test: %v", err)
+	}
+	d.annotatePodCNIHints(context.Background(), testNamespace, "vf-pod", cniHintsFor(d.store.Get(pod)))
+	annotated, err := d.kubeClient.CoreV1().Pods(testNamespace).Get(context.Background(), "vf-pod", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("reading annotated pod: %v", err)
+	}
+	var annotationHints []CNIHint
+	if err := json.Unmarshal([]byte(annotated.Annotations[cniHintAnnotationKey]), &annotationHints); err != nil {
+		t.Fatalf("parsing pod CNI hint annotation: %v", err)
+	}
+	if len(annotationHints) != 1 || annotationHints[0] != (CNIHint{
+		SchemaVersion: 1,
+		Device:        "cxi4",
+		HSNIface:      "enp197s0f1",
+		IfName:        "cxi4",
+		VNI:           137,
+	}) {
+		t.Errorf("pod CNI hint annotation = %+v, want the same VF hint as the file", annotationHints)
 	}
 }
 

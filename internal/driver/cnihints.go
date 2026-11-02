@@ -11,17 +11,20 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 )
 
-// CNIHint is one claimed device's entry in a pod's CNI hint file. This is the
-// read-side contract for the Slingshot CNI plugin: a
-// CNI plugin invoked by containerd/CRI for RunPodSandbox has no access to
-// this driver's in-process AllocationStore, so the allocation is handed off
-// via a host file instead. See docs/cni/cnidra-cni-hint-contract.md for the full
-// contract, including why ordering against CNI ADD is guaranteed.
+// CNIHint is one claimed device's entry in a pod's CNI hint file. It is the
+// driver writer's side of the JSON contract with slingshot-cni: a CNI plugin
+// invoked by containerd/CRI for RunPodSandbox has no access to this driver's
+// in-process AllocationStore, so the allocation is handed off via a host file.
+// See docs/cni/cnidra-cni-hint-contract.md for the full contract.
 type CNIHint struct {
-	Device   string `json:"device"`
-	HSNIface string `json:"hsn_iface"`
-	VNI      int    `json:"vni"`
+	SchemaVersion int    `json:"schema_version,omitempty"`
+	Device        string `json:"device"`
+	HSNIface      string `json:"hsn_iface"`
+	IfName        string `json:"ifname,omitempty"`
+	VNI           int    `json:"vni"`
 }
+
+const cniHintSchemaVersionIfName = 1
 
 // cniHintPath returns the host path of the hint file for a pod.
 func (d *Driver) cniHintPath(podUID types.UID) string {
@@ -33,7 +36,12 @@ func (d *Driver) cniHintPath(podUID types.UID) string {
 func cniHintsFor(allocs []PodAllocation) []CNIHint {
 	hints := make([]CNIHint, 0, len(allocs))
 	for _, a := range allocs {
-		hints = append(hints, CNIHint{Device: a.DeviceName, HSNIface: a.HSNIface, VNI: a.VNI})
+		h := CNIHint{Device: a.DeviceName, HSNIface: a.HSNIface, VNI: a.VNI}
+		if a.PodIfName != "" {
+			h.SchemaVersion = cniHintSchemaVersionIfName
+			h.IfName = a.PodIfName
+		}
+		hints = append(hints, h)
 	}
 	return hints
 }
