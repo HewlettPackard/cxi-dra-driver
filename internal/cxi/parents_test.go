@@ -142,3 +142,40 @@ func TestDiscoverWarnsOnPFWithoutVFs(t *testing.T) {
 		t.Errorf("logs %q: want a warning for cxi1 only", logs)
 	}
 }
+
+func TestDiscoverPFTopologyOnParents(t *testing.T) {
+	f := newFakeSysfs(t)
+	pf0, pf1 := f.pciDev("0000:c5:00.0"), f.pciDev("0000:cd:00.0")
+	// cxi1 has a different NUMA node and no netdev.
+	if err := os.WriteFile(filepath.Join(pf1, "numa_node"), []byte("-1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f.link("cxi_user", "cxi0", pf0)
+	f.link("cxi_user", "cxi1", pf1)
+	f.link("net", "hsn3", pf0)
+	addVF(f, "cxi0", pf0, 0, "cxi4", "0000:c5:00.1", "4")
+	addVF(f, "cxi0", pf0, 1, "cxi5", "0000:c5:00.2", "5")
+	addVF(f, "cxi1", pf1, 0, "cxi6", "0000:cd:00.1", "4")
+
+	devs, logs := vfOnly(t, f)
+	type topo struct {
+		pci   string
+		numa  int
+		netdv string
+	}
+	got := map[string]topo{}
+	for _, p := range Parents(devs) {
+		got[p.Name()] = topo{p.PFPCIBusID, p.PFNUMANode, p.PFNetdev}
+	}
+	want := map[string]topo{
+		"cxi0-svc4": {"0000:c5:00.0", 3, "hsn3"},
+		"cxi0-svc5": {"0000:c5:00.0", 3, "hsn3"},
+		"cxi1-svc4": {"0000:cd:00.0", -1, ""},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("parent PF topology = %v, want %v", got, want)
+	}
+	if !logged(logs, "WARNING: PF cxi1 has no netdev") || logged(logs, "WARNING: PF cxi0 has no netdev") {
+		t.Errorf("logs %q: want a netdev warning for cxi1 only", logs)
+	}
+}

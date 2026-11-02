@@ -58,6 +58,8 @@ MutatingAdmissionPolicy (in-process in API server)
     └── intercepts ResourceClaim CREATE
           └── converts legacy opaque config (txqs …, le_pools, tle_pools)
                 into capacity.requests
+          └── appends a VNI selector to each CXI request, so only devices
+                whose VNI set covers the namespace VNI are considered (VF mode)
     └── intercepts Pod CREATE
           └── injects Multus slingshot-hsn network annotation
                 for Pods referencing CXI ResourceClaimTemplates
@@ -204,7 +206,7 @@ Most-used values (full list in the [chart README](deploy/helm/cxi-dra-driver/REA
 | `image.repository` / `image.tag` | `ghcr.io/bristol-supercomputing/cxi-dra` / `main` | driver image (pin a commit-sha or `v*` tag for a reproducible install) |
 | `driver.vniRange.start` / `.end` | `100` / `300` | per-namespace VNI pool |
 | `driver.systemSvcIDs` | `[1,2,3,4]` | blessed system services (never reaped; their usage is reserved) |
-| `admissionPolicy.excludedNamespaces` | `[kube-system]` | namespaces the policy ignores |
+| `admissionPolicy.excludedNamespaces` | `[kube-system]` | namespaces the policies (capacity conversion and VNI selector) ignore |
 | `resourceClaimTemplates.namespaces` | `[default]` | namespaces to render the templates into (one copy each) |
 
 Because every object keys off `driverName`, a second install under a different name is fully
@@ -618,7 +620,20 @@ Each device in the `ResourceSlice` exposes the following driver-specific attribu
 | Attribute | Type | Description |
 |---|---|---|
 | `type` | string | Always `"device"`; matched by the DeviceClass selector |
-| `hsn_iface` | string | Associated HSN network interface (e.g. `"hsn2"`) |
+| `function_type` | string | `"pf"` for a physical function, `"parent"` for an SR-IOV parent service (`--vf-only`) |
+| `hsn_iface` | string | Associated HSN network interface (e.g. `"hsn2"`). PF devices only: a parent spans several VF netdevs and cannot promise one |
+
+With `--vf-only` the published device is a **parent** (`<pf>-svc<id>`), not a VF; VFs stay unpublished and exclusive, one per allocation. A parent adds:
+
+| Attribute | Type | Description |
+|---|---|---|
+| `pf_name` | string | CXI name of the parent's PF (e.g. `"cxi0"`) |
+| `pf_netdev` | string | The PF's netdev; omitted when it cannot be resolved |
+| `parent_svc_id` | int | The parent service id on the PF |
+| `vni_min`, `vni_max` | int | The parent's VNI set when it is a contiguous range (also a list of consecutive VNIs) |
+| `vni_set` | string | The VNI set otherwise, wrapped in delimiters (`",40,42,"`) so `vni_set.contains(",42,")` works without the `split` string extension. A parent whose set could not be read publishes `","`, which no namespace matches |
+
+A device publishes either `vni_min`/`vni_max` or `vni_set`, never both; PF devices publish neither. Its `resource.kubernetes.io/numaNode` and `pciBusID` (below) are the PF's.
 
 The per-resource `capacity_*` (hardware total) and `avail_*` (live headroom) attributes are no longer published: placement is governed by consumable capacity below, and the `ClaimBinder` reads live headroom from the hardware directly. To see how much of a device is allocated, sum `consumedCapacity` across the claims allocated to it.
 
@@ -634,6 +649,11 @@ Each device also publishes consumable capacity, requested under `spec.devices.re
 | `acs` | 2 | — | Address contexts |
 | `les` | 0 | 1024 | List entries (one LE pool per step) |
 | `tles` | 0 | 512 | Triggered list entries (one TLE pool per step) |
+| `vfs` | 1 | — | Parents only: the number of VFs, one per allocation (valid range 1–1), so a VF is never shared |
+
+On a parent `les` and `tles` are 0 (a VF's service inherits them from the parent), so the scheduler rejects any non-zero LE/TLE request: in VF mode use `le_pools: 0` / `tle_pools: 0` or omit them.
+
+**VNI selector.** The `cxi-dra-vni-selector` `MutatingAdmissionPolicy` appends a CEL selector to every CXI request in a namespace carrying the `cxi.slingshot.hpe.com/vni` annotation, keeping the scheduler off parents whose VNI set does not cover it (a user-supplied selector is kept; PF devices always match; a missing or malformed annotation skips the policy and the driver's Prepare/`ClaimBinder` check applies). It is needed because a VNI mismatch is static: the scheduler would otherwise re-allocate the same parent after each `Unschedulable` bounce without ever trying a covering one.
 
 Each device also exposes the Kubernetes [standard device attributes](https://kubernetes.io/docs/reference/node/dra-standard-device-attributes/) under the `resource.kubernetes.io` domain, letting CEL selectors and `matchAttribute` constraints compare CXI devices against devices from other DRA drivers without driver-specific knowledge. `numaNode` is omitted when the device's NUMA affinity is unknown:
 

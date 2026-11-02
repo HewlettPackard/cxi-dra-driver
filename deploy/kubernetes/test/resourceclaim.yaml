@@ -21,6 +21,8 @@
 # 0 LEs/TLEs). LEs and TLEs are absolute counts; the scheduler rounds them up
 # to whole pools (1024 LEs, 512 TLEs). Claims still using the old opaque
 # config (le_pools/tle_pools etc.) are converted by the admission policy.
+# In VF mode (--vf-only) the parent devices publish 0 LEs/TLEs, so LE/TLE
+# requests must be 0 (le_pools: 0 / tle_pools: 0, or omitted).
 #
 # Parameter reference (concise — see README "Resource field reference" for
 # the source-grounded explanation of what each field actually controls):

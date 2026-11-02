@@ -1,6 +1,7 @@
 {{- if .Values.admissionPolicy.enabled }}
 {{- $driver := include "cxi-dra.driverName" . }}
 {{- $fullname := include "cxi-dra.fullname" . }}
+{{- $deviceClass := include "cxi-dra.deviceClassName" . }}
 ---
 # MutatingAdmissionPolicy: convert legacy CXI opaque resource config into
 # consumable-capacity requests, so claims written for the opaque-config API
@@ -25,6 +26,10 @@
 # LE/TLE pool conversion (must match LEPoolSize/TLEPoolSize in internal/cxi/resources.go):
 #   le_pools  * 1024 = les   (LEPoolSize)
 #   tle_pools * 512  = tles  (TLEPoolSize)
+#
+# In VF mode (--vf-only) the published parent devices have 0 LEs/TLEs (the VFs'
+# children inherit them from the parent), so the scheduler rejects any claim
+# that converts to a non-zero value: use le_pools: 0 / tle_pools: 0, or omit them.
 apiVersion: admissionregistration.k8s.io/v1
 kind: MutatingAdmissionPolicy
 metadata:
@@ -108,6 +113,128 @@ metadata:
     {{- include "cxi-dra.labels" . | nindent 4 }}
 spec:
   policyName: {{ include "cxi-dra.fullname" . }}-capacity-conversion
+  matchResources:
+    namespaceSelector:
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: NotIn
+          values:
+            {{- toYaml .Values.admissionPolicy.excludedNamespaces | nindent 12 }}
+---
+# MutatingAdmissionPolicy: restrict every CXI request to devices whose VNI set
+# covers the claim's namespace VNI.
+#
+# VF-mode parents publish the VNIs they allow (vni_min/vni_max, or the
+# delimiter-wrapped vni_set; PF devices publish neither and always match).
+# A namespace VNI that a parent does not cover is a static mismatch, so it must
+# be excluded before allocation: the scheduler's allocator is first-fit in
+# slice order and does not exclude a device that just failed binding, so a
+# ClaimBinder Unschedulable bounce would re-allocate the same parent forever
+# while a covering parent is never tried. The namespace VNI is annotated by the
+# VNI allocator before the claim controller creates the claim from its
+# template, and namespaceObject is available to the policy.
+#
+# This is its own policy, not a second mutation of the capacity-conversion
+# policy, because matchConditions apply to every mutation of a policy and that
+# one only matches claims carrying the legacy opaque config.
+#
+# Logic:
+#   - Intercept ResourceClaim CREATE in any namespace except the excluded ones
+#   - Skip unless the claim's namespace carries a valid cxi.slingshot.hpe.com/vni
+#     annotation (digits only, 1-65535): without it the driver's fallback in
+#     Prepare/ClaimBinder applies, and the value is spliced into a CEL
+#     expression the scheduler evaluates, so it is validated first. The check
+#     is a variable, not a matchCondition: namespaceObject does not exist in
+#     matchConditions, and failurePolicy Ignore would hide the compile error
+#   - For each request whose exactly.deviceClassName is this chart's DeviceClass,
+#     append the selector below to exactly.selectors; a selector the user
+#     supplied is kept
+#
+# Requests that use firstAvailable subrequests (no "exactly") are not touched.
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingAdmissionPolicy
+metadata:
+  name: {{ $fullname }}-vni-selector
+  labels:
+    {{- include "cxi-dra.labels" . | nindent 4 }}
+spec:
+  failurePolicy: Ignore  # never block claim creation if the policy errors
+  reinvocationPolicy: Never
+  matchConstraints:
+    resourceRules:
+      - apiGroups:   ["resource.k8s.io"]
+        apiVersions: ["v1"]
+        operations:  ["CREATE"]
+        resources:   ["resourceclaims"]
+  matchConditions:
+    - name: targets-cxi-device-class
+      expression: >
+        has(object.spec.devices.requests) &&
+        object.spec.devices.requests.exists(r,
+          has(r.exactly) && r.exactly.deviceClassName == "{{ $deviceClass }}")
+
+  variables:
+    # namespaceObject is NOT available in matchConditions: an expression using
+    # it fails to compile and, with failurePolicy Ignore, silently disables the
+    # policy. It is available in variables and mutations, so the namespace is
+    # checked here and the mutation returns no patch when the check fails.
+    - name: vni_valid
+      expression: >
+        has(namespaceObject.metadata.annotations) &&
+        "{{ $driver }}/vni" in namespaceObject.metadata.annotations &&
+        namespaceObject.metadata.annotations["{{ $driver }}/vni"].matches("^[0-9]{1,5}$") &&
+        int(namespaceObject.metadata.annotations["{{ $driver }}/vni"]) >= 1 &&
+        int(namespaceObject.metadata.annotations["{{ $driver }}/vni"]) <= 65535
+
+    # Canonical decimal form of the validated annotation.
+    - name: vni
+      expression: >
+        string(int(namespaceObject.metadata.annotations["{{ $driver }}/vni"]))
+    # Matches devices without VNI attributes (PFs), and parents whose VNI set
+    # covers the VNI, in either published form.
+    - name: selector
+      expression: >
+        '(!has(device.attributes["{{ $driver }}"].vni_min) && !has(device.attributes["{{ $driver }}"].vni_set)) || ' +
+        '(has(device.attributes["{{ $driver }}"].vni_min) && device.attributes["{{ $driver }}"].vni_min <= ' + variables.vni +
+        ' && ' + variables.vni + ' <= device.attributes["{{ $driver }}"].vni_max) || ' +
+        '(has(device.attributes["{{ $driver }}"].vni_set) && device.attributes["{{ $driver }}"].vni_set.contains(",' + variables.vni + ',"))'
+
+  mutations:
+    # A claim has at most 32 requests (the API limit), hence the fixed index list.
+    # First create selectors where the request has none, then append to every
+    # CXI request, so a user-supplied selector is never replaced. No patch at
+    # all unless the namespace carries a valid VNI annotation.
+    - patchType: JSONPatch
+      jsonPatch:
+        expression: >
+          variables.vni_valid ? (
+          [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+           16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31]
+            .filter(i, i < size(object.spec.devices.requests) &&
+                       has(object.spec.devices.requests[i].exactly) &&
+                       object.spec.devices.requests[i].exactly.deviceClassName == "{{ $deviceClass }}" &&
+                       !has(object.spec.devices.requests[i].exactly.selectors))
+            .map(i, JSONPatch{op: "add",
+                              path: "/spec/devices/requests/" + string(i) + "/exactly/selectors",
+                              value: []}) +
+          [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+           16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31]
+            .filter(i, i < size(object.spec.devices.requests) &&
+                       has(object.spec.devices.requests[i].exactly) &&
+                       object.spec.devices.requests[i].exactly.deviceClassName == "{{ $deviceClass }}")
+            .map(i, JSONPatch{op: "add",
+                              path: "/spec/devices/requests/" + string(i) + "/exactly/selectors/-",
+                              value: {"cel": {"expression": variables.selector}}})
+          ) : []
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingAdmissionPolicyBinding
+metadata:
+  name: {{ $fullname }}-vni-selector-binding
+  labels:
+    {{- include "cxi-dra.labels" . | nindent 4 }}
+spec:
+  policyName: {{ $fullname }}-vni-selector
   matchResources:
     namespaceSelector:
       matchExpressions:

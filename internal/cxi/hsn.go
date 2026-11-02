@@ -40,9 +40,20 @@ func pairDevice(dev *Device, netPath string) error {
 		return fmt.Errorf("resolving CXI sysfs link for %s: %w", dev.Name, err)
 	}
 
+	iface, err := netdevOnPCIPath(netPath, cxiPCIPath)
+	if err != nil {
+		return fmt.Errorf("%s: %w", dev.Name, err)
+	}
+	dev.HSNIface = iface
+	return nil
+}
+
+// netdevOnPCIPath returns the netdev in netPath whose resolved device link is
+// the PCI function at pciPath (already symlink-resolved).
+func netdevOnPCIPath(netPath, pciPath string) (string, error) {
 	entries, err := os.ReadDir(netPath)
 	if err != nil {
-		return fmt.Errorf("reading %s: %w", netPath, err)
+		return "", fmt.Errorf("reading %s: %w", netPath, err)
 	}
 
 	for _, e := range entries {
@@ -52,11 +63,10 @@ func pairDevice(dev *Device, netPath string) error {
 			// Virtual netdevs (lo, bridges, veth) have no device link.
 			continue
 		}
-		if ifacePCIPath == cxiPCIPath {
-			dev.HSNIface = iface
-			return nil
+		if ifacePCIPath == pciPath {
+			return iface, nil
 		}
 	}
 
-	return fmt.Errorf("no netdev found for %s on PCI function %s", dev.Name, cxiPCIPath)
+	return "", fmt.Errorf("no netdev found on PCI function %s", pciPath)
 }

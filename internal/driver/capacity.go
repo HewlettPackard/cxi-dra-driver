@@ -24,6 +24,12 @@ const (
 	capACs  resourceapi.QualifiedName = "acs"
 	capLEs  resourceapi.QualifiedName = "les"
 	capTLEs resourceapi.QualifiedName = "tles"
+
+	// capVFs is published on VF-mode parents only. Each allocation takes
+	// exactly one, so a parent with N VFs is shared by at most N pods and a
+	// VF is never given to two pods at once. It is a count of VFs, not a CXI
+	// resource, so it is absent from cxi.ResourceSet.
+	capVFs resourceapi.QualifiedName = "vfs"
 )
 
 // defaultRequest is what an allocation consumes for any capacity the claim
@@ -81,6 +87,18 @@ func deviceCapacity(value, def, step int64) resourceapi.DeviceCapacity {
 		RequestPolicy: &resourceapi.CapacityRequestPolicy{
 			Default:    qty(def),
 			ValidRange: r,
+		},
+	}
+}
+
+// vfsCapacity is the parent's vfs capacity: nVFs in total, one per allocation
+// (default 1, valid range [1, 1]) so a claim cannot take more or fewer.
+func vfsCapacity(nVFs int) resourceapi.DeviceCapacity {
+	return resourceapi.DeviceCapacity{
+		Value: *qty(int64(nVFs)),
+		RequestPolicy: &resourceapi.CapacityRequestPolicy{
+			Default:    qty(1),
+			ValidRange: &resourceapi.CapacityRequestPolicyRange{Min: qty(1), Max: qty(1)},
 		},
 	}
 }

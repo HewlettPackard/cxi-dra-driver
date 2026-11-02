@@ -63,7 +63,7 @@ See [values.yaml](values.yaml) for the full set. Most-used:
 | `driver.vniRange.start/end` | `100`/`300` | per-namespace VNI pool |
 | `driver.systemSvcIDs` | `[1,2,3,4]` | blessed system service svc_ids (never reaped; their usage is reserved) |
 | `resourceClaimTemplates.namespaces` | `[default]` | namespaces the templates are rendered into, one copy each (falls back to singular `namespace` when empty) |
-| `admissionPolicy.excludedNamespaces` | `[kube-system]` | namespaces the policy ignores |
+| `admissionPolicy.excludedNamespaces` | `[kube-system]` | namespaces the policies (capacity conversion and VNI selector) ignore |
 | `cni.install` | `false` | install the bundled `slingshot-cni` into `cni.binDir` (default `/opt/cni/bin`) at driver startup |
 | `cni.nad.create` | `false` | render the `slingshot-hsn` NetworkAttachmentDefinition and the pod network-injection policy; `cni.nad.ipam` is the Whereabouts block |
 

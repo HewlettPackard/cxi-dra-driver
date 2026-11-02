@@ -140,9 +140,10 @@ cni:
     retryTimeout: ""
 
 admissionPolicy:
-  # -- Render the MutatingAdmissionPolicy + Binding that converts legacy opaque
+  # -- Render the MutatingAdmissionPolicies + Bindings that convert legacy opaque
   # resource config (txqs, ..., le_pools, tle_pools) on claims for this install's
-  # driver into consumable-capacity requests.
+  # driver into consumable-capacity requests, and that append the namespace-VNI
+  # selector to every claim request for this install's DeviceClass.
   enabled: true
   # -- Namespaces the policy does NOT mutate.
   excludedNamespaces:
@@ -210,6 +211,9 @@ resourceClaimTemplates:
   namespace: default
   # Each template's params become capacity requests (le_pools x 1024 = les,
   # tle_pools x 512 = tles). Omitted fields consume the device default.
+  # VF mode (--vf-only): parents publish 0 LEs/TLEs, so the scheduler rejects
+  # every template below that sets a non-zero le_pools or tle_pools; override
+  # them with le_pools: 0 / tle_pools: 0 for VF nodes.
   templates:
     # cxi-small — benchmarks, fi_pingpong, development, simple single-threaded tools.
     - name: small
