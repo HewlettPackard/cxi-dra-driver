@@ -14,6 +14,7 @@
 # per-namespace by the leader-elected allocator and read at prepare time.
 # Resources are consumable-capacity requests charged against the device by the
 # scheduler; le_pools/tle_pools in values are converted to absolute LEs/TLEs.
+# LE/TLE must be 0 on a VF-mode (--vf-only) node: parents publish none.
 # A field left out of params consumes the device's requestPolicy default.
 apiVersion: resource.k8s.io/v1
 kind: ResourceClaimTemplate

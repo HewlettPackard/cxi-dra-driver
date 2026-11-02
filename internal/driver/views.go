@@ -86,6 +86,8 @@ type publishedDevice struct {
 	numaNode int
 	pciBusID string
 	hsnIface string
+	// parent is set for a VF-mode parent and nil for a PF.
+	parent *parentInfo
 }
 
 // publishedDevices is what the ResourceSlice, the ClaimBinder and the pending
@@ -101,8 +103,8 @@ func (d *Driver) publishedDevices() []publishedDevice {
 	parents := d.parents.list()
 	out := make([]publishedDevice, 0, len(parents))
 	for _, p := range parents {
-		// A parent's VFs share the PF's NUMA node; it has no single netdev or PCI function.
-		out = append(out, publishedDevice{name: p.Name(), numaNode: p.VFs[0].NUMANode})
+		// A parent has no single netdev; its topology is its PF's.
+		out = append(out, publishedDevice{name: p.Name(), numaNode: p.PFNUMANode, pciBusID: p.PFPCIBusID, parent: p})
 	}
 	return out
 }
@@ -137,6 +139,8 @@ func (d *Driver) setupParents() {
 // cover the cluster VNI range, and fewer remaining LEs than one pool.
 func (d *Driver) warnParent(p *parentInfo) {
 	if p.vnis.IsEmpty() {
+		d.logf("warning: parent %s has no readable VNI set; publishing vni_set=%q so the admission selector never matches it and no namespace is scheduled onto it",
+			p.Name(), noVNIs)
 		return
 	}
 	if d.vniRangeStart != 0 || d.vniRangeEnd != 0 {

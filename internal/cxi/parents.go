@@ -23,6 +23,11 @@ type Parent struct {
 	SvcID int
 	// VFs are the VFs assigned to this parent, in device index order.
 	VFs []*Device
+	// PFPCIBusID, PFNUMANode and PFNetdev are the PF's topology, shared by
+	// every VF of the parent (see Device). Unknown values are "", -1 and "".
+	PFPCIBusID string
+	PFNUMANode int
+	PFNetdev   string
 }
 
 // Name is the parent's DRA device name, <pf>-svc<id>.
@@ -47,7 +52,10 @@ func Parents(vfs []*Device) []*Parent {
 		k := key{d.PFName, d.ParentSvcID}
 		p, ok := byKey[k]
 		if !ok {
-			p = &Parent{PFName: d.PFName, SvcID: d.ParentSvcID}
+			p = &Parent{
+				PFName: d.PFName, SvcID: d.ParentSvcID,
+				PFPCIBusID: d.PFPCIBusID, PFNUMANode: d.PFNUMANode, PFNetdev: d.PFNetdev,
+			}
 			byKey[k] = p
 			out = append(out, p)
 		}

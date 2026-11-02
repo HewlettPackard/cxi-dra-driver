@@ -57,6 +57,14 @@ type Device struct {
 	// PFName is the cxi name of the PF a VF belongs to ("" for a PF).
 	PFName string
 
+	// PFPCIBusID, PFNUMANode and PFNetdev describe a VF's PF, read from sysfs
+	// without opening the PF: its PCI address, its NUMA node (-1 if unknown)
+	// and its netdev (e.g. "hsn0", "" if none). A VF-mode parent publishes
+	// them as its own topology. Zero values for a PF.
+	PFPCIBusID string
+	PFNUMANode int
+	PFNetdev   string
+
 	// VFIndex is the VF's index under its PF, from the PF's virtfnN link.
 	// Meaningful only for a VF.
 	VFIndex int
@@ -186,6 +194,7 @@ func (x *discoverer) discover(opts DiscoverOptions) ([]*Device, error) {
 		}
 	}
 
+	pfs := make(map[string]pfInfo)
 	var devices []*Device
 	for _, c := range cands {
 		var dev *Device
@@ -202,6 +211,12 @@ func (x *discoverer) discover(opts DiscoverOptions) ([]*Device, error) {
 				x.logf("ERROR: skipping VF %s: %v", c.name, err)
 				continue
 			}
+			pf, ok := pfs[c.pfPCI]
+			if !ok {
+				pf = x.readPF(dev.PFName, c.pfPCI)
+				pfs[c.pfPCI] = pf
+			}
+			dev.PFPCIBusID, dev.PFNUMANode, dev.PFNetdev = pf.pciBusID, pf.numaNode, pf.netdev
 		default:
 			dev, err = x.buildPF(c, opts.SystemSvcIDs)
 			if err != nil {
@@ -297,6 +312,29 @@ func (x *discoverer) buildVF(c candidate, pfByPCI map[string]string) (*Device, e
 	dev.VFIndex = vfIdx
 	dev.ParentSvcID = svcID
 	return dev, nil
+}
+
+// pfInfo is what a VF-mode parent reports about its PF.
+type pfInfo struct {
+	pciBusID string
+	numaNode int
+	netdev   string
+}
+
+// readPF reads the PF's PCI address, NUMA node and netdev from sysfs alone.
+// Anything it cannot resolve is left empty (-1 for the NUMA node) and logged
+// once per PF, since the ResourceSlice omits the matching attribute.
+func (x *discoverer) readPF(name, pfPCI string) pfInfo {
+	pf := pfInfo{
+		pciBusID: readPCISlot(filepath.Join(pfPCI, "uevent")),
+		numaNode: readIntFile(filepath.Join(pfPCI, "numa_node"), -1),
+	}
+	netdev, err := netdevOnPCIPath(x.netPath, pfPCI)
+	if err != nil {
+		x.logf("WARNING: PF %s has no netdev; its parents publish no pf_netdev: %v", name, err)
+	}
+	pf.netdev = netdev
+	return pf
 }
 
 // dropUnlimitedParents drops the VFs of every parent without resource limits:
