@@ -86,6 +86,13 @@ driver:
   vniRange:
     start: 100
     end: 300
+  # -- SR-IOV VF mode (`--vf-only`): publish each parent CXI service of the node's
+  # VFs as one shareable device instead of publishing PFs. Every node this
+  # install runs on must already have its parents and VFs provisioned (see
+  # README § SR-IOV VF mode); PF and VF nodes cannot be mixed in one install,
+  # so use `nodeSelector` (and a separate `driverName`) for a second install.
+  # `systemSvcIDs` is ignored in this mode (the driver logs a warning).
+  vfOnly: false
   # -- Blessed system services present on every node — typically the default
   # service (svc_id 1) and the Ethernet service(s). These are never torn down by
   # the driver, and their actual reserved resources are deducted from each
@@ -103,8 +110,8 @@ deviceClass:
 # Optional Slingshot CNI plugin (slingshot-cni). Gives each CXI-claiming pod an
 # L2 IPVLAN netdev on its HSN with a Whereabouts-assigned address — see
 # docs/cni/cni-plugin.md. Entirely OPT-IN: a site may instead keep hostNetwork
-# pods, or (future) SR-IOV VFs, and the driver behaves identically with the
-# CNI absent. Everything below is off by default and renders nothing.
+# pods, and the driver behaves identically with the CNI absent. Everything below
+# is off by default and renders nothing.
 cni:
   # -- Install the slingshot-cni binary bundled in the driver image onto each
   # node's CNI plugin directory at driver startup (atomic temp-file + rename,

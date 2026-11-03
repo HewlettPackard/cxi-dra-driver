@@ -69,6 +69,7 @@ MutatingAdmissionPolicy (in-process in API server)
 
 - Kubernetes 1.36+ (DRA consumable capacity — the `DRAConsumableCapacity` feature gate — is beta and on by default from 1.36; on 1.34/1.35 enable it, along with `DRADeviceBindingConditions`, on the API server, scheduler and kubelet). `MutatingAdmissionPolicy` requires 1.32+
 - Nodes labelled `feature.node.kubernetes.io/cxi=true`
+- For [SR-IOV VF mode](#sr-iov-vf-mode): parents and VFs provisioned on the nodes before the driver starts, and an SHS release later than 15.0.0 (15.0.0 is not supported for VF mode)
 - Container runtime with CDI and NRI support (containerd ≥ 2.0)
 - NRI enabled in containerd config (see below)
 - Docker or Podman (to build the image); Go 1.24+ only if building the binary outside a container
@@ -116,7 +117,7 @@ make build-cni                 # → bin/slingshot-cni for the build host's arch
 make build-cni GOARCH=amd64    # cross-build, e.g. from an arm64 workstation for x86-64 nodes
 ```
 
-Bundling it does **not** install it on nodes — that is opt-in at deploy time (`cni.install=true`, see [Optional: Slingshot CNI](#optional-slingshot-cni)). Sites that use `hostNetwork` (or, in future, SR-IOV VFs) for HSN access simply leave it off.
+Bundling it does **not** install it on nodes — that is opt-in at deploy time (`cni.install=true`, see [Optional: Slingshot CNI](#optional-slingshot-cni)). Sites that use `hostNetwork` for HSN access simply leave it off.
 
 
 Reference this image at install time — `--set image.repository=…,image.tag=…` for Helm, or the `image:` field in [deploy/kubernetes/daemonset.yaml](deploy/kubernetes/daemonset.yaml) for the kubectl path.
@@ -241,7 +242,7 @@ the `DaemonSet` in order. It does **not** apply `configmap.yaml`, which the Daem
 
 #### Optional: Slingshot CNI
 
-The driver works without any CNI involvement — pods reach the HSN via `hostNetwork` (and in future via SR-IOV VFs). If you want each CXI-claiming pod to get its own IP-addressed HSN interface instead, enable the bundled [`slingshot-cni`](#hsn-ip-interface-slingshot-cni). It is off by default and everything below renders nothing until you opt in.
+The driver works without any CNI involvement — pods reach the HSN via `hostNetwork` (including in [SR-IOV VF mode](#sr-iov-vf-mode)). If you want each CXI-claiming pod to get its own IP-addressed HSN interface instead, enable the bundled [`slingshot-cni`](#hsn-ip-interface-slingshot-cni). It is off by default and everything below renders nothing until you opt in.
 
 Prerequisites not installed by this chart: **Multus** (secondary-network attachment; provides the `NetworkAttachmentDefinition` CRD) and **Whereabouts** (the `whereabouts` binary on each node's `CNI_PATH` plus its CRDs / `ip-reconciler`).
 
@@ -357,9 +358,9 @@ The per-claim resource values map directly to fields in the per-service `cxi_svc
 
 - **`acs` — Address contexts.** Allocated implicitly per `cxil_map` call for memory protection / IOMMU translation. The libfabric MR cache (`cxip_iomm.c:368`) aggregates repeated mappings of the same region, so typical jobs need only 2–4 ACs (EQ buffers + send/recv buffers). Frequent buffer reuse minimises AC pressure.
 
-- **`les` — List entries** (allocated in pools of 1024). LEs are consumed by **every** `cxip_pte_append`: control messaging during `cxip_ep_ctrl_init` (`cxip_ctrl.c:206`), every receive append in the HPC/RNR paths (`cxip_msg_hpc.c:4218`, `cxip_msg_rnr.c:169`), every memory region (`cxip_mr.c`), rendezvous (`cxip_rdzv_pte.c`), and collectives (`cxip_coll.c`). See the shared-default-pool note above — a value of `0` means "use the shared default LE pool on a best-effort basis"; `>0` reserves whole pools exclusively for guaranteed capacity.
+- **`les` — List entries** (allocated in pools of 1024). LEs are consumed by **every** `cxip_pte_append`: control messaging during `cxip_ep_ctrl_init` (`cxip_ctrl.c:206`), every receive append in the HPC/RNR paths (`cxip_msg_hpc.c:4218`, `cxip_msg_rnr.c:169`), every memory region (`cxip_mr.c`), rendezvous (`cxip_rdzv_pte.c`), and collectives (`cxip_coll.c`). See the shared-default-pool note above — a value of `0` means "use the shared default LE pool on a best-effort basis"; `>0` reserves whole pools exclusively for guaranteed capacity. **In SR-IOV VF mode (`--vf-only`) this must be `0`:** the kernel only accepts a zero LE reservation on a pod's child service, so the published `les` is `0` and any non-zero request is not scheduled.
 
-- **`tles` — Triggered list entries** (allocated in pools of 512). TLEs are consumed only by triggered commands — `cxi_cq_emit_trig_*` in `cxip_dom.c:2013, 2073, 2086` and counter-triggered events in `cxip_cntr.c:572`. A workload without triggered operations (e.g. `fi_pingpong`) needs zero. With `tles: "0"`, any triggered operations that do occur draw from the shared default pool on a best-effort basis; `>0` reserves dedicated TLE capacity.
+- **`tles` — Triggered list entries** (allocated in pools of 512). TLEs are consumed only by triggered commands — `cxi_cq_emit_trig_*` in `cxip_dom.c:2013, 2073, 2086` and counter-triggered events in `cxip_cntr.c:572`. A workload without triggered operations (e.g. `fi_pingpong`) needs zero. With `tles: "0"`, any triggered operations that do occur draw from the shared default pool on a best-effort basis; `>0` reserves dedicated TLE capacity. **In VF mode this must be `0`** (the kernel forces a child's TLE reservation to zero; pods share the parent's pool), so any non-zero request is not scheduled.
 
 ### Host runtime injection (env)
 
@@ -564,6 +565,131 @@ The VNI range is configured via `--vni-range-start` / `--vni-range-end` in the D
 
 Pre-existing annotations are respected: if a namespace already has a valid `cxi.slingshot.hpe.com/vni` annotation, the allocator leaves it untouched. This lets operators pre-assign VNIs to particular tenants.
 
+## SR-IOV VF Mode
+
+On nodes where the Cassini NIC exposes SR-IOV Virtual Functions (VFs), run the driver with `--vf-only` (Helm `driver.vfOnly=true`). Pods then get a CXI **child service** on a VF, bounded by a **parent CXI service** that an administrator created on the PF. The default (no flag) is unchanged: PFs only, VFs skipped. The two are never mixed on a node.
+
+### How it works
+
+- **The parent is the device.** A parent service reserves a fixed slice of the NIC's resources (TXQs, TGQs, EQs, CTs, PTEs, ACs, LEs, TLEs) and a VNI set. One or more VFs are assigned to it, and all of them **share the parent's budget**. The driver publishes each parent as one shareable device (`allowMultipleAllocations: true`), named `<pf>-svc<id>` (e.g. `cxi0-svc4`), with consumable capacity; **VFs are not published**. The scheduler's own `consumedCapacity` accounting therefore enforces the shared budget.
+- **One pod per VF.** A synthetic `vfs` capacity (value = the number of VFs assigned to the parent, requested one per allocation) keeps VFs exclusive: the scheduler stops placing pods on a parent when either a resource or `vfs` runs out.
+- **The VF is chosen at Prepare.** `PrepareResourceClaims` gives each allocation the lowest-index free VF of its parent under a per-parent lock, and uses that VF for the pod's `/dev/cxiN`, CXI service and CNI hint. Once the pod's service is created, the chosen VF is shown as `vf` in the claim's device status. A parent with no free VF fails Prepare and kubelet retries.
+- **Published capacity** per parent is the parent's reservation minus one Ethernet system child per VF (see [LE pressure](#le-pressure-and-parent-sizing)). `les` and `tles` are published as `0`.
+- **The pod's interface** is an IPVLAN on the VF's host netdev (via `slingshot-cni` + Whereabouts, if enabled), named after the VF's `cxiN`; the synthetic sysfs entry uses the same name, so libfabric still discovers the HSN. See [HSN IP Interface](#hsn-ip-interface-slingshot-cni).
+- **Topology.** A parent's `numaNode` / `pciBusID` attributes are the PF's, and the VFs share them (NUMA node and PCIe root).
+- **The driver never creates, resizes or destroys parents or VFs.** Provision first, then start (or restart) the driver; discovery runs once at startup.
+
+### Requirements
+
+- **A supported SHS release.** SHS 15.0.0 is not supported for VF mode; use a later release on the nodes and pin the `Dockerfile` libcxi refs to it. Before installing the driver, confirm on the host that `fi_info -p cxi` lists the VFs; if it does not, do not proceed with the driver install.
+- **Parents with resource limits.** A parent without resource limits (`Resource Limits: No`) is not supported: the kernel enforces no per-parent budget, so two such parents on one PF would each publish the whole device. The driver skips such a parent and its VFs with an error.
+- **The admission policies** (`deploy/kubernetes/admission-policy.yaml`, or Helm `admissionPolicy.enabled=true`, the default); see [VNI selector](#vni-selector).
+- **Provision every PF of the node.** On a multi-GPU node each PF sits on the PCIe root of one GPU; a PF without VFs leaves that GPU with no HSN path. The driver warns at startup for each PF that has no VFs.
+
+### LE pressure and parent sizing
+
+List Entries (LEs) are consumed by every receive buffer, memory region, rendezvous or collective that libfabric's CXI provider posts. A Cassini 1 has 16 384, reserved in pools of 1024, and they are usually the first resource to run out.
+
+1. **Each VF whose netdev is up costs the parent about 660 LEs** (plus 8 PTEs and 1 TXQ, TGQ, EQ and AC): the kernel creates an Ethernet *system* child service on the VF for its netdev, and it reserves from the parent. At startup the driver measures that child on a VF whose netdev is up and deducts it once per VF, so **bring the VF netdevs up before starting the driver**: with none up, nothing is deducted and the published ceiling overstates the parent. The Slingshot CNI needs the host VF netdev up anyway.
+
+   | VFs with netdev up | LEs left in a 4096-LE parent |
+   |---|---|
+   | 0 | 4096 |
+   | 2 | 2776 |
+   | 4 | ~1456 |
+
+2. **Pod children cannot reserve LEs or TLEs.** The kernel accepts only a zero LE reservation for a child and forces its TLE reservation to zero, so pods draw LEs best-effort from whatever the parent has left, shared by every pod on every VF of that parent. This is why `les` / `tles` are published as `0` and any non-zero request is rejected by the scheduler.
+3. **LE exhaustion is invisible to the scheduler.** An application that runs out fails inside libfabric (`cxip_pte_append`).
+
+Sizing rule: `parent LEs >= 660 × N_VFs + LEs needed by the heaviest concurrent workload mix`. 4096 is a bare minimum for 2–4 VFs with light workloads; for 4 VFs running MPI or NCCL reserve **8192–12 288** of the NIC's 16 384. For LE-heavy workloads use fewer VFs per parent or more than one parent on the PF. The Ethernet child also takes 8 PTEs per VF, so with 4 VFs a 64-PTE parent has 32 PTEs left for pods (each pod endpoint needs at least 2 PTEs plus one per memory region).
+
+> The per-VF figures above were measured on SHS 15.0.0. Re-check them on your release (`cxi_service list -d <vf> -v` with the VF netdev up) before sizing parents.
+
+### Provisioning order
+
+The kernel enforces this order. Do it for **every PF** that will serve VFs, before the driver starts:
+
+1. **Create the parent service(s)** on the PF: `cxi_service create -d cxi0 -y <parent.yaml>`.
+2. **Enable each parent**: `cxi_service enable -d cxi0 -s <svc_id>`. `cxi_service create` leaves a range-form parent disabled, and the kernel rejects assigning a disabled parent to a VF.
+3. **Assign a parent to every VF slot you will enable**, before the VFs exist: `echo <svc_id> > /sys/class/cxi/cxi0/vf/<N>/svc_id` for `N = 0 .. numvfs-1` (`0` means unassigned; SR-IOV enablement fails if a VF to be created has no valid, enabled parent).
+4. **Create the VFs**: `echo <numvfs> > /sys/class/cxi/cxi0/device/sriov_numvfs`. They appear as `cxi4`, `cxi5`, … (the next free indices after the PFs) and keep their names across restarts.
+5. **Bring every VF netdev up.** VF netdevs are named by PCI function (`enp197s0f1`, …), not `hsnN`.
+6. **Install or restart the driver** with `--vf-only`.
+
+If the `cxi_vf.sh` helper from the cxi-driver source tree is available, `CXI_DEVICE=cxi0 cxi_vf.sh setup <N> --create-service-from-yaml <parent.yaml>` performs steps 1–4 with one parent shared by all N VFs (`--use-service <svc_id>` attaches the VFs to an existing parent). Several parents may share a PF (for example one per tenant class); each has its own budget and VNI set, all drawn from the NIC's total.
+
+A VF whose parent is unassigned, or whose parent has no resource limits, is skipped and logged. With no usable VF the driver logs an error and publishes an empty slice (it does not crash-loop). Changing VFs or parents later requires a driver restart.
+
+### Parent service file
+
+Start from `cxi_service_template_parent.yaml` (shipped with `cxi_service`):
+
+```yaml
+is_parent: 1
+restricted_vnis: 1
+vnis:                       # EITHER a range …
+  vni_min: 100
+  vni_max: 300
+# … OR an explicit list:  vnis: [100, 101, 102]
+restricted_members: 0
+resource_limits: 1          # required: a parent without limits is skipped
+limits:
+  txqs:  { res: 128,  max: 1019 }
+  tgqs:  { res: 64,   max: 507  }
+  eqs:   { res: 256,  max: 2037 }
+  cts:   { res: 256,  max: 2047 }
+  ptes:  { res: 128,  max: 2036 }
+  acs:   { res: 128,  max: 1018 }
+  les:   { res: 8192, max: 16384 }   # the one most often under-sized
+  tles:  { res: 1024, max: 2048 }
+```
+
+| Field | What to consider | Starting point for 4 VFs of MPI/NCCL pods |
+|---|---|---|
+| `resource_limits` / `limits` | **Mandatory.** Without limits the parent is unsupported | set |
+| `vnis` | Must **cover the cluster VNI range** (`--vni-range-start`/`--vni-range-end`, Helm `driver.vniRange`); a pod whose namespace VNI is outside the set cannot run on that parent. The driver warns at startup when a parent does not cover the range. Use the same range on every node | the cluster range |
+| `txqs` / `tgqs` | 1 each per VF Ethernet child, then 2–4 / 1–2 per pod endpoint | 128 / 64 |
+| `eqs` | 1 per VF child; libfabric uses 4 per endpoint | 256 |
+| `cts` | Only counter-using workloads (NCCL, collectives): 64–256 each | 256 or more |
+| `ptes` | 8 per VF child + 2 per pod endpoint + 1 per memory region | 128 |
+| `acs` | 1 per VF child + 2–4 per pod | 128 |
+| `les` | ~660 per VF child; pods cannot reserve and share the remainder | 8192–12 288 |
+| `tles` | Child TLE reservations are always 0; pods share the parent pool | 1024 |
+
+### Verify before installing the driver
+
+```bash
+cxi_service list -d cxi0 -v                      # parent: "Parent Service: Yes", enabled, resource limits
+for n in 0 1 2 3; do echo -n "vf/$n -> "; cat /sys/class/cxi/cxi0/vf/$n/svc_id; done
+cat /sys/class/cxi/cxi0/device/sriov_numvfs
+readlink -f /sys/class/cxi/cxi4/device/physfn    # a VF resolves back to its PF
+ip -br link | grep enp                           # every VF netdev exists and is up
+cxi_service list -d cxi4 -v                      # one Ethernet SYSTEM child per VF (the per-VF overhead)
+fi_info -p cxi                                   # lists the VFs
+```
+
+The expected remaining parent budget before any pod is the parent reservation minus N_VFs × the Ethernet child; confirm the LE remainder is what you planned for.
+
+### Install and verify
+
+```bash
+helm install cxi deploy/helm/cxi-dra-driver --set driver.vfOnly=true
+# raw manifests: uncomment "- --vf-only" in deploy/kubernetes/daemonset.yaml
+kubectl get resourceslices -o wide     # one device per parent on each node, e.g. cxi0-svc4
+```
+
+One install is either PF or VF mode. For a fleet that mixes both, run two installs with distinct `driverName` values, each restricted to its nodes with `nodeSelector`.
+
+### Claims in VF mode
+
+Claims are written as in PF mode, with two differences: `les` / `tles` must be `0` (use `le_pools: 0` / `tle_pools: 0` or omit them; any non-zero request, including legacy `le_pools` / `tle_pools` > 0 that the admission policy converts, is not scheduled), and each claim consumes one `vfs`. **The Helm chart's default `ResourceClaimTemplates` all set non-zero `le_pools` / `tle_pools`, so on a VF node override them** (set `le_pools: 0` / `tle_pools: 0` under `resourceClaimTemplates.templates`) and size the remaining resources to fit a parent; pods using the unmodified templates stay `Pending`. To steer a pod, use the parent attributes (`pf_name`, `function_type`, `resource.kubernetes.io/numaNode`, `pciBusID`) in a CEL selector.
+
+### VNI selector
+
+Each parent publishes the VNIs it allows (`vni_min`/`vni_max`, or `vni_set`). The `cxi-dra-vni-selector` `MutatingAdmissionPolicy` reads the namespace's `cxi.slingshot.hpe.com/vni` annotation at `ResourceClaim` CREATE and appends a CEL selector, so the scheduler only allocates parents that cover the namespace VNI (PF devices always match).
+
+**Install it on every cluster that runs VF mode with more than one parent per node** (it is on by default in Helm; `deploy/kubernetes/admission-policy.yaml` in the raw manifests) unless every parent covers the whole VNI range. A VNI mismatch is a *static* condition, and the scheduler's allocator is first-fit: without the selector it picks the same non-covering parent, `ClaimBinder` marks the claim `Unschedulable` (`VNINotInParentSet`), the claim is deallocated, and the scheduler picks that same parent again — forever — without ever trying a covering one. With the selector the claim is allocated correctly the first time, or stays `Pending` with the scheduler's "no devices match" message when no parent covers the VNI. The policy is skipped for namespaces without a valid annotation or listed in `admissionPolicy.excludedNamespaces`, and requests that use `firstAvailable` sub-requests are not touched. Prepare and `ClaimBinder` keep the check as a fallback for those claims and for claims created before the namespace was annotated, and the kernel rejects an out-of-set VNI regardless.
+
 ## Project Layout
 
 ```
@@ -600,7 +726,7 @@ docs/                    pod-lifecycle-flow.txt, cni/ (plugin reference, driver-
 | `--vni-range-start` | `0` | First VNI in the namespace-VNI allocator's pool (0 disables the allocator) |
 | `--vni-range-end` | `0` | Last VNI in the pool (inclusive) |
 | `--system-svc-ids` | `""` | Comma-separated svc_ids of blessed system services: never deleted, and their reserved resources are deducted from each device's usable ceiling |
-| `--vf-only` | `false` | Discover and publish SR-IOV VFs only; PFs are skipped before any libcxi read, so a PF is never opened. The default publishes PFs only and skips VFs (`device/physfn` present); the two are never mixed. With no usable VF the driver logs an error and publishes an empty slice. `--system-svc-ids` is ignored (with a warning), because its PF svc_ids would match pod services on a VF. In VF mode the `ResourceSlice` publishes one device per parent service, `<pf>-svc<id>`, with the parent's budget less one Ethernet-child reservation per VF (LEs/TLEs 0); at Prepare each claim result is given the lowest free VF of its parent, which the pod's CDI device, NRI service and CNI hint use. A parent with no free VF fails Prepare (kubelet retries). Part of SR-IOV; do not use it in production yet |
+| `--vf-only` | `false` | SR-IOV VF mode: discover VFs only and publish one device per parent service (`<pf>-svc<id>`); PFs are skipped before any libcxi read. The default publishes PFs only and skips VFs; the two are never mixed. `--system-svc-ids` is ignored (with a warning). Helm: `driver.vfOnly`. See [SR-IOV VF Mode](#sr-iov-vf-mode) |
 | `--netns-sysfs-root` | `/var/run/cxi/netns` | Host directory for the per-pod synthetic `/sys/class/net` trees (empty disables HSN sysfs injection) |
 | `--cni-hints-dir` | `/var/run/cxi/net-hints` | Host directory for per-pod CNI hint files read by `slingshot-cni` (empty disables the hint-file write/delete); must match the `hintsDir` in the plugin's network config. See [docs/cni/cnidra-cni-hint-contract.md](docs/cni/cnidra-cni-hint-contract.md) |
 | `--cni-install-dir` | `""` (disabled) | Host CNI plugin directory (e.g. `/opt/cni/bin`, must be a hostPath mounted at the same path) to install the bundled `slingshot-cni` into at startup; requires `--cni-hints-dir`. Opt-in — the driver works without the CNI |
@@ -651,9 +777,9 @@ Each device also publishes consumable capacity, requested under `spec.devices.re
 | `tles` | 0 | 512 | Triggered list entries (one TLE pool per step) |
 | `vfs` | 1 | — | Parents only: the number of VFs, one per allocation (valid range 1–1), so a VF is never shared |
 
-On a parent `les` and `tles` are 0 (a VF's service inherits them from the parent), so the scheduler rejects any non-zero LE/TLE request: in VF mode use `le_pools: 0` / `tle_pools: 0` or omit them.
+On a parent `les` and `tles` are 0 (a VF's service inherits them from the parent), so the scheduler rejects any non-zero LE/TLE request: in VF mode use `le_pools: 0` / `tle_pools: 0` or omit them. See [LE pressure](#le-pressure-and-parent-sizing) for how to size a parent's LEs.
 
-**VNI selector.** The `cxi-dra-vni-selector` `MutatingAdmissionPolicy` appends a CEL selector to every CXI request in a namespace carrying the `cxi.slingshot.hpe.com/vni` annotation, keeping the scheduler off parents whose VNI set does not cover it (a user-supplied selector is kept; PF devices always match; a missing or malformed annotation skips the policy and the driver's Prepare/`ClaimBinder` check applies). It is needed because a VNI mismatch is static: the scheduler would otherwise re-allocate the same parent after each `Unschedulable` bounce without ever trying a covering one.
+**VNI selector.** The `cxi-dra-vni-selector` `MutatingAdmissionPolicy` appends a CEL selector to every CXI request in a namespace carrying the `cxi.slingshot.hpe.com/vni` annotation, keeping the scheduler off parents whose VNI set does not cover it (PF devices always match). It is required for multi-parent VF nodes; see [VNI selector](#vni-selector) for why, and what happens without it.
 
 Each device also exposes the Kubernetes [standard device attributes](https://kubernetes.io/docs/reference/node/dra-standard-device-attributes/) under the `resource.kubernetes.io` domain, letting CEL selectors and `matchAttribute` constraints compare CXI devices against devices from other DRA drivers without driver-specific knowledge. `numaNode` is omitted when the device's NUMA affinity is unknown:
 
@@ -706,6 +832,14 @@ kubectl logs cxi-test-3
 
 - **Hot-plug** — no fsnotify watcher on `/sys/class/cxi_user`; driver restart required if devices appear/disappear
 - **VNI exhaustion handling** — if the configured `[--vni-range-start, --vni-range-end]` is exhausted, the namespace VNI allocator logs the error per reconcile attempt but does not emit an Event on the affected namespace; operators must read the DaemonSet logs to find out why new namespaces aren't getting a VNI
+- **SR-IOV VF mode** (see [SR-IOV VF Mode](#sr-iov-vf-mode)):
+  - **Provision first, discover once** — parents and VFs must exist, with VF netdevs up, before the driver starts; there is no re-scan, so any change to VFs or parents needs a driver restart. The driver never creates, resizes or destroys them.
+  - **No mixed PF/VF nodes** — a node (and a Helm install) is either PF or VF mode. A parent without resource limits, or a VF with an unassigned parent, is skipped.
+  - **VFs are not published** — the parent is the device, so a pod cannot select a specific VF; the driver picks the lowest free one at Prepare. One pod per VF (`vfs` capacity).
+  - **LE/TLE are best-effort** — they must be `0`; pods share whatever LEs the parent has left after the per-VF Ethernet child, and exhaustion is only visible inside libfabric, not to the scheduler.
+  - **Ethernet child on every VF** — its reservation (about 660 LEs and 8 PTEs per VF on SHS 15.0.0 measurements) is measured once from a VF whose netdev is up at startup and deducted for every VF, so a parent's published budget is `reservation − N_VFs × child`; the VF netdevs must be up when the driver starts.
+  - **VNI selector coverage** — it needs the admission policies and a valid namespace VNI annotation at claim creation, and does not rewrite `firstAvailable` requests; otherwise only the Prepare/`ClaimBinder` fallback applies, which can loop a claim on a non-covering parent.
+  - **Planned follow-up** — publishing VFs as devices that draw from a shared parent counter (Kubernetes KEP-5941, DRA Shared Consumable Capacity; targeted at alpha in 1.38) would replace the parent-as-device model; the device split in `internal/driver/views.go` and `resourceslice.go` is kept so that flip stays local.
 
 ## Troubleshooting
 

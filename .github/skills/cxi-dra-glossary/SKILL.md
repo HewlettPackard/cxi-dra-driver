@@ -1,6 +1,6 @@
 ---
 name: cxi-dra-glossary
-description: "Glossary of CXI/DRA/Kubernetes domain terms used throughout this driver. USE FOR: understanding source comments, README, and CONTEXT.md; writing new code that touches DRA/CXI/CDI/NRI/CNI concepts. Trigger keywords: DRA, CXI, CDI, NRI, CNI, ResourceClaim, ResourceSlice, consumable capacity, HSN, VNI, IPVLAN, Whereabouts, hint file, reaper, glossary."
+description: "Glossary of CXI/DRA/Kubernetes domain terms used throughout this driver. USE FOR: understanding source comments, README, and CONTEXT.md; writing new code that touches DRA/CXI/CDI/NRI/CNI concepts. Trigger keywords: DRA, CXI, CDI, NRI, CNI, ResourceClaim, ResourceSlice, consumable capacity, HSN, VNI, IPVLAN, Whereabouts, hint file, reaper, SR-IOV, VF, parent service, glossary."
 ---
 
 # CXI DRA Glossary
@@ -22,6 +22,13 @@ description: "Glossary of CXI/DRA/Kubernetes domain terms used throughout this d
 | **IPVLAN (L2)** | Kernel virtual-interface type `slingshot-cni` creates on the host HSN and moves into the pod netns, named by `ifname` when set or otherwise `hsn_iface` (fallback `<name>_inet`) |
 | **Whereabouts** | Cluster-wide CNI IPAM plugin `slingshot-cni` delegates to for HSN addresses; keys reservations on `(containerID, ifname)`, hence the per-device `CNI_IFNAME` override |
 | **VNI** | Virtual Network Identifier — assigned once per namespace (not per pod/claim) by the leader-elected namespace allocator |
+| **SR-IOV / VF mode** | `--vf-only` (Helm `driver.vfOnly`): the node's NIC exposes SR-IOV Virtual Functions and the driver publishes parents instead of PFs; never mixed with PF mode on a node |
+| **PF / VF** | Physical Function (`cxiN` with no `device/physfn`, paired with its HSN netdev, e.g. `hsn3`) / Virtual Function (a `cxiN` whose `device/physfn` points at its PF; its netdev is named by PCI function, e.g. `enp197s0f1`). Pods get a CXI service on a VF |
+| **Parent service** | CXI service on a PF (`Parent Service: Yes`) that reserves a resource budget and a VNI set for the VFs assigned to it (`/sys/class/cxi/<pf>/vf/<N>/svc_id`, `0` = unassigned). It must carry resource limits. Created by the administrator before the driver starts; the driver never creates, resizes or destroys it |
+| **Parent device** | What the driver publishes in VF mode: one DRA device per parent service, `<pf>-svc<id>`, with the parent's budget (less the Ethernet system children) as consumable capacity plus a `vfs` capacity (one per allocation). VFs are not published; the VF is picked at Prepare |
+| **Ethernet system child** | System-bit service the kernel creates on a VF while its netdev is up; it reserves resources (about 660 LEs, 8 PTEs, 1 TXQ/TGQ/EQ/AC measured on SHS 15.0.0) from the parent; the driver measures it on one VF with its netdev up at startup and deducts it for every VF. Never reaped |
+| **`pf_netdev` / `hsn_iface` / `ifname`** | `pf_netdev`: a parent's PF netdev attribute, informational. `hsn_iface`: PF devices' attribute and the CNI hint field naming the **host** link the IPVLAN attaches to (PF netdev in PF mode, VF netdev such as `enp197s0f1` in VF mode); never published on a parent. `ifname`: optional hint field naming the **pod-side** interface (the VF's `cxiN` in VF mode; absent in PF mode, where `hsn_iface` is used) and the synthetic sysfs entry |
+| **VNI selector** | `cxi-dra-vni-selector` `MutatingAdmissionPolicy` that appends a CEL selector from the namespace VNI annotation so the scheduler only allocates parents whose VNI set covers it; required for multi-parent VF nodes |
 | **Reaper** | Backstop that destroys orphaned CXI services (pod netns gone for several consecutive cycles) left behind by pods that didn't tear down cleanly; runs every `--resource-refresh-interval` |
 | **TXQ/TGQ/EQ/CT/PTE/LE/TLE/AC** | Per-device hardware quota fields, requested as `exactly.capacity.requests` (legacy opaque `le_pools`/`tle_pools` config is converted by the admission policy: pools × 1024 = `les`, × 512 = `tles`) — see README § Resource field reference for exact semantics |
 | **`tags cxi` / mock / stub** | The three build modes of `internal/cxi` — real libcxi ioctls, synthetic devices (`--mock-devices`), and no-op, respectively |

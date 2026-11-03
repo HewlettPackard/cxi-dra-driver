@@ -67,7 +67,7 @@ func main() {
 		// Optional host install of the slingshot-cni plugin binary bundled in
 		// this image, mirroring how cxi-cdi-hook is installed below. Opt-in:
 		// using the CNI is one of several ways a pod can reach the HSN
-		// (hostNetwork, future SR-IOV VFs), so the default leaves the node's
+		// (hostNetwork), so the default leaves the node's
 		// CNI_PATH untouched. The directory must be a hostPath mounted at the
 		// same path in this container.
 		cniInstallDir = flag.String("cni-install-dir", "",

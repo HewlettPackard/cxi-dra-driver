@@ -59,6 +59,9 @@ spec:
         {{- with .Values.driver.systemSvcIDs }}
         - --system-svc-ids={{ join "," . }}
         {{- end }}
+        {{- if .Values.driver.vfOnly }}
+        - --vf-only
+        {{- end }}
         - --vni-range-start={{ .Values.driver.vniRange.start }}
         - --vni-range-end={{ .Values.driver.vniRange.end }}
         - --enable-cdi-env={{ .Values.driver.enableCdiEnv }}

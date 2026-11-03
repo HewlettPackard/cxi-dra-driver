@@ -61,7 +61,8 @@ See [values.yaml](values.yaml) for the full set. Most-used:
 | `namespace` | `kube-system` | driver components namespace |
 | `priorityClassName` | `system-node-critical` | set `""` if installing outside kube-system |
 | `driver.vniRange.start/end` | `100`/`300` | per-namespace VNI pool |
-| `driver.systemSvcIDs` | `[1,2,3,4]` | blessed system service svc_ids (never reaped; their usage is reserved) |
+| `driver.systemSvcIDs` | `[1,2,3,4]` | blessed system service svc_ids (never reaped; their usage is reserved); ignored when `driver.vfOnly=true` |
+| `driver.vfOnly` | `false` | SR-IOV VF mode (`--vf-only`): publish one device per parent service instead of PFs. Parents and VFs must already be provisioned on every node; one install is either PF or VF mode (use `nodeSelector` + a distinct `driverName` for a mixed fleet). Keep `admissionPolicy.enabled=true` — the VNI selector is required on nodes with several parents. See the root README § SR-IOV VF mode |
 | `resourceClaimTemplates.namespaces` | `[default]` | namespaces the templates are rendered into, one copy each (falls back to singular `namespace` when empty) |
 | `admissionPolicy.excludedNamespaces` | `[kube-system]` | namespaces the policies (capacity conversion and VNI selector) ignore |
 | `cni.install` | `false` | install the bundled `slingshot-cni` into `cni.binDir` (default `/opt/cni/bin`) at driver startup |
