@@ -5,8 +5,18 @@ CXI DRA driver "{{ .Release.Name }}" installed.
 {{- if .Values.deviceClass.enabled }}
   DeviceClass : {{ include "cxi-dra.deviceClassName" . }}
 {{- end }}
+{{- if .Values.driver.vfOnly }}
+  Mode        : SR-IOV VF (--vf-only): one device per parent service
+{{- end }}
 {{- if .Values.admissionPolicy.enabled }}
   Policy      : {{ include "cxi-dra.fullname" . }}-capacity-conversion (legacy opaque config → capacity.requests)
+{{- end }}
+{{- if and .Values.driver.vfOnly (not .Values.admissionPolicy.enabled) }}
+
+WARNING: driver.vfOnly=true with admissionPolicy.enabled=false. Without the VNI
+selector policy the scheduler can keep allocating a parent whose VNI set does not
+cover a namespace's VNI; install the policies (deploy/kubernetes/admission-policy.yaml)
+on any node with more than one parent.
 {{- end }}
 
 The driver publishes ResourceSlices under driver name
@@ -29,6 +39,12 @@ Reference one from a pod with:
       resourceClaimTemplateName: {{ include "cxi-dra.fullname" . }}-small
 {{- end }}
 
+{{- if .Values.driver.vfOnly }}
+
+VF mode: the default ResourceClaimTemplates set non-zero le_pools/tle_pools, which
+parents (0 LEs/TLEs) cannot satisfy. Override them with le_pools: 0 / tle_pools: 0
+under resourceClaimTemplates.templates before scheduling pods.
+{{- end }}
 {{- if .Values.workload.antiAffinity.enabled }}
 
 Anti-affinity is ON: every install's pods carry the constant label

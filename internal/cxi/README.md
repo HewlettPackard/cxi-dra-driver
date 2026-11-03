@@ -15,6 +15,7 @@ Hardware abstraction layer for CXI (HPE Slingshot NIC) devices. Everything else 
 | `mock.go` | `MockDevices(n)` — generates `n` synthetic devices for kind/local dev and tests |
 | `parent.go` | VF-mode read path (SR-IOV): `ReadParentBudget` (parent `res` + `VNISet`, `ErrParentUnlimited` when the parent has no resource limits), `ReadParentRemaining` (parent `res` − Σ `res` of every service on the parent's VFs, system children included, raw LE/TLE), `ReadVFSystemReservation` (Σ `res` of all system-bit services on a VF). The math is build-independent; only `readParentDescriptor`/`readVFServices` differ per mode (`service_cgo.go` / `capacity_stub.go`) |
 | `vniset.go` | `VNISet` — a parent's VNI set in range or list form (a contiguous list is normalized to a range): `Contains`, `Covers`, `Range`, `List`, and `String` (`"min-max"` or the delimiter-wrapped `",40,42,"` used for the `vni_set` slice attribute) |
+| `parents.go` | `Parent` / `Parents()` — groups the discovered VFs by (PF, parent service ID) in stable order; each VF's assignment is read from `/sys/class/cxi/<pf>/vf/<N>/svc_id` (`0` = unassigned) |
 | `service_mock.go` (topology) | `SetMockTopology`/`ResetMockTopology` — the in-memory parents and per-VF service lists that the non-cxi build of the parent read path answers from |
 
 ## Build modes
@@ -29,7 +30,11 @@ This package has **three** implementations selected by build tag, never by runti
 
 New hardware-facing code should follow this same three-file split — see [.github/instructions/code-style.instructions.md](../../.github/instructions/code-style.instructions.md).
 
-## Testing
+## SR-IOV VF mode
+
+With `--vf-only`, `Discover` keeps VFs (`device/physfn` present) and skips PFs before any libcxi read; PFs are opened only through the parent read path to read a parent's descriptor, never for device capacity. Every skipped device is logged with the reason: a VF whose `vf/<N>/svc_id` is unreadable or `0`, or whose parent has no resource limits (`ErrParentUnlimited`), is not usable. A PF with no VFs is logged. Discovery runs once at startup. Each VF carries its PF's name, PCI address, NUMA node and netdev, read from sysfs.
+
+The kernel does not expose a parent's remaining budget, so it is computed as the parent's `res` minus the `res` of every service listed on every VF of that parent (the VF Ethernet system child included). Service IDs are local to each VF, a VF never sees a sibling's services, and the parent is never listed on a VF, so everything below the parent is keyed (VF name, svc ID).
 
 VF child creation accepts `ServiceOptions{Parent: parent}`; existing calls without
 options preserve PF behavior. The child uses the parent's `limits.les.max`
@@ -41,6 +46,8 @@ VF creation errors identify the failing operation; parent-budget and VNI/descrip
 diagnostics apply only to allocation errors, not later configuration failures.
 The optional argument preserves existing PF calls, but implementations of the
 `ServiceManager` interface must accept the variadic `ServiceOptions` parameter.
+
+## Testing
 
 `service_failure_test.go` compiles the production C creation routine against fake
 libcxi calls using `cc` (no hardware or libcxi headers needed). It forces open,

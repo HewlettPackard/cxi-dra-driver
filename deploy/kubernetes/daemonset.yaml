@@ -48,6 +48,12 @@ spec:
             # driver, and their reserved resources are deducted from each
             # device's usable ceiling. Populate from `cxi_service list`.
             - --system-svc-ids=1,2,3,4
+            # OPTIONAL SR-IOV VF mode: uncomment on nodes whose parent services
+            # and VFs are already provisioned (see README § SR-IOV VF mode). The
+            # driver then publishes one device per parent instead of PFs, and
+            # ignores --system-svc-ids above (it logs a warning). Requires the
+            # admission policies (deploy/kubernetes/admission-policy.yaml).
+            # - --vf-only
             - --vni-range-start=100
             - --vni-range-end=300
             - --enable-cdi-env=true
@@ -66,7 +72,7 @@ spec:
             # (also uncomment the cni-bin volumeMount and volume below, and
             # apply deploy/kubernetes/cni/networkattachmentdefinition.yaml).
             # Requires Multus + Whereabouts on the cluster. Leave commented to
-            # keep using hostNetwork (or SR-IOV) for HSN access instead.
+            # keep using hostNetwork for HSN access instead.
             # - --cni-install-dir=/opt/cni/bin
           env:
             - name: NODE_NAME
