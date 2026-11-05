@@ -292,7 +292,7 @@ Container: {
     label: "■ CDI Env Spec"
     impl: "internal/cdi/env.go + internal/cdi/containerd.go"
     flag: "--enable-cdi-env=true (set in daemonset)"
-    purpose: "injects /dev/kdreg2, gdrdrv, xpmem, /dev/shm + host libfabric/libcxi (NCCL via k8s-modules)"
+    purpose: "injects /dev/kdreg2, gdrdrv, xpmem + host libfabric/libcxi (NCCL via k8s-modules)"
     env: "CXIP_SKIP_AMA_CHECK=1 bypasses libfabric AMA gate (no patch, no real netdev)"
     attached: "always, to every CXI device (no per-claim opt-in)"
     auto_configure: "writes /etc/containerd/conf.d/50-cxi-cdi.toml + SIGHUPs containerd at startup"

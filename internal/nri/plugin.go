@@ -374,6 +374,18 @@ func (p *Plugin) CreateContainer(_ context.Context, pod *api.PodSandbox, contain
 	adj.AddEnv("SLINGSHOT_VNIS", strings.Join(vnis, ","))
 	adj.AddEnv("SLINGSHOT_SVC_IDS", strings.Join(svcIDList, ","))
 
+	// Give the container its own tmpfs at /dev/shm instead of a host directory
+	// shared with other tenants. Like an emptyDir with medium Memory, it has no
+	// tmpfs size cap (the container's memory cgroup limits it) and disappears
+	// with the container. It replaces any existing /dev/shm mount, including
+	// the runtime's default.
+	adj.AddMount(&api.Mount{
+		Source:      "shm",
+		Destination: "/dev/shm",
+		Type:        "tmpfs",
+		Options:     []string{"nosuid", "nodev", "noexec", "mode=1777"},
+	})
+
 	// Overmount the container's /sys/class/net with the per-pod synthetic tree
 	// so stock libfabric discovers the HSN device(s). libfabric's link gate
 	// (cxip_if.c:142) has no env bypass and is satisfied by operstate=up in the

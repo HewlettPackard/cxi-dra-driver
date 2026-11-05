@@ -161,6 +161,7 @@ claim's status.allocation.devices.results[].consumedCapacity.
       ▼
   NRI: CreateContainer
       │  injects SLINGSHOT_DEVICES=cxi0, SLINGSHOT_VNIS=<n>, SLINGSHOT_SVC_IDS=<n> env vars
+      │  mounts a fresh tmpfs at /dev/shm (per container; never the host's /dev/shm)
       │  bind-mounts <root>/<podUID>/net OVER /sys/class/net (ro)
       │    ▲ only /sys/class/net is overmounted, so the pod keeps its own NICs:
       │      replicated symlinks resolve through the untouched /sys/devices.
@@ -327,6 +328,7 @@ idempotent.
                             service create; per-pod synthetic /sys/class/net
                             build (HSN sysfs injection); RemovePending
   NRI CreateContainer     SLINGSHOT_DEVICES/VNIS/SVC_IDS env var injection;
+                            fresh per-container tmpfs at /dev/shm;
                             bind-mounts the synthetic /sys/class/net over the
                             container's so stock libfabric discovers the HSN
                             device (AMA bypass supplied via the CDI env config)

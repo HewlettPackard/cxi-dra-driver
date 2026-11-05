@@ -73,11 +73,15 @@ func TestWriteEnvSpec(t *testing.T) {
 		t.Errorf("device nodes = %d, want 0 (all absent)", len(edits.DeviceNodes))
 	}
 	mounts := mountsByContainerPath(edits)
-	if len(mounts) != 3 {
-		t.Errorf("mounts = %v, want /dev/shm + 2 libs", edits.Mounts)
+	if len(mounts) != 2 {
+		t.Errorf("mounts = %v, want 2 libs", edits.Mounts)
+	}
+	// The host /dev/shm must never be shared between tenants; the NRI plugin
+	// provides a per-container tmpfs instead.
+	if _, ok := mounts["/dev/shm"]; ok {
+		t.Errorf("env spec mounts the host /dev/shm: %v", edits.Mounts)
 	}
 	for containerPath, hostPath := range map[string]string{
-		"/dev/shm":                 "/dev/shm",
 		"/host/env/libfabric.so.1": libfabricHost,
 		"/host/env/libcxi.so.1":    "/usr/lib64/libcxi.so.1",
 	} {
@@ -129,8 +133,8 @@ func TestWriteEnvSpecCustomLdcache(t *testing.T) {
 }
 
 // With --enable-cdi-env unset the driver writes the env spec from a zero
-// config: it must still carry the gdrdrv and kdreg2 nodes and /dev/shm so
-// every CXI device gets them, but no lib mounts, hook, or env.
+// config: it must still carry the gdrdrv and kdreg2 nodes so every CXI device
+// gets them, but no mounts (notably no host /dev/shm), hook, or env.
 func TestWriteEnvSpecZeroConfigInjectsDeviceNodes(t *testing.T) {
 	cdiRoot := t.TempDir()
 	// A regular file is enough: optionalDeviceNode only needs stat to succeed
@@ -157,8 +161,8 @@ func TestWriteEnvSpecZeroConfigInjectsDeviceNodes(t *testing.T) {
 	if want := []string{gdrdrv, kdreg2}; !reflect.DeepEqual(got, want) {
 		t.Errorf("device nodes = %v, want %v", got, want)
 	}
-	if len(edits.Mounts) != 1 || edits.Mounts[0].ContainerPath != "/dev/shm" {
-		t.Errorf("mounts = %v, want only /dev/shm", edits.Mounts)
+	if len(edits.Mounts) != 0 {
+		t.Errorf("mounts = %v, want none", edits.Mounts)
 	}
 	if len(edits.Hooks) != 0 || len(edits.Env) != 0 {
 		t.Errorf("hooks = %v env = %v, want none", edits.Hooks, edits.Env)

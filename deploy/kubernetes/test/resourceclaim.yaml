@@ -47,7 +47,7 @@
 #               counter-triggered MPI collectives) consume TLEs.
 #
 # CDI injection needs no parameter: every device also gets the driver's env
-# spec (/dev/kdreg2, /dev/gdrdrv, /dev/xpmem, /dev/shm, and with
+# spec (/dev/kdreg2, /dev/gdrdrv, /dev/xpmem, and with
 # --enable-cdi-env the host libfabric/libcxi under /host/env plus
 # CXIP_SKIP_AMA_CHECK=1). NCCL and aws-ofi-nccl come from k8s-modules (pod
 # annotation modules.brics.ac.uk/load, e.g. "aws-ofi-nccl-1.18.0"). The old

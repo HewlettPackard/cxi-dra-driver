@@ -91,7 +91,7 @@ func main() {
 		// PFs before any libcxi read, so the PF is never opened.
 		vfOnly = flag.Bool("vf-only", false, "Discover and publish SR-IOV VFs only (PFs are skipped); the default publishes PFs only")
 
-		// CDI env spec configuration. The env spec (kdreg2/gdrdrv/xpmem nodes, /dev/shm)
+		// CDI env spec configuration. The env spec (kdreg2/gdrdrv/xpmem nodes)
 		// is always attached to every CXI device; when --enable-cdi-env is true,
 		// --env-config must point to a JSON file (typically mounted from a
 		// ConfigMap) listing the host libraries and env vars it also injects.
