@@ -893,7 +893,7 @@ Check in order:
 
 ### Claim rejected: "opaque config requests … exceed the scheduler-allocated capacity"
 
-The claim still carries legacy opaque resource config, but it was allocated without matching capacity requests, so the scheduler charged only the defaults. This happens when the `MutatingAdmissionPolicy` is disabled or did not match the claim (it only converts `requests[0]` using `config[0]`). Move the resources to `spec.devices.requests[].exactly.capacity.requests` — see [deploy/kubernetes/test/resourceclaim.yaml](deploy/kubernetes/test/resourceclaim.yaml).
+The claim still carries legacy opaque resource config, but it was allocated without matching capacity requests, so the scheduler charged only the defaults. This happens when the `MutatingAdmissionPolicy` is disabled or did not match the claim (it converts using `config[0]` only, onto the requests that config names in `requests`, or onto every request of the driver's DeviceClass when it names none). Move the resources to `spec.devices.requests[].exactly.capacity.requests` — see [deploy/kubernetes/test/resourceclaim.yaml](deploy/kubernetes/test/resourceclaim.yaml).
 
 ### Claim rejected: "has neither consumed capacity nor CXI opaque resource config"
 
