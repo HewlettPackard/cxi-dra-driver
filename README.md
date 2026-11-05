@@ -17,7 +17,7 @@ Scheduler ──allocates──► ResourceSlice (cxi0, cxi1, …)
                          ├── writes CDI specs → /var/run/cdi/
                          │     ├── DeviceNodes: /dev/cxiN  (cgroup BPF allowance)
                          │     └── env spec, attached to every device: kdreg2/gdrdrv/xpmem,
-                         │         /dev/shm, host libfabric/libcxi under /host/env and
+                         │         host libfabric/libcxi under /host/env and
                          │         CXIP_SKIP_AMA_CHECK (libs/env with --enable-cdi-env)
                          ├── ClaimBinder
                          │     └── gates pod binding via DRA BindingConditions
@@ -35,7 +35,8 @@ Scheduler ──allocates──► ResourceSlice (cxi0, cxi1, …)
                          │         (HSN sysfs injection so stock libfabric finds the device)
                          ├── NRI plugin (CreateContainer)
                          │     └── injects SLINGSHOT_DEVICES, SLINGSHOT_VNIS, SLINGSHOT_SVC_IDS env
-                         │         vars and bind-mounts the synthetic /sys/class/net over the
+                         │         vars, mounts a fresh per-container tmpfs at /dev/shm
+                         │         (never the host's) and bind-mounts the synthetic /sys/class/net over the
                          │         container's own (HSN visible to stock libfabric)
                          └── NRI plugin (StopPodSandbox)
                                └── destroys CXI service and removes the synthetic sysfs tree
@@ -366,7 +367,7 @@ The per-claim resource values map directly to fields in the per-service `cxi_svc
 
 Like the NVIDIA DRA driver, the driver injects the host runtime it owns with every device and leaves nothing to choose per claim. Each prepared CXI device gets its own `/dev/cxiN` spec plus the shared `env` CDI spec (referenced once per claim, however many devices it has). The env spec carries:
 
-- `/dev/kdreg2` (libfabric's MR-cache monitor), `/dev/gdrdrv` (GDRCopy) and `/dev/xpmem` device nodes, each only when present on the host, and a `/dev/shm` bind — **always**, even without `--enable-cdi-env`;
+- `/dev/kdreg2` (libfabric's MR-cache monitor), `/dev/gdrdrv` (GDRCopy) and `/dev/xpmem` device nodes, each only when present on the host — **always**, even without `--enable-cdi-env`;
 - with `--enable-cdi-env` and `--env-config`: the listed host libraries (libfabric, libcxi and their dependencies), bind-mounted read-only at `/host/env/<basename>` — nothing is written over the image's own files — plus the listed env vars.
 
 A `createContainer` hook (`cxi-cdi-hook update-ldcache --folder /host/env`) rebuilds the container's `ld.so.cache` with `/host/env` included. The driver installs `cxi-cdi-hook` and a self-contained `ldconfig` (with its dynamic linker and libc) onto each node at startup (`--cdi-hook-path`, `--cdi-ldconfig-dir`; see [internal/cdi/hookinstall.go](internal/cdi/hookinstall.go)), so **nothing needs to be pre-installed on the node** — no nvidia-container-toolkit. The driver does **not** touch `LD_LIBRARY_PATH`, which the loader consults before the ldcache; an image that points it at a bundled libfabric (NGC: `/opt/amazon/efa/lib`) is left to k8s-modules (below).

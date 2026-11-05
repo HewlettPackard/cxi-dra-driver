@@ -303,8 +303,8 @@ func (d *Driver) Run(ctx context.Context) error {
 	}
 
 	// The env spec is attached to every CXI device, so it is always written:
-	// it carries the kdreg2/gdrdrv/xpmem nodes and /dev/shm even when no host libs
-	// are configured.
+	// it carries the kdreg2/gdrdrv/xpmem nodes even when no host libs are
+	// configured.
 	if err := cdi.WriteEnvSpec(d.cdiRoot, d.driverName, d.cdiEnvConfig); err != nil {
 		return fmt.Errorf("writing CDI env spec: %w", err)
 	}

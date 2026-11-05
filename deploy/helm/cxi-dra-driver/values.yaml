@@ -79,7 +79,7 @@ driver:
   # to disable the hint-file write/delete.
   cniHintsDir: /var/run/cxi/net-hints
   # -- Add the envConfig host libs and env vars to the env CDI spec (the spec
-  # itself, with /dev/kdreg2, /dev/gdrdrv, /dev/xpmem and /dev/shm, is always
+  # itself, with /dev/kdreg2, /dev/gdrdrv and /dev/xpmem, is always
   # injected).
   enableCdiEnv: true
   # -- Per-namespace VNI pool.
@@ -159,7 +159,7 @@ admissionPolicy:
 envConfig:
   # -- Render the env.json ConfigMap for the "env" CDI spec, which is attached to
   # every CXI device alongside /dev/cxiN (it always carries /dev/kdreg2,
-  # /dev/gdrdrv, /dev/xpmem and /dev/shm). With driver.enableCdiEnv it also
+  # /dev/gdrdrv and /dev/xpmem). With driver.enableCdiEnv it also
   # injects the host libfabric/libcxi below, bind-mounted read-only at
   # /host/env/<basename>, and the env vars. Host paths are site-specific —
   # override below. NCCL and aws-ofi-nccl are injected by k8s-modules (pod

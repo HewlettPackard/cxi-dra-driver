@@ -42,7 +42,7 @@ func (c LdcacheConfig) enabled() bool { return c.Enabled == nil || *c.Enabled }
 // CDIEnvConfig holds the host runtime the env spec injects. It is loaded from
 // a JSON file at driver startup (see LoadConfig) so paths can be updated
 // without rebuilding the binary. The zero value (--enable-cdi-env unset)
-// yields an env spec with only the side-device nodes and /dev/shm.
+// yields an env spec with only the side-device nodes.
 type CDIEnvConfig struct {
 	Ldcache LdcacheConfig `json:"ldcache,omitzero"`
 
@@ -90,9 +90,11 @@ func profileSpecPath(cdiRoot, driverName, name string) string {
 }
 
 // WriteEnvSpec writes the env CDI spec: the xpmem/gdrdrv/kdreg2 device nodes (each
-// only when present on the host), /dev/shm, read-only bind mounts of cfg.Libs
-// under /host/env, cfg.Env, and the ldcache hook. It also removes the spec
-// files of the legacy nccl/aws-ofi-nccl profiles.
+// only when present on the host), read-only bind mounts of cfg.Libs under
+// /host/env, cfg.Env, and the ldcache hook. It also removes the spec files of
+// the legacy nccl/aws-ofi-nccl profiles. It deliberately does not mount the
+// host /dev/shm, which would be shared between tenants; the NRI plugin gives
+// each container its own tmpfs there instead.
 func WriteEnvSpec(cdiRoot, driverName string, cfg CDIEnvConfig) error {
 	if err := os.MkdirAll(cdiRoot, 0o755); err != nil {
 		return err
@@ -118,11 +120,7 @@ func WriteEnvSpec(cdiRoot, driverName string, cfg CDIEnvConfig) error {
 		}
 	}
 
-	mounts := []*specs.Mount{{
-		HostPath:      "/dev/shm",
-		ContainerPath: "/dev/shm",
-		Options:       []string{"bind", "rw", "nosuid", "nodev", "private"},
-	}}
+	var mounts []*specs.Mount
 	for _, l := range cfg.Libs {
 		mounts = append(mounts, &specs.Mount{
 			HostPath:      l,

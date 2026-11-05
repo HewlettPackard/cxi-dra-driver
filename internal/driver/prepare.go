@@ -389,7 +389,7 @@ func (d *Driver) legacyResourceConfig(
 
 // resolveCDIDeviceIDs returns the CDI device IDs attached for one device:
 // its own cxi=<dev> spec and the shared env spec (kdreg2/gdrdrv/xpmem nodes,
-// /dev/shm, and the host libs and env vars when --enable-cdi-env is set).
+// and the host libs and env vars when --enable-cdi-env is set).
 // Like the NVIDIA DRA driver, there is nothing to choose per claim; NCCL and
 // aws-ofi-nccl are injected by k8s-modules (modules.brics.ac.uk/load).
 func (d *Driver) resolveCDIDeviceIDs(deviceName string) []string {
