@@ -1,0 +1,75 @@
+# Multi-request claim with legacy opaque config that names ONE request, to
+# verify the capacity-conversion admission policy end to end (scheduler and
+# Prepare, not only the mutated object).
+#
+# The claim has two requests and config[0].requests names only the second. The
+# policy must convert the opaque config onto "second" regardless of its
+# position; "first" keeps the device defaults. To exercise a real mixed claim,
+# change "first" to a request on a non-CXI DeviceClass (for example a GPU
+# class) in a cluster that has one — the expected result is identical.
+#
+# The manifest sets no namespace: pass -n. deviceClassName and driver below are
+# the raw-manifest names; for the Helm chart use its DeviceClass and driver
+# name (e.g. cxi-slingshot-hpe-com-device / cxi.slingshot.hpe.com), for
+# example:
+#   sed -e 's/cxi-device/cxi-it-hpe-com-device/' \
+#       -e 's/cxi.slingshot.hpe.com/cxi-it.hpe.com/' \
+#       deploy/kubernetes/test/mixed-claim.yaml | kubectl apply -n cxi-it -f -
+#
+# The node needs two free CXI devices (one per request). LE/TLE are 0 so the
+# claim is also valid in VF mode (--vf-only).
+#
+# Verify (a claim generated from the template is named <pod>-<claim>-<hash>):
+#   CLAIM=$(kubectl get resourceclaim -o name | grep cxi-mixed)
+#   # 1. the policy converted the named request only (controller-created claim):
+#   kubectl get "$CLAIM" -o jsonpath='{range .spec.devices.requests[*]}{.name}{": "}{.exactly.capacity.requests}{"\n"}{end}'
+#      expect  first:   (empty)
+#              second: {"les":"0","tgqs":"32","tles":"0","txqs":"64"}
+#   # 2. the scheduler charged that capacity to the second request's device:
+#   kubectl get "$CLAIM" -o jsonpath='{range .status.allocation.devices.results[*]}{.request}{": "}{.device}{" "}{.consumedCapacity}{"\n"}{end}'
+#   # 3. Prepare succeeded and the pod runs:
+#   kubectl get pod cxi-mixed-test
+#
+# Cleanup:
+#   kubectl delete pod cxi-mixed-test; kubectl delete resourceclaimtemplate cxi-mixed
+---
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata:
+  name: cxi-mixed
+spec:
+  spec:
+    devices:
+      requests:
+        - name: first
+          exactly:
+            deviceClassName: cxi-device
+        - name: second
+          exactly:
+            deviceClassName: cxi-device
+      config:
+        - requests: [second]
+          opaque:
+            driver: cxi.slingshot.hpe.com
+            parameters:
+              txqs: 64
+              tgqs: 32
+              le_pools: 0
+              tle_pools: 0
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: cxi-mixed-test
+spec:
+  restartPolicy: Never
+  resourceClaims:
+    - name: cxi
+      resourceClaimTemplateName: cxi-mixed
+  containers:
+    - name: workload
+      image: ubuntu:24.04
+      command: ["sleep", "3600"]
+      resources:
+        claims:
+          - name: cxi

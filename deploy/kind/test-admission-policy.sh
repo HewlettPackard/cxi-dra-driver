@@ -34,6 +34,8 @@
 # Usage:
 #   ./deploy/kind/test-admission-policy.sh
 #   KUBECONFIG=/path/to/kubeconfig ./deploy/kind/test-admission-policy.sh
+#   SKIP_POD_ATTACH=1 DRIVER=cxi-it.hpe.com DEVICE_CLASS=cxi-it-hpe-com-device \
+#     ./deploy/kind/test-admission-policy.sh   # claim policies only
 
 set -euo pipefail
 
@@ -58,7 +60,11 @@ templates=(
 tmpdir="$(mktemp -d)"
 trap 'rm -rf "$tmpdir"' EXIT
 
+# SKIP_POD_ATTACH=1 skips the Pod auto-attach checks, for installs without the
+# Slingshot CNI policy or with a non-default driver name (the template names
+# above are the default chart's).
 for template in "${templates[@]}"; do
+  [[ "${SKIP_POD_ATTACH:-}" == "1" ]] && break
   # Generate a unique Pod name from the template name.
   pod_name="test-admission-$(echo "$template" | tr '.' '-' | tr '_' '-')"
 
@@ -104,7 +110,11 @@ EOF
 done
 
 echo
-echo "PASS: all CXI ResourceClaimTemplate naming patterns triggered Slingshot network auto-attachment"
+if [[ "${SKIP_POD_ATTACH:-}" == "1" ]]; then
+  echo "SKIP: Pod network auto-attachment checks (SKIP_POD_ATTACH=1)"
+else
+  echo "PASS: all CXI ResourceClaimTemplate naming patterns triggered Slingshot network auto-attachment"
+fi
 
 # ---------------------------------------------------------------------------
 # Capacity conversion and VNI selector (ResourceClaim CREATE)
@@ -198,6 +208,112 @@ actual="$(submit_claim "${NAMESPACE}" \
             le_pools: 0
             tle_pools: 0")"
 expect_equal "le_pools: 0 / tle_pools: 0 convert to les/tles \"0\"" "0/0" "${actual}"
+
+# submit_raw REQUESTS CONFIG JSONPATH
+# Dry-runs a ResourceClaim in the default namespace and prints JSONPATH of the
+# mutated object. REQUESTS and CONFIG are the raw list items under "requests:"
+# and "config:" (6-space indent). A rejected claim prints "REJECTED: <error>",
+# so an assertion cannot pass on empty output.
+submit_raw() {
+  local requests="$1" config="$2" path="$3" out
+  cat > "${tmpdir}/claim.yaml" <<EOF
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaim
+metadata:
+  name: test-admission-claim
+  namespace: ${NAMESPACE}
+spec:
+  devices:
+    requests:
+${requests}
+    config:
+${config}
+EOF
+  if ! out="$(kubectl create --dry-run=server -f "${tmpdir}/claim.yaml" -o jsonpath="${path}" 2>&1)"; then
+    echo "REJECTED: ${out}"
+    return 0
+  fi
+  echo "${out}"
+}
+
+# exactly_request NAME CLASS [TXQS]
+# A request item; TXQS, when given, adds the user's own capacity request.
+exactly_request() {
+  printf '      - name: %s\n        exactly:\n          deviceClassName: %s\n' "$1" "$2"
+  if [[ -n "${3:-}" ]]; then printf '          capacity:\n            requests:\n              txqs: "%s"\n' "$3"; fi
+}
+
+# cxi_config REQUESTS_LINE [DRIVER]
+# A config item carrying opaque CXI parameters (txqs 64, tgqs 32, 2 LE pools).
+cxi_config() {
+  printf '      - %s\n        opaque:\n          driver: %s\n          parameters:\n            txqs: 64\n            tgqs: 32\n            le_pools: 2\n' \
+    "$1" "${2:-${DRIVER}}"
+}
+
+# cap_of NAME: JSONPATH printing a request's txqs/les capacity requests.
+cap_of() {
+  printf '{.spec.devices.requests[?(@.name=="%s")].exactly.capacity.requests.txqs}/{.spec.devices.requests[?(@.name=="%s")].exactly.capacity.requests.les}' "$1" "$1"
+}
+
+GPU_CLASS="gpu.example.com"
+
+echo
+echo "==> Capacity conversion: mixed CXI + non-CXI claims are not order-dependent"
+for order in "gpu cxi" "cxi gpu"; do
+  read -r first second <<<"${order}"
+  reqs=""
+  for name in "${first}" "${second}"; do
+    class="${GPU_CLASS}"
+    if [[ "${name}" == "cxi" ]]; then class="${DEVICE_CLASS}"; fi
+    reqs+="$(exactly_request "${name}" "${class}")"$'\n'
+  done
+  for cfg_requests in 'requests: [cxi]' 'requests: []'; do
+    cfg="$(cxi_config "${cfg_requests}")"
+    expect_equal "[${first}, ${second}], config ${cfg_requests}: capacity on the cxi request" "64/2048" \
+      "$(submit_raw "${reqs}" "${cfg}" "$(cap_of cxi)")"
+    expect_equal "[${first}, ${second}], config ${cfg_requests}: gpu request untouched" "/" \
+      "$(submit_raw "${reqs}" "${cfg}" "$(cap_of gpu)")"
+  done
+done
+
+echo
+echo "==> Capacity conversion: edge cases"
+
+# The user's own capacity request wins and is not merged with the opaque config.
+expect_equal "user capacity on the target request is kept, opaque config not merged" "4/" \
+  "$(submit_raw "$(exactly_request cxi "${DEVICE_CLASS}" 4)" "$(cxi_config 'requests: [cxi]')" "$(cap_of cxi)")"
+
+# Two CXI requests: only the ones named are converted, whatever their position.
+reqs="$(exactly_request a "${DEVICE_CLASS}")"$'\n'"$(exactly_request b "${DEVICE_CLASS}")"
+cfg="$(cxi_config 'requests: [b]')"
+expect_equal "two CXI requests, config names b: b converted" "64/2048" "$(submit_raw "${reqs}" "${cfg}" "$(cap_of b)")"
+expect_equal "two CXI requests, config names b: a untouched" "/" "$(submit_raw "${reqs}" "${cfg}" "$(cap_of a)")"
+cfg="$(cxi_config 'requests: [a, b]')"
+expect_equal "config names a and b: a converted" "64/2048" "$(submit_raw "${reqs}" "${cfg}" "$(cap_of a)")"
+expect_equal "config names a and b: b converted" "64/2048" "$(submit_raw "${reqs}" "${cfg}" "$(cap_of b)")"
+cfg="$(cxi_config 'requests: []')"
+expect_equal "config without requests: both CXI requests converted" "64/2048 64/2048" \
+  "$(submit_raw "${reqs}" "${cfg}" "$(cap_of a) $(cap_of b)")"
+
+# A firstAvailable request has no "exactly": it is skipped, the rest still converts.
+reqs="      - name: fa
+        firstAvailable:
+          - name: sub
+            deviceClassName: ${DEVICE_CLASS}
+$(exactly_request cxi "${DEVICE_CLASS}")"
+FA_NAME='{.spec.devices.requests[?(@.name=="fa")].firstAvailable[0].name}'
+for cfg_requests in 'requests: [cxi]' 'requests: []'; do
+  cfg="$(cxi_config "${cfg_requests}")"
+  expect_equal "firstAvailable request next to cxi, config ${cfg_requests}: cxi converted" "64/2048" \
+    "$(submit_raw "${reqs}" "${cfg}" "$(cap_of cxi)")"
+  expect_equal "firstAvailable request next to cxi, config ${cfg_requests}: firstAvailable untouched" "sub" \
+    "$(submit_raw "${reqs}" "${cfg}" "${FA_NAME}")"
+done
+
+# Only config[0] is read: a CXI config at config[1] is not converted (known limitation).
+cfg="$(cxi_config 'requests: [cxi]' other.example.com)"$'\n'"$(cxi_config 'requests: [cxi]')"
+expect_equal "CXI config at config[1] behind another driver's config[0]: not converted" "/" \
+  "$(submit_raw "$(exactly_request cxi "${DEVICE_CLASS}")" "${cfg}" "$(cap_of cxi)")"
 
 echo
 echo "==> VNI selector"
