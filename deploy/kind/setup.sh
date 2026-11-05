@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # Sets up a local kind cluster with the CXI DRA driver in mock mode.
+# MOCK_VFS=<parents>x<vfs-per-parent> (e.g. 2x4) runs it in SR-IOV VF mode on a mock
+# topology instead of MOCK_DEVICES PFs, and installs the admission policies.
 # Requires: kind, kubectl, docker OR podman
 
 set -euo pipefail
@@ -7,6 +9,7 @@ set -euo pipefail
 CLUSTER_NAME="${CLUSTER_NAME:-cxi-dra-dev}"
 IMAGE="${IMAGE:-localhost/cxi-dra-driver:dev}"
 MOCK_DEVICES="${MOCK_DEVICES:-2}"
+MOCK_VFS="${MOCK_VFS:-}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 KUBECONFIG_PATH="${REPO_ROOT}/.kube/config"
@@ -82,17 +85,28 @@ echo "==> Applying RBAC and DeviceClasses"
 kubectl apply -f "${REPO_ROOT}/deploy/kubernetes/clusterrole.yaml"
 kubectl apply -f "${REPO_ROOT}/deploy/kubernetes/deviceclass.yaml"
 
-echo "==> Patching DaemonSet for mock mode (${MOCK_DEVICES} devices, no nodeSelector)"
+# Mock device names: PFs cxi0.., or the VFs cxi1.. of the mock PF cxi0.
+if [[ -n "${MOCK_VFS}" ]]; then
+  MOCK_ARG="--mock-vfs=${MOCK_VFS}"
+  MOCK_NAMES=$(seq 1 $(( ${MOCK_VFS%%[xX]*} * ${MOCK_VFS##*[xX]} )))
+  echo "==> Applying admission policies (capacity conversion, VNI selector)"
+  kubectl apply -f "${REPO_ROOT}/deploy/kubernetes/admission-policy.yaml"
+else
+  MOCK_ARG="--mock-devices=${MOCK_DEVICES}"
+  MOCK_NAMES=$(seq 0 $((MOCK_DEVICES - 1)))
+fi
+
+echo "==> Patching DaemonSet for mock mode (${MOCK_ARG}, no nodeSelector)"
 sed \
   -e "s|__IMAGE__|${IMAGE}|g" \
-  -e "s|__MOCK_DEVICES__|${MOCK_DEVICES}|g" \
+  -e "s|__MOCK_ARG__|${MOCK_ARG}|g" \
   "${SCRIPT_DIR}/daemonset-mock.yaml" \
   | kubectl apply -f -
 
 echo "==> Creating mock device files on worker node"
 WORKER_NODE=$(kubectl get nodes --selector='feature.node.kubernetes.io/cxi=true' -o jsonpath='{.items[0].metadata.name}')
 "${CONTAINER_CLI}" exec "${WORKER_NODE}" mkdir -p /tmp/mock-cxi
-for i in $(seq 0 $((MOCK_DEVICES - 1))); do
+for i in ${MOCK_NAMES}; do
   "${CONTAINER_CLI}" exec "${WORKER_NODE}" touch /tmp/mock-cxi/cxi${i}
 done
 
@@ -116,6 +130,9 @@ echo "  kubectl apply -f ${REPO_ROOT}/deploy/kubernetes/test/"
 echo ""
 echo "Run the namespace-VNI allocator tests:"
 echo "  ${SCRIPT_DIR}/test-vni.sh"
+echo ""
+echo "Run the SR-IOV VF tests (MOCK_VFS=2x4 setup):"
+echo "  ${SCRIPT_DIR}/test-vf.sh"
 echo ""
 echo "Tear down:"
 echo "  kind delete cluster --name ${CLUSTER_NAME}"

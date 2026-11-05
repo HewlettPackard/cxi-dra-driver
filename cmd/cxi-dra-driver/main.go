@@ -46,6 +46,7 @@ func main() {
 		registrarDir  = flag.String("registrar-dir", kubeletplugin.KubeletRegistryDir, "Kubelet plugin registrar directory")
 		kubeconfig    = flag.String("kubeconfig", "", "Path to kubeconfig (omit for in-cluster config)")
 		mockDevices   = flag.Int("mock-devices", 0, "Generate N synthetic CXI devices instead of real discovery (for kind/local testing)")
+		mockVFs       = flag.String("mock-vfs", "", "Generate a synthetic SR-IOV topology instead of real discovery: <parents>x<vfs-per-parent> on one mock PF (implies --vf-only; mock image only)")
 		vniRangeStart = flag.Int("vni-range-start", 0, "First VNI in the cluster-wide pool used by the namespace VNI allocator (0 disables the allocator)")
 		vniRangeEnd   = flag.Int("vni-range-end", 0, "Last VNI in the cluster-wide pool (inclusive)")
 
@@ -134,7 +135,15 @@ func main() {
 		os.Exit(1)
 	}
 
-	mock := *mockDevices > 0
+	mock := *mockDevices > 0 || *mockVFs != ""
+	if *mockDevices > 0 && *mockVFs != "" {
+		fmt.Fprintln(os.Stderr, "error: --mock-devices and --mock-vfs are mutually exclusive")
+		os.Exit(1)
+	}
+	if *mockVFs != "" && !*vfOnly {
+		log.Printf("--mock-vfs implies --vf-only")
+		*vfOnly = true
+	}
 
 	sysSvcIDs, err := parseSvcIDs(*systemSvcIDs)
 	if err != nil {
@@ -149,8 +158,18 @@ func main() {
 	}
 
 	var mockDevList []*cxi.Device
-	if mock {
+	if *mockDevices > 0 {
 		mockDevList = cxi.MockDevices(*mockDevices)
+	}
+	if *mockVFs != "" {
+		parents, perParent, err := cxi.ParseMockVFs(*mockVFs)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
+		var topo cxi.MockTopology
+		mockDevList, topo = cxi.MockVFTopology(parents, perParent)
+		cxi.SetMockTopology(topo)
 	}
 
 	var envConfig cdi.CDIEnvConfig

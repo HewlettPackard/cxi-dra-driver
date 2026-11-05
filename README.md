@@ -722,6 +722,7 @@ docs/                    pod-lifecycle-flow.txt, cni/ (plugin reference, driver-
 | `--registrar-dir` | `/var/lib/kubelet/plugins_registry` | Plugin registrar directory |
 | `--kubeconfig` | `""` | Path to a kubeconfig (empty uses in-cluster config) |
 | `--mock-devices` | `0` | Generate N synthetic devices (no hardware needed) |
+| `--mock-vfs` | `""` | Generate a synthetic SR-IOV topology, `<parents>x<vfs-per-parent>` on one mock PF (implies `--vf-only`; mock image only) |
 | `--resource-refresh-interval` | `10s` | How often the orphan-service reaper checks for CXI services whose pod is gone |
 | `--vni-range-start` | `0` | First VNI in the namespace-VNI allocator's pool (0 disables the allocator) |
 | `--vni-range-end` | `0` | Last VNI in the pool (inclusive) |
@@ -826,6 +827,21 @@ kubectl get resourceslices -o wide
 kubectl apply -f deploy/kubernetes/test/resourceclaim.yaml
 kubectl apply -f deploy/kubernetes/test/pod.yaml
 kubectl logs cxi-test-3
+```
+
+`--mock-vfs=<parents>x<vfs-per-parent>` runs the SR-IOV VF path instead: one mock
+PF `cxi0` with parent services `cxi0-svc4`, `cxi0-svc5`, ..., each with the
+hardware-measured budget and one Ethernet child per VF, and the VFs `cxi1`, `cxi2`, ...
+assigned to them. Parents get disjoint VNI sets: even parents the range
+`100(k+1)`–`100(k+1)+15`, odd parents the list `{100(k+1), +2, +4}` (so 100–115 and
+{200,202,204} for two parents). The mock service manager shares each parent's budget
+across its VFs and rejects VNIs outside the parent's set. It writes service files to
+`/tmp/cxi-services` and bind-mounts them into pods, so that path must be a hostPath in
+the driver pod (the kind DaemonSet has it).
+
+```bash
+MOCK_VFS=2x4 deploy/kind/setup.sh    # also installs the admission policies
+deploy/kind/test-vf.sh               # VF placement, vfs and budget exhaustion, VNI selector
 ```
 
 ## Known Limitations / Planned Work
