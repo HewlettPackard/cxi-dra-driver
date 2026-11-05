@@ -30,7 +30,7 @@ spec:
             - --cdi-root=/var/run/cdi
             - --plugin-dir=/var/lib/kubelet/plugins/cxi.slingshot.hpe.com
             - --registrar-dir=/var/lib/kubelet/plugins_registry
-            - --mock-devices=__MOCK_DEVICES__
+            - __MOCK_ARG__
             - --vni-range-start=1
             - --vni-range-end=5
           env:
