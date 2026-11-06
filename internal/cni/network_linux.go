@@ -6,6 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
 
 	types100 "github.com/containernetworking/cni/pkg/types/100"
 	"github.com/vishvananda/netlink"
@@ -75,6 +79,10 @@ func (netlinkManager) CreateIPVLAN(hsnIface, ifName, containerID, nsPath string)
 		if renameErr != nil {
 			return fmt.Errorf("renaming IPVLAN sub-interface to %s (or fallback): %w", ifName, renameErr)
 		}
+		// Before the link comes up, so it never answers ARP with the defaults.
+		if err := setARPSysctls(nsPath, usedName); err != nil {
+			return err
+		}
 		if err := h.LinkSetUp(moved); err != nil {
 			return fmt.Errorf("setting %s up: %w", usedName, err)
 		}
@@ -92,6 +100,64 @@ func (netlinkManager) CreateIPVLAN(hsnIface, ifName, containerID, nsPath string)
 		return "", err
 	}
 	return usedName, nil
+}
+
+// Per-interface ARP sysctls applied to every IPVLAN the plugin creates.
+// A pod claiming several devices has one IPVLAN per HSN, all in the same L2
+// domain and subnet. With the kernel defaults (arp_ignore=0) every interface
+// answers ARP for every local IP, so a peer can cache the MAC of the wrong
+// interface and its traffic is then dropped (intermittent 100% loss).
+const (
+	// arpIgnoreTargetOnly answers an ARP request only if the target IP is
+	// configured on the interface that received it.
+	arpIgnoreTargetOnly = "1"
+	// arpAnnounceBestLocal restricts the ARP source address to one in the
+	// target's subnet on the outgoing interface, so announcements never
+	// advertise another interface's IP.
+	arpAnnounceBestLocal = "2"
+)
+
+// setARPSysctls writes arp_ignore and arp_announce for ifName inside the netns
+// at nsPath.
+func setARPSysctls(nsPath, ifName string) error {
+	// The kernel exposes a "." in an interface name as "/" in sysctl paths.
+	dir := filepath.Join("/proc/sys/net/ipv4/conf", strings.ReplaceAll(ifName, ".", "/"))
+	return inNetNS(nsPath, func() error {
+		for _, s := range []struct{ name, value string }{
+			{"arp_ignore", arpIgnoreTargetOnly},
+			{"arp_announce", arpAnnounceBestLocal},
+		} {
+			if err := os.WriteFile(filepath.Join(dir, s.name), []byte(s.value), 0o644); err != nil {
+				return fmt.Errorf("setting %s=%s on %s: %w", s.name, s.value, ifName, err)
+			}
+		}
+		return nil
+	})
+}
+
+// inNetNS runs fn on an OS thread joined to the netns at nsPath. It is needed
+// for /proc/sys/net, which is resolved against the network namespace of the
+// opening thread (netlink handles don't help here). fn runs on a throwaway
+// goroutine whose thread is never unlocked, so the runtime discards it instead
+// of returning a thread still joined to the pod netns to the pool — the same
+// approach as internal/netsysfs.
+func inNetNS(nsPath string, fn func() error) error {
+	errCh := make(chan error, 1)
+	go func() {
+		runtime.LockOSThread()
+		nsFd, err := unix.Open(nsPath, unix.O_RDONLY|unix.O_CLOEXEC, 0)
+		if err != nil {
+			errCh <- fmt.Errorf("opening netns %s: %w", nsPath, err)
+			return
+		}
+		defer func() { _ = unix.Close(nsFd) }()
+		if err := unix.Setns(nsFd, unix.CLONE_NEWNET); err != nil {
+			errCh <- fmt.Errorf("joining netns %s: %w", nsPath, err)
+			return
+		}
+		errCh <- fn()
+	}()
+	return <-errCh
 }
 
 func (netlinkManager) Find(nsPath, ifName string) (string, error) {

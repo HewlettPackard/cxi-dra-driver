@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/containernetworking/cni/pkg/types"
@@ -186,6 +187,47 @@ func TestNetlinkManager_CreateConfigureCheckDelete(t *testing.T) {
 	}
 	if err := m.Check(nsPath, name); err == nil {
 		t.Error("Check must fail once the link is gone")
+	}
+}
+
+// readARPSysctl reads a per-interface IPv4 sysctl as seen from inside nsPath.
+func readARPSysctl(t *testing.T, nsPath, ifName, name string) string {
+	t.Helper()
+	var val string
+	err := inNetNS(nsPath, func() error {
+		b, err := os.ReadFile(filepath.Join("/proc/sys/net/ipv4/conf", ifName, name))
+		val = strings.TrimSpace(string(b))
+		return err
+	})
+	if err != nil {
+		t.Fatalf("reading %s on %s: %v", name, ifName, err)
+	}
+	return val
+}
+
+// Several IPVLANs of one pod share an L2 domain, so each must answer ARP only
+// for its own address; the kernel defaults make every interface answer for all.
+func TestNetlinkManager_CreateIPVLANSetsARPSysctls(t *testing.T) {
+	requireRoot(t)
+	nsPath := newTestNetNS(t)
+	m := newLinkManager()
+
+	var names []string
+	for i, parent := range []string{"hsnT4", "hsnT5"} {
+		newDummyParent(t, parent)
+		name, err := m.CreateIPVLAN(parent, parent, fmt.Sprintf("ctr%d", i), nsPath)
+		if err != nil {
+			t.Fatalf("CreateIPVLAN(%s): %v", parent, err)
+		}
+		names = append(names, name)
+	}
+	for _, name := range names {
+		if got := readARPSysctl(t, nsPath, name, "arp_ignore"); got != "1" {
+			t.Errorf("%s arp_ignore = %q, want 1", name, got)
+		}
+		if got := readARPSysctl(t, nsPath, name, "arp_announce"); got != "2" {
+			t.Errorf("%s arp_announce = %q, want 2", name, got)
+		}
 	}
 }
 

@@ -105,7 +105,7 @@ For each hint entry, in order:
 | a | `LinkByName(hsn_iface)` in the host netns → parent | fail; unwind previous devices |
 | b | `LinkAdd` IPVLAN (mode L2, parent = HSN) under a temporary host-side name (`cxi<containerID[:8]>`) | fail; unwind |
 | c | `LinkSetNsFd` → move into `CNI_NETNS` | delete link; unwind |
-| d | Inside the pod netns: rename to the effective name (`ifname`, otherwise `hsn_iface`); if the kernel refuses (name in use), try `<name>_inet`; `LinkSetUp` | delete link; unwind |
+| d | Inside the pod netns: rename to the effective name (`ifname`, otherwise `hsn_iface`); if the kernel refuses (name in use), try `<name>_inet`; set `arp_ignore=1` and `arp_announce=2` on the interface; `LinkSetUp` | delete link; unwind |
 | e | Exec the IPAM plugin (`ipam.type`, found on `CNI_PATH`) with `CNI_COMMAND=ADD`, the **unmodified stdin config**, and `CNI_IFNAME` overridden to the name chosen in (d) | delete link; unwind |
 | f | Apply every returned IP to the interface; add every returned route (using the IP's gateway when the route has none) | IPAM `DEL` + delete link; unwind |
 
@@ -124,6 +124,14 @@ passes to `slingshot-cni` is a single name (e.g. `net1`); reusing it for
 every device of a `count: 2` pod would make the second reservation overwrite
 the first. Presenting each device under its own in-pod name keeps the
 reservations distinct and lets `DEL` release each one precisely.
+
+**Why the ARP sysctls are set.** A pod with several devices has several IPVLANs
+in one L2 domain and subnet. With the kernel default `arp_ignore=0`, every
+interface answers ARP for every local IP, so a peer may cache the MAC of the
+wrong interface and its traffic is dropped (intermittent 100% loss). Pod
+`securityContext.sysctls` cannot fix this: the interfaces do not exist when the
+pod spec is evaluated, and `/proc/sys` is read-only in the workload. The plugin
+writes them from the host, inside the pod netns, before the link comes up.
 
 ### `DEL`
 
@@ -199,7 +207,7 @@ Prerequisites on each node:
 | [cmd_test.go](../../internal/cni/cmd_test.go) | `ADD`/`DEL`/`CHECK` orchestration against in-memory fakes: single- and multi-device result shape, custom names, `_inet` fallback, rollback ordering on IPAM / configure / create failure, `DEL` idempotency and per-device continuation, missing-vs-malformed/unsupported hint handling | everywhere |
 | [hint_test.go](../../internal/cni/hint_test.go) | Legacy/versioned hints, optional naming, fallback length boundaries, unsupported schema errors and logging | everywhere |
 | [ipam_test.go](../../internal/cni/ipam_test.go) | the real IPAM delegate exec'ing a fake `whereabouts` binary (built from [testdata/fakewhereabouts](../../internal/cni/testdata/fakewhereabouts)) — verifies `CNI_COMMAND`, per-device `CNI_IFNAME` override, inherited `CNI_CONTAINERID`, stdin forwarding, result parsing, and error surfacing | everywhere (needs `go` on `PATH`) |
-| [network_linux_test.go](../../internal/cni/network_linux_test.go) | the real `netlink` implementation against a throwaway named netns and a dummy parent: create/move/rename/up, L2 mode, address and route application, distinct host/pod names, `Find`/`Check`/`Delete`, idempotent delete, `_inet` fallback at the 15-byte limit without disturbing the pod's own link, vanished-netns handling | Linux as root only (skips otherwise) |
+| [network_linux_test.go](../../internal/cni/network_linux_test.go) | the real `netlink` implementation against a throwaway named netns and a dummy parent: create/move/rename/up, L2 mode, per-interface ARP sysctls, address and route application, distinct host/pod names, `Find`/`Check`/`Delete`, idempotent delete, `_inet` fallback at the 15-byte limit without disturbing the pod's own link, vanished-netns handling | Linux as root only (skips otherwise) |
 
 To run the root-gated tests from a non-Linux workstation:
 
