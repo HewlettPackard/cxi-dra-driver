@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/slingshot/cxi-dra-driver/internal/cxi"
+	"github.com/HewlettPackard/cxi-dra-driver/internal/cxi"
 )
 
 // parentInfo is one VF-mode parent as the driver uses it: the VFs grouped

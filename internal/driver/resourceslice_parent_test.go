@@ -9,7 +9,7 @@ import (
 
 	resourceapi "k8s.io/api/resource/v1"
 
-	"github.com/slingshot/cxi-dra-driver/internal/cxi"
+	"github.com/HewlettPackard/cxi-dra-driver/internal/cxi"
 )
 
 // testParentCeiling is a ceiling with non-zero LEs/TLEs on purpose: parents

@@ -8,7 +8,7 @@ import (
 	resourceapi "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 
-	"github.com/slingshot/cxi-dra-driver/internal/cxi"
+	"github.com/HewlettPackard/cxi-dra-driver/internal/cxi"
 )
 
 func consumedOf(rs cxi.ResourceSet) map[resourceapi.QualifiedName]resource.Quantity {

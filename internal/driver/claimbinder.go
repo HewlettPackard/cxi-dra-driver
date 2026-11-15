@@ -13,7 +13,7 @@ import (
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes"
 
-	"github.com/slingshot/cxi-dra-driver/internal/cxi"
+	"github.com/HewlettPackard/cxi-dra-driver/internal/cxi"
 )
 
 // ClaimBinder watches ResourceClaims cluster-wide and manages DRA binding

@@ -4,15 +4,6 @@ on:
   push:
     branches: [main]
     tags: ["v*"]
-    paths:
-      - "Dockerfile"
-      - "Dockerfile.mock"
-      - ".dockerignore"
-      - ".github/workflows/build.yaml"
-      - "go.mod"
-      - "go.sum"
-      - "cmd/**"
-      - "internal/**"
   pull_request:
     branches: [main]
     paths:
@@ -24,18 +15,25 @@ on:
       - "go.sum"
       - "cmd/**"
       - "internal/**"
+  workflow_dispatch:
 
-# Runners, registry, and credentials come from repo variables/secrets
-# (Settings > Secrets and variables > Actions); nothing is hard-coded here.
+# The image is published to GHCR with the workflow's own GITHUB_TOKEN; no
+# repository secrets or variables are needed. The name must be lowercase, so it
+# is spelled out rather than derived from github.repository.
 env:
-  REGISTRY: ${{ vars.REGISTRY }}
-  IMAGE_NAME: ${{ vars.IMAGE_NAME }}
-  # Buildx gha cache needs the Actions cache service; opt in with BUILD_CACHE_GHA=true.
-  CACHE_GHA: ${{ vars.BUILD_CACHE_GHA == 'true' }}
+  REGISTRY: ghcr.io
+  IMAGE_NAME: hewlettpackard/cxi-dra-driver
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
 
 jobs:
   check:
-    runs-on: ${{ fromJSON(vars.RUNNER_DEFAULT) }}
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -45,156 +43,138 @@ jobs:
         with:
           go-version-file: go.mod
 
-      # Separate from vet so a blocked module proxy shows up here, quickly and
-      # with the offending URL in the log, instead of as a silent vet hang.
-      - name: Download modules
-        timeout-minutes: 10
-        run: |
-          go env GOPROXY GOSUMDB GONOSUMDB GOFLAGS
-          go mod download -x
-
       # Untagged build only: vetting the cxi path needs libcxi headers, which
       # the container build covers by compiling it for real.
-      # The -v list is dependencies being compiled, not vetted; vet needs
-      # their export data and there is no way to skip that. -p 1 and a low
-      # GOGC trade speed for peak memory on sub-1 GB, swapless runners.
       - name: Vet
-        timeout-minutes: 45
-        env:
-          GOGC: 25
-        run: |
-          nproc; free -m; df -h "$(go env GOCACHE)"
-          cat /sys/fs/cgroup/cpu.max /sys/fs/cgroup/memory.max 2>/dev/null || true
-          go vet -v -p 1 ./...
+        run: go vet ./...
 
       - name: Test
-        timeout-minutes: 30
+        run: go test ./...
+
+  # One job per architecture on a native runner (QEMU emulation of arm64 makes
+  # the CGo libcxi build take ~40 minutes). Pull requests build without pushing.
+  build:
+    needs: check
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build (pull request validation)
+        if: github.event_name == 'pull_request'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: ${{ matrix.platform }}
+          push: false
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
+
+      - name: Build and push by digest
+        id: build
+        if: github.event_name != 'pull_request'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: ${{ matrix.platform }}
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Export digest
+        if: github.event_name != 'pull_request'
         env:
-          GOGC: 25
-        run: go test -p 1 ./...
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${DIGEST#sha256:}"
 
-  # # One job per architecture on a native runner (QEMU emulation of arm64 made
-  # # the CGo libcxi build take ~40 minutes). BUILD_MATRIX supplies the matrix
-  # # JSON; "runner" may be a label string or a JSON label array.
-  # build:
-  #   needs: check
-  #   strategy:
-  #     fail-fast: false
-  #     matrix: ${{ fromJSON(vars.BUILD_MATRIX) }}
-  #   runs-on: ${{ matrix.runner }}
-  #   permissions:
-  #     contents: read
-  #     packages: write
+      - name: Upload digest
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
 
-  #   steps:
-  #     - name: Checkout
-  #       uses: actions/checkout@v4
+  # Combine the per-arch images into one multi-arch manifest list and apply the
+  # human-readable tags to it. Every merge to main gets an immutable short-SHA
+  # tag plus the moving `main` tag; the official version tag (the chart's
+  # appVersion) is applied to one of those SHA images by release-chart.yaml,
+  # never here.
+  merge:
+    needs: build
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
 
-  #     - name: Set up Docker Buildx
-  #       uses: docker/setup-buildx-action@v3
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digest-*
+          merge-multiple: true
 
-  #     # Same-repo PRs push too (tagged pr-<number> below), so a test
-  #     # deployment can pull a real image without merging to main first.
-  #     # Fork PRs are excluded explicitly rather than relying on GitHub's
-  #     # implicit read-only token for forks: that's a platform behavior we
-  #     # don't control, not something this workflow should depend on.
-  #     - name: Log in to registry
-  #       if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-  #       uses: docker/login-action@v3
-  #       with:
-  #         registry: ${{ env.REGISTRY }}
-  #         username: ${{ secrets.REGISTRY_USERNAME }}
-  #         password: ${{ secrets.REGISTRY_PASSWORD }}
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
-  #     # Fork PRs still get build validation, just never pushed.
-  #     - name: Build (fork PR validation)
-  #       if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
-  #       uses: docker/build-push-action@v6
-  #       with:
-  #         context: .
-  #         file: Dockerfile
-  #         platforms: ${{ matrix.platform }}
-  #         push: false
-  #         cache-from: ${{ env.CACHE_GHA == 'true' && format('type=gha,scope={0}', matrix.arch) || '' }}
-  #         cache-to: ${{ env.CACHE_GHA == 'true' && format('type=gha,mode=max,scope={0}', matrix.arch) || '' }}
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-  #     - name: Build and push by digest
-  #       id: build
-  #       if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-  #       uses: docker/build-push-action@v6
-  #       with:
-  #         context: .
-  #         file: Dockerfile
-  #         platforms: ${{ matrix.platform }}
-  #         cache-from: ${{ env.CACHE_GHA == 'true' && format('type=gha,scope={0}', matrix.arch) || '' }}
-  #         cache-to: ${{ env.CACHE_GHA == 'true' && format('type=gha,mode=max,scope={0}', matrix.arch) || '' }}
-  #         outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix=,format=short
 
-  #     - name: Export digest
-  #       if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-  #       env:
-  #         DIGEST: ${{ steps.build.outputs.digest }}
-  #       run: |
-  #         mkdir -p /tmp/digests
-  #         touch "/tmp/digests/${DIGEST#sha256:}"
+      - name: Create manifest list and push
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<<"$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf "${REGISTRY}/${IMAGE_NAME}@sha256:%s " *)
 
-  #     - name: Upload digest
-  #       if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-  #       uses: actions/upload-artifact@v4
-  #       with:
-  #         name: digest-${{ matrix.arch }}
-  #         path: /tmp/digests/*
-  #         if-no-files-found: error
-  #         retention-days: 1
-
-  # # Combine the two per-arch manifests into one multi-arch manifest list and
-  # # apply the human-readable tags to it.
-  # merge:
-  #   needs: build
-  #   if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-  #   runs-on: ${{ fromJSON(vars.RUNNER_DEFAULT) }}
-  #   permissions:
-  #     contents: read
-  #     packages: write
-
-  #   steps:
-  #     - name: Download digests
-  #       uses: actions/download-artifact@v4
-  #       with:
-  #         path: /tmp/digests
-  #         pattern: digest-*
-  #         merge-multiple: true
-
-  #     - name: Set up Docker Buildx
-  #       uses: docker/setup-buildx-action@v3
-
-  #     - name: Log in to registry
-  #       uses: docker/login-action@v3
-  #       with:
-  #         registry: ${{ env.REGISTRY }}
-  #         username: ${{ secrets.REGISTRY_USERNAME }}
-  #         password: ${{ secrets.REGISTRY_PASSWORD }}
-
-  #     - name: Extract metadata
-  #       id: meta
-  #       uses: docker/metadata-action@v5
-  #       with:
-  #         images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-  #         tags: |
-  #           type=ref,event=branch
-  #           type=ref,event=pr
-  #           type=semver,pattern={{version}}
-  #           type=semver,pattern={{major}}.{{minor}}
-  #           type=sha,prefix=,format=short
-
-  #     - name: Create manifest list and push
-  #       working-directory: /tmp/digests
-  #       run: |
-  #         docker buildx imagetools create \
-  #           $(jq -cr '.tags | map("-t " + .) | join(" ")' <<<"$DOCKER_METADATA_OUTPUT_JSON") \
-  #           $(printf "${REGISTRY}/${IMAGE_NAME}@sha256:%s " *)
-
-  #     - name: Inspect
-  #       run: |
-  #         docker buildx imagetools inspect \
-  #           ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
+      - name: Inspect
+        run: |
+          docker buildx imagetools inspect \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}

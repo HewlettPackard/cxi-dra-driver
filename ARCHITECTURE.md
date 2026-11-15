@@ -283,15 +283,15 @@ There is no in-repo `examples/` directory or smoke-test harness; `deploy/kuberne
 
 ## 15. CI/CD pipeline
 
-`.github/workflows/build.yaml` runs on every push to `main`, every `v*` tag, and every PR touching `Dockerfile`, `Dockerfile.mock`, `.dockerignore`, the workflow itself, `go.mod`, `go.sum`, `cmd/**`, or `internal/**`, as three jobs:
+`.github/workflows/build.yaml` runs on every push to `main` (no path filter, so every merge publishes), every `v*` tag, manual dispatch, and every PR touching `Dockerfile`, `Dockerfile.mock`, `.dockerignore`, the workflow itself, `go.mod`, `go.sum`, `cmd/**`, or `internal/**`, as three jobs:
 
 1. **`check`** — checkout, set up Go (version read from `go.mod`), `go vet ./...`, `go test ./...` (untagged build, so no libcxi needed). `golangci-lint` is **not** run in CI.
-2. **`build`** — a matrix of one native job per architecture (`linux/amd64` on `ubuntu-24.04`, `linux/arm64` on `ubuntu-24.04-arm`, no QEMU), each running a Docker Buildx build of `Dockerfile` with GitHub Actions layer caching scoped per arch. Same-repo runs log in to `ghcr.io` and push by digest; fork PRs build without pushing.
-3. **`merge`** — combines the per-arch digests into one multi-arch manifest list on `ghcr.io/<repository>`, tagged from the branch, PR number (`pr-<n>`), semver tag, and short SHA (`docker/metadata-action`). Skipped for fork PRs.
+2. **`build`** — a matrix of one native job per architecture (`linux/amd64` on `ubuntu-24.04`, `linux/arm64` on `ubuntu-24.04-arm`, no QEMU), each running a Docker Buildx build of `Dockerfile` with GitHub Actions layer caching scoped per arch. Pushes log in to `ghcr.io` with `GITHUB_TOKEN` and push by digest; PRs build without pushing.
+3. **`merge`** — push events only. Combines the per-arch digests into one multi-arch manifest list on `ghcr.io/hewlettpackard/cxi-dra-driver`, tagged with the short commit SHA (immutable) and the branch (`main`, moving), plus semver tags for `v*` git tags (`docker/metadata-action`). It never applies the official version tag.
 
 `Dockerfile` is self-contained (it builds libcxi from pinned SHS sources and also builds `cxi-cdi-hook` and `slingshot-cni`), so nothing is staged in `bin/` first. `Dockerfile.mock` is the no-hardware image for kind and is not built by this workflow.
 
-`.github/workflows/release-chart.yaml` handles the Helm chart: a `lint` job (`helm lint` plus `helm template` for the DaemonSet default and a Deployment with an alternate driver name), a `pr-chart` job that pushes a `<version>-pr.<n>` prerelease chart (pinned to the `pr-<n>` image when the PR changes image inputs) for same-repo PRs, and a `release` job on non-PR runs that publishes the chart as an OCI artifact on `ghcr.io` and creates a GitHub release unless that chart version is already tagged.
+`.github/workflows/release-chart.yaml` handles the Helm chart and the official image version. A `lint` job (`helm lint` plus `helm template` for the DaemonSet default, a Deployment with an alternate driver name, and the CNI templates) runs on PRs touching `deploy/helm/**`. The `release` job runs via `workflow_run` after `Build` succeeds on `main` (so the short-SHA image for that commit exists) and is a no-op when the git tag `cxi-dra-driver-<chart version>` already exists. Otherwise it retags `ghcr.io/hewlettpackard/cxi-dra-driver:<short-sha>` as `:<appVersion>` (skipped if that tag already exists — version tags are immutable), pushes the chart to `oci://ghcr.io/hewlettpackard/charts/cxi-dra-driver`, and creates the GitHub release. Cutting a release therefore means bumping `version` (and `appVersion` for a new driver image) in `Chart.yaml` and merging. Both workflows authenticate with `GITHUB_TOKEN`; no repository secrets or variables are required.
 
 The `check` job is the only automated correctness gate; the image build does not run any tests inside the container.
 

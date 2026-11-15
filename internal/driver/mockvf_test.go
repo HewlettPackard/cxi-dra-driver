@@ -6,7 +6,7 @@ import (
 
 	resourceapi "k8s.io/api/resource/v1"
 
-	"github.com/slingshot/cxi-dra-driver/internal/cxi"
+	"github.com/HewlettPackard/cxi-dra-driver/internal/cxi"
 )
 
 // The --mock-vfs topology goes through the same parent setup as discovered VFs

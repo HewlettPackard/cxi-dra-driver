@@ -15,8 +15,8 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/dynamic-resource-allocation/kubeletplugin"
 
-	"github.com/slingshot/cxi-dra-driver/internal/cdi"
-	"github.com/slingshot/cxi-dra-driver/internal/cxi"
+	"github.com/HewlettPackard/cxi-dra-driver/internal/cdi"
+	"github.com/HewlettPackard/cxi-dra-driver/internal/cxi"
 )
 
 const (

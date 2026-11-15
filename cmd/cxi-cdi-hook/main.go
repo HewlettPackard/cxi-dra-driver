@@ -24,7 +24,7 @@ import (
 	"os/exec"
 	"path/filepath"
 
-	"github.com/slingshot/cxi-dra-driver/internal/cdi"
+	"github.com/HewlettPackard/cxi-dra-driver/internal/cdi"
 )
 
 // ociState is the subset of the OCI runtime state JSON (delivered on stdin to

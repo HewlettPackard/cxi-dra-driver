@@ -20,8 +20,8 @@ import (
 	k8stesting "k8s.io/client-go/testing"
 	"k8s.io/dynamic-resource-allocation/kubeletplugin"
 
-	"github.com/slingshot/cxi-dra-driver/internal/cdi"
-	"github.com/slingshot/cxi-dra-driver/internal/cxi"
+	"github.com/HewlettPackard/cxi-dra-driver/internal/cdi"
+	"github.com/HewlettPackard/cxi-dra-driver/internal/cxi"
 )
 
 const (

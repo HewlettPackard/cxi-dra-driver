@@ -12,7 +12,7 @@ import (
 	"github.com/containernetworking/cni/pkg/skel"
 	"github.com/containernetworking/cni/pkg/version"
 
-	"github.com/slingshot/cxi-dra-driver/internal/cni"
+	"github.com/HewlettPackard/cxi-dra-driver/internal/cni"
 )
 
 func main() {

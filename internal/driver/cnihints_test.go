@@ -13,7 +13,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/dynamic-resource-allocation/kubeletplugin"
 
-	"github.com/slingshot/cxi-dra-driver/internal/cni"
+	"github.com/HewlettPackard/cxi-dra-driver/internal/cni"
 )
 
 func readHintFile(t *testing.T, dir string, podUID types.UID) []CNIHint {

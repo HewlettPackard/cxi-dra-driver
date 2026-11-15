@@ -1,4 +1,4 @@
-IMAGE ?= ghcr.io/bristol-supercomputing/cxi-dra
+IMAGE ?= ghcr.io/hewlettpackard/cxi-dra-driver
 TAG   ?= latest
 KIND_CLUSTER ?= cxi-dra-dev
 KIND_IMAGE   ?= localhost/cxi-dra-driver:dev

@@ -9,7 +9,7 @@ import (
 
 	specs "tags.cncf.io/container-device-interface/specs-go"
 
-	"github.com/slingshot/cxi-dra-driver/internal/cxi"
+	"github.com/HewlettPackard/cxi-dra-driver/internal/cxi"
 )
 
 const cdiVersion = "0.6.0"
