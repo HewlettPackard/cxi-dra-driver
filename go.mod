@@ -13,7 +13,7 @@ require (
 	k8s.io/client-go v0.34.0
 	k8s.io/dynamic-resource-allocation v0.34.0
 	k8s.io/utils v0.0.0-20250604170112-4c0f3b243397
-	tags.cncf.io/container-device-interface/specs-go v0.8.0
+	tags.cncf.io/container-device-interface/specs-go v1.1.1
 )
 
 require (
