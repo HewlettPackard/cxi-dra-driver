@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/slingshot/cxi-dra-driver/internal/cxi"
+	"github.com/HewlettPackard/cxi-dra-driver/internal/cxi"
 )
 
 const (

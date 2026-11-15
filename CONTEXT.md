@@ -10,7 +10,7 @@ This repository implements the **CXI DRA driver** — a Kubernetes Dynamic Resou
 | Kubernetes API | `resource.k8s.io/v1` (DRA), `k8s.io/dynamic-resource-allocation` kubelet plugin framework |
 | Hardware integration | CGO bindings to libcxi (`tags cxi` build); CDI (Container Device Interface); NRI (Node Resource Interface) via containerd |
 | Deployment | Helm chart (`deploy/helm/cxi-dra-driver`, recommended) or raw manifests (`deploy/kubernetes/`) |
-| CI | GitHub Actions — `build.yaml` (`go vet`, `go test ./...`, per-architecture native image builds merged into a multi-arch (amd64/arm64) manifest on ghcr) and `release-chart.yaml` (Helm chart lint/publish); `golangci-lint` is not run in CI |
+| CI | GitHub Actions — `build.yaml` (`go vet`, `go test ./...`, per-architecture native image builds merged into a multi-arch (amd64/arm64) manifest on ghcr, tagged by short commit SHA + `main`) and `release-chart.yaml` (Helm chart lint/publish; promotes a SHA image to the official `appVersion` tag when a chart release is cut); `golangci-lint` is not run in CI |
 
 ## Annotated layout
 

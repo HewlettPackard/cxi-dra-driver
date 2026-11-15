@@ -1,4 +1,4 @@
-module github.com/slingshot/cxi-dra-driver
+module github.com/HewlettPackard/cxi-dra-driver
 
 go 1.24.0
 

@@ -8,11 +8,11 @@ description: >-
   side-by-side: pod anti-affinity keeps each install's pods on distinct nodes.
 type: application
 version: 0.2.0
-appVersion: "dev"
+appVersion: "0.0.1"
 keywords:
   - dra
   - cxi
   - slingshot
   - rdma
   - hpe
-home: https://github.com/slingshot/cxi-dra-driver
+home: https://github.com/HewlettPackard/cxi-dra-driver

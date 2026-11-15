@@ -34,7 +34,7 @@ spec:
 
       containers:
         - name: driver
-          image: docker.io/pirese/cxi-dra-driver:dev
+          image: ghcr.io/hewlettpackard/cxi-dra-driver:0.0.1
           imagePullPolicy: Always
           command:
             - /cxi-dra-driver

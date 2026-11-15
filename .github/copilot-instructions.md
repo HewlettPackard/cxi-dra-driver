@@ -48,7 +48,7 @@ go test ./...              # unit tests across internal/cdi, internal/cni, inter
 golangci-lint run          # lint; not run in CI
 ```
 
-CI (`.github/workflows/build.yaml`) runs `go vet` and `go test ./...`, then builds the image natively per architecture and merges a multi-arch manifest to ghcr; it does **not** run `golangci-lint`. `.github/workflows/release-chart.yaml` lints/templates and publishes the Helm chart. `internal/cxi` and `internal/nri` have no unit tests (hardware/cluster-dependent; exercised via `mock.go` and the sibling `cxi-dra-integration-tests` repo). `internal/cni`'s real-netlink tests (`network_linux_test.go`) need Linux + root and skip otherwise — run them via a privileged container from a non-Linux workstation (see [docs/cni/cni-plugin.md](../docs/cni/cni-plugin.md) § Testing); its orchestration and IPAM-delegate tests run anywhere.
+CI (`.github/workflows/build.yaml`) runs `go vet` and `go test ./...`, then builds the image natively per architecture and merges a multi-arch manifest to ghcr (tagged by short commit SHA and `main`); it does **not** run `golangci-lint`. `.github/workflows/release-chart.yaml` lints/templates and publishes the Helm chart and is the only place the official image version tag (chart `appVersion`) is applied. `internal/cxi` and `internal/nri` have no unit tests (hardware/cluster-dependent; exercised via `mock.go` and the sibling `cxi-dra-integration-tests` repo). `internal/cni`'s real-netlink tests (`network_linux_test.go`) need Linux + root and skip otherwise — run them via a privileged container from a non-Linux workstation (see [docs/cni/cni-plugin.md](../docs/cni/cni-plugin.md) § Testing); its orchestration and IPAM-delegate tests run anywhere.
 
 ## Critical anti-patterns
 

@@ -44,7 +44,7 @@ const (
 
 var (
 	// MockParentBudget is each mock parent's reservation: the parent template
-	// used on the SSHOTECO-112 test nodes (LEs sized for the VF Ethernet children).
+	// used on the SR-IOV test nodes (LEs sized for the VF Ethernet children).
 	MockParentBudget = ResourceSet{ACs: 64, CTs: 128, EQs: 128, LEs: 4096, PTEs: 64, TGQs: 32, TXQs: 64, TLEs: 512}
 	// MockEthernetChild is the system child the kernel creates on every VF whose
 	// netdev is up, as measured on SHS 15.0.0.

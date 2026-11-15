@@ -22,14 +22,17 @@ namespace: kube-system
 priorityClassName: system-node-critical
 
 image:
-  # -- Driver image. Published by .github/workflows/build.yaml on every push
-  # to main, as a multi-arch (amd64 + arm64) manifest built with `-tags cxi`.
-  repository: ghcr.io/bristol-supercomputing/cxi-dra
-  # -- `main` tracks the latest build, which is why pullPolicy is Always.
-  # Every build is also tagged with its commit sha (e.g. `af87aba`) -- pin one
-  # of those, or a `v*` release tag, for a reproducible install.
-  tag: main
-  pullPolicy: Always
+  # -- Driver image. Every merge to main is published by
+  # .github/workflows/build.yaml as a multi-arch (amd64 + arm64) manifest built
+  # with `-tags cxi`, tagged with its short commit sha (e.g. `af87aba`) and the
+  # moving `main` tag. The official version tag (= this chart's appVersion) is
+  # applied by .github/workflows/release-chart.yaml when a chart release is cut.
+  repository: ghcr.io/hewlettpackard/cxi-dra-driver
+  # -- Image tag. Empty means the chart's appVersion, the official release
+  # image. Set a short commit sha to run an unreleased build of main, or
+  # `main` for the latest (then also set pullPolicy to Always).
+  tag: ""
+  pullPolicy: IfNotPresent
 
 workload:
   # -- DaemonSet (one pod per CXI node) or Deployment (replicas + anti-affinity spread).

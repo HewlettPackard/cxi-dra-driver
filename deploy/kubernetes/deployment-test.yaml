@@ -43,7 +43,7 @@ spec:
               topologyKey: kubernetes.io/hostname
       containers:
         - name: driver
-          image: docker.io/pirese/cxi-dra-driver:test
+          image: ghcr.io/hewlettpackard/cxi-dra-driver:main
           imagePullPolicy: Always
           command:
             - /cxi-dra-driver

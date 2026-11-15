@@ -54,9 +54,9 @@ spec:
               - matchExpressions:
                   - key: kubernetes.io/hostname
                     operator: In
-                    values:
-                      - nid001006
-                      - nid001005
+                    values:  # replace with two CXI node names in your cluster
+                      - cxi-node-1
+                      - cxi-node-2
 
       resourceClaims:
         - name: cxi
@@ -79,5 +79,5 @@ spec:
       volumes:
         - name: fi-install
           hostPath:
-            path: /home/vendor/pirese.vendor/source/libfabric/install
+            path: /opt/libfabric/install  # host path of a libfabric install; adjust for your site
             type: Directory

@@ -5,7 +5,7 @@ applyTo: "**/*.go"
 
 # Build & Test
 
-- Module: `github.com/slingshot/cxi-dra-driver`, Go 1.24.
+- Module: `github.com/HewlettPackard/cxi-dra-driver`, Go 1.24.
 - Real hardware build (CGO, links libcxi): `make build` — requires libcxi headers on the build host (a Slingshot node). Never run this on a laptop or generic CI runner; `make image` builds libcxi from pinned SHS sources inside the container and needs no host libraries or staged `bin/` artifacts.
 - Hardware-free build (kind/local dev, tests, CI): `make build-mock` (driver) / `make build-hook` (hook binary — always CGO-free regardless of driver mode) / `make build-cni` (`slingshot-cni` host CNI plugin — always CGO-free, honours `GOARCH`; the production image builds it itself and the driver optionally installs it onto nodes). `make image-mock` builds the no-hardware image from `Dockerfile.mock` (used by `make kind-load`).
 - Unit tests: `go test ./...` — also run in CI (`.github/workflows/build.yaml`).

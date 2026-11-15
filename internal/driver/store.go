@@ -6,7 +6,7 @@ import (
 
 	"k8s.io/apimachinery/pkg/types"
 
-	"github.com/slingshot/cxi-dra-driver/internal/cxi"
+	"github.com/HewlettPackard/cxi-dra-driver/internal/cxi"
 )
 
 // PodAllocation records which CXI devices were allocated to a pod.

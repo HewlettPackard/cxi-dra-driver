@@ -1,17 +1,36 @@
 name: Release Helm chart
 
-# Disabled for automatic runs until the chart registry on GHES is settled;
-# manual dispatch only. Restore the push/pull_request triggers (see git
-# history) to re-enable PR charts and releases.
+# Lints the chart on every PR that touches it, and releases it from main.
+# The release runs after build.yaml has succeeded for the same commit, so the
+# short-SHA image that this workflow promotes to the official version tag is
+# guaranteed to exist. Nothing is published unless Chart.yaml's version has
+# not been released yet, so a release is cut by bumping `version` (and
+# `appVersion` for a new driver image) in Chart.yaml and merging.
 on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "deploy/helm/**"
+      - ".github/workflows/release-chart.yaml"
+  workflow_run:
+    workflows: [Build]
+    types: [completed]
+    branches: [main]
   workflow_dispatch:
 
-# Runner, registry, and credentials come from the same repo variables/secrets
-# as build.yaml; CHART_REPO is the OCI path under REGISTRY the chart is pushed to.
+# Published with the workflow's own GITHUB_TOKEN; no repository secrets or
+# variables are needed. GHCR names must be lowercase, so they are spelled out
+# rather than derived from github.repository. The chart lives under charts/ so
+# it cannot collide with the image, which helm push would otherwise do since
+# both are named cxi-dra-driver.
 env:
   CHART_DIR: deploy/helm/cxi-dra-driver
-  REGISTRY: ${{ vars.REGISTRY }}
-  CHART_REPO: ${{ vars.CHART_REPO }}
+  REGISTRY: ghcr.io
+  CHART_REPO: hewlettpackard/charts
+  IMAGE_NAME: hewlettpackard/cxi-dra-driver
+  # The commit being released: the one Build just finished for, or HEAD of the
+  # dispatched ref.
+  RELEASE_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
 
 permissions:
   contents: read
@@ -19,10 +38,13 @@ permissions:
 jobs:
   lint:
     name: Lint and template
-    runs-on: ${{ fromJSON(vars.RUNNER_DEFAULT) }}
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_SHA }}
 
       - name: Set up Helm
         uses: azure/setup-helm@v5
@@ -48,105 +70,24 @@ jobs:
             --set cni.install=true \
             --set cni.nad.create=true \
             --set 'cni.nad.namespaces={default}' > /dev/null
-  # Same-repo PRs publish a prerelease chart, <version>-pr.<number>, the chart
-  # counterpart of build.yaml's pr-<number> image tag, so a PR can be
-  # test-deployed end to end without merging. Like the image tag it is
-  # re-pushed on every commit to the PR. Fork PRs are excluded for the same
-  # reason build.yaml excludes them from pushing.
-  pr-chart:
-    name: Publish PR chart
-    needs: lint
-    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: ${{ fromJSON(vars.RUNNER_DEFAULT) }}
-    permissions:
-      contents: read
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0 # diff against the base branch below
-
-      - name: Set up Helm
-        uses: azure/setup-helm@v5
-
-      # Pin the chart to the pr-<number> image only when this PR changes an
-      # image input, because build.yaml publishes that tag only then. A
-      # chart-only PR keeps the default image tag so it never points at an
-      # image that does not exist. Keep this pattern in sync with build.yaml's
-      # paths filter.
-      - name: Point the chart at this PR
-        id: chart
-        env:
-          PR: ${{ github.event.pull_request.number }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-        run: |
-          name=$(yq -r '.name' "$CHART_DIR/Chart.yaml")
-          version="$(yq -r '.version' "$CHART_DIR/Chart.yaml")-pr.${PR}"
-          yq -i ".version = \"${version}\"" "$CHART_DIR/Chart.yaml"
-          image_re='^(Dockerfile|Dockerfile\.mock|\.dockerignore|\.github/workflows/build\.yaml|go\.mod|go\.sum|cmd/|internal/)'
-          if git diff --name-only "$BASE_SHA"...HEAD | grep -qE "$image_re"; then
-            yq -i ".appVersion = \"pr-${PR}\"" "$CHART_DIR/Chart.yaml"
-            yq -i ".image.tag = \"pr-${PR}\"" "$CHART_DIR/values.yaml"
-            image_tag="pr-${PR}"
-          else
-            image_tag=$(yq -r '.image.tag' "$CHART_DIR/values.yaml")
-          fi
-          echo "name=$name" >> "$GITHUB_OUTPUT"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "image_tag=$image_tag" >> "$GITHUB_OUTPUT"
-
-      - name: Package
-        run: helm package "$CHART_DIR" --destination /tmp/chart
-
-      - name: Log in to registry
-        env:
-          REGISTRY_USERNAME: ${{ secrets.REGISTRY_USERNAME }}
-          REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
-        run: |
-          printf '%s' "$REGISTRY_PASSWORD" \
-            | helm registry login "$REGISTRY" -u "$REGISTRY_USERNAME" --password-stdin
-
-      - name: Push chart
-        env:
-          CHART: ${{ steps.chart.outputs.name }}
-          VERSION: ${{ steps.chart.outputs.version }}
-        run: |
-          helm push "/tmp/chart/${CHART}-${VERSION}.tgz" \
-            "oci://${REGISTRY}/${CHART_REPO}"
-
-      - name: Summary
-        env:
-          CHART: ${{ steps.chart.outputs.name }}
-          VERSION: ${{ steps.chart.outputs.version }}
-          IMAGE_TAG: ${{ steps.chart.outputs.image_tag }}
-        run: |
-          cat >> "$GITHUB_STEP_SUMMARY" <<EOF
-          PR chart \`${CHART}\` ${VERSION} (image tag \`${IMAGE_TAG}\`):
-
-          \`\`\`bash
-          helm upgrade --install cxi oci://${REGISTRY}/${CHART_REPO}/${CHART} --version ${VERSION}
-          \`\`\`
-          EOF
 
   # The chart is distributed as an OCI artifact in the container registry, not
-  # as an HTTP chart repository. An HTTP repo would mean a gh-pages branch plus
-  # GitHub Pages, and on a private repo that combination does not work: the
-  # Pages site is served publicly (access control is Enterprise Cloud only)
-  # while the index.yaml it serves points at release assets that need
-  # authentication. OCI needs no Pages and authenticates uniformly.
+  # as an HTTP chart repository, so it needs no gh-pages branch or GitHub
+  # Pages and authenticates the same way as the image.
   release:
     name: Package and publish
     needs: lint
     if: github.event_name != 'pull_request'
-    runs-on: ${{ fromJSON(vars.RUNNER_DEFAULT) }}
+    runs-on: ubuntu-24.04
     permissions:
       contents: write # create the release and its tag
+      packages: write # push the chart and the official image tag
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
+          ref: ${{ env.RELEASE_SHA }}
           fetch-depth: 0 # need tags to tell whether this version is released
 
       - name: Set up Helm
@@ -157,8 +98,13 @@ jobs:
         run: |
           name=$(helm show chart "$CHART_DIR" | yq -r '.name')
           version=$(helm show chart "$CHART_DIR" | yq -r '.version')
-          echo "name=$name" >> "$GITHUB_OUTPUT"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
+          app_version=$(helm show chart "$CHART_DIR" | yq -r '.appVersion')
+          {
+            echo "name=$name"
+            echo "version=$version"
+            echo "app_version=$app_version"
+            echo "short_sha=${RELEASE_SHA:0:7}"
+          } >> "$GITHUB_OUTPUT"
           if git rev-parse -q --verify "refs/tags/$name-$version" >/dev/null; then
             echo "released=true" >> "$GITHUB_OUTPUT"
             echo "::notice::$name-$version is already released; bump version in $CHART_DIR/Chart.yaml to publish a new one."
@@ -166,18 +112,37 @@ jobs:
             echo "released=false" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Log in to GHCR
+        if: steps.chart.outputs.released == 'false'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # This is the only place the official image version is set. The
+      # short-SHA image built by build.yaml for this commit is retagged with
+      # the chart's appVersion; the tag is immutable, so if it already exists
+      # (chart bumped without a new appVersion) it is left alone.
+      - name: Tag the release image
+        if: steps.chart.outputs.released == 'false'
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          APP_VERSION: ${{ steps.chart.outputs.app_version }}
+          SHORT_SHA: ${{ steps.chart.outputs.short_sha }}
+        run: |
+          if docker buildx imagetools inspect "${IMAGE}:${APP_VERSION}" >/dev/null 2>&1; then
+            echo "::notice::${IMAGE}:${APP_VERSION} already exists; not retagging. Bump appVersion in ${CHART_DIR}/Chart.yaml to release a new image."
+            exit 0
+          fi
+          docker buildx imagetools create \
+            -t "${IMAGE}:${APP_VERSION}" \
+            "${IMAGE}:${SHORT_SHA}"
+          docker buildx imagetools inspect "${IMAGE}:${APP_VERSION}"
+
       - name: Package
         if: steps.chart.outputs.released == 'false'
         run: helm package "$CHART_DIR" --destination /tmp/chart
-
-      - name: Log in to registry
-        if: steps.chart.outputs.released == 'false'
-        env:
-          REGISTRY_USERNAME: ${{ secrets.REGISTRY_USERNAME }}
-          REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
-        run: |
-          printf '%s' "$REGISTRY_PASSWORD" \
-            | helm registry login "$REGISTRY" -u "$REGISTRY_USERNAME" --password-stdin
 
       - name: Push chart
         if: steps.chart.outputs.released == 'false'
@@ -197,24 +162,18 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CHART: ${{ steps.chart.outputs.name }}
           VERSION: ${{ steps.chart.outputs.version }}
+          APP_VERSION: ${{ steps.chart.outputs.app_version }}
         run: |
-          # gh defaults to github.com; point it at this instance (GHES or not).
-          export GH_HOST="${GITHUB_SERVER_URL#https://}"
           notes=$(cat <<EOF
-          Helm chart \`${CHART}\` ${VERSION}.
+          Helm chart \`${CHART}\` ${VERSION}, driver image \`${REGISTRY}/${IMAGE_NAME}:${APP_VERSION}\`.
 
           \`\`\`bash
-          helm install cxi oci://${REGISTRY}/${CHART_REPO}/${CHART} --version ${VERSION}
-          \`\`\`
-
-          If the registry is private, authenticate first:
-
-          \`\`\`bash
-          helm registry login ${REGISTRY} -u <username>
+          helm install cxi oci://${REGISTRY}/${CHART_REPO}/${CHART} --version ${VERSION} -n kube-system
           \`\`\`
           EOF
           )
           gh release create "${CHART}-${VERSION}" \
+            --target "${RELEASE_SHA}" \
             --title "${CHART} ${VERSION}" \
             --notes "$notes" \
             "/tmp/chart/${CHART}-${VERSION}.tgz"

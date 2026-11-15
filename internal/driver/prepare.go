@@ -15,8 +15,8 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/dynamic-resource-allocation/kubeletplugin"
 
-	"github.com/slingshot/cxi-dra-driver/internal/cdi"
-	"github.com/slingshot/cxi-dra-driver/internal/cxi"
+	"github.com/HewlettPackard/cxi-dra-driver/internal/cdi"
+	"github.com/HewlettPackard/cxi-dra-driver/internal/cxi"
 )
 
 // PrepareResourceClaims is called by the kubelet plugin helper when a pod

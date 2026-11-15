@@ -48,5 +48,5 @@ spec:
   volumes:
     - name: fi-install
       hostPath:
-        path: /home/vendor/pirese.vendor/source/libfabric/install
+        path: /opt/libfabric/install  # host path of a libfabric install; adjust for your site
         type: Directory

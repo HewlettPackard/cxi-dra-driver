@@ -16,9 +16,9 @@ import (
 	"github.com/containerd/nri/pkg/stub"
 	"k8s.io/apimachinery/pkg/types"
 
-	"github.com/slingshot/cxi-dra-driver/internal/cxi"
-	"github.com/slingshot/cxi-dra-driver/internal/driver"
-	"github.com/slingshot/cxi-dra-driver/internal/netsysfs"
+	"github.com/HewlettPackard/cxi-dra-driver/internal/cxi"
+	"github.com/HewlettPackard/cxi-dra-driver/internal/driver"
+	"github.com/HewlettPackard/cxi-dra-driver/internal/netsysfs"
 )
 
 // podState tracks per-pod service creation state so that the CXI service is

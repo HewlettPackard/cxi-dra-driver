@@ -18,10 +18,10 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/dynamic-resource-allocation/kubeletplugin"
 
-	"github.com/slingshot/cxi-dra-driver/internal/cdi"
-	"github.com/slingshot/cxi-dra-driver/internal/cxi"
-	"github.com/slingshot/cxi-dra-driver/internal/driver"
-	"github.com/slingshot/cxi-dra-driver/internal/nri"
+	"github.com/HewlettPackard/cxi-dra-driver/internal/cdi"
+	"github.com/HewlettPackard/cxi-dra-driver/internal/cxi"
+	"github.com/HewlettPackard/cxi-dra-driver/internal/driver"
+	"github.com/HewlettPackard/cxi-dra-driver/internal/nri"
 )
 
 const defaultDriverName = "cxi.slingshot.hpe.com"

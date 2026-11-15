@@ -8,7 +8,7 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/slingshot/cxi-dra-driver/internal/cxi"
+	"github.com/HewlettPackard/cxi-dra-driver/internal/cxi"
 )
 
 // reapGraceCycles is the number of consecutive reconcile cycles a service must
