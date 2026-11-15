@@ -1,0 +1,59 @@
+name: Sync public repository
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  # Provisions an ephemeral VM and registers it as a runner; outputs its name.
+  # Requires the WORKFLOW (and optionally GCP_SA_KEY) repo secrets.
+  create-runner:
+    if: github.repository == 'hpe/cxi-dra-driver'
+    uses: hpc-sw/create_runners/.github/workflows/create_runners.yaml@master
+    with:
+      machine_size: small
+      machine_type: x86
+      max_duration_in_hours: "1"
+      disk_size_in_gb: 20
+      run_as_root: false
+    secrets: inherit
+
+  sync:
+    needs: create-runner
+    runs-on: ['${{ needs.create-runner.outputs.runner_name }}', 'ignore']
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Push main to public repository
+        env:
+          DEPLOY_KEY: ${{ secrets.PUBLIC_REPO_DEPLOY_KEY }}
+        run: |
+          set -eu
+          test -n "$DEPLOY_KEY" || {
+            echo "::error::Set the PUBLIC_REPO_DEPLOY_KEY Actions secret"
+            exit 1
+          }
+
+          keydir="$RUNNER_TEMP/public-repo-ssh"
+          mkdir -p "$keydir"
+          chmod 700 "$keydir"
+          printf '%s\n' "$DEPLOY_KEY" > "$keydir/id_ed25519"
+          chmod 600 "$keydir/id_ed25519"
+          # Pin github.com's host keys rather than trusting on first use.
+          ssh-keyscan -t ed25519,ecdsa,rsa github.com > "$keydir/known_hosts" 2>/dev/null
+
+          GIT_SSH_COMMAND="ssh -i $keydir/id_ed25519 -o IdentitiesOnly=yes -o UserKnownHostsFile=$keydir/known_hosts -o StrictHostKeyChecking=yes" \
+            git push git@github.com:HewlettPackard/cxi-dra-driver.git \
+            HEAD:refs/heads/main
+
+      - name: Remove deploy key
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/public-repo-ssh"
