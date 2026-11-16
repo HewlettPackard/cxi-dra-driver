@@ -1,13 +1,13 @@
 module github.com/HewlettPackard/cxi-dra-driver
 
-go 1.24.0
+go 1.26.0
 
 require (
 	github.com/containerd/nri v0.12.5
 	github.com/containernetworking/cni v1.3.1
 	github.com/vishvananda/netlink v1.3.1
 	github.com/vishvananda/netns v0.0.5
-	golang.org/x/sys v0.39.0
+	golang.org/x/sys v0.50.0
 	k8s.io/api v0.34.0
 	k8s.io/apimachinery v0.34.0
 	k8s.io/client-go v0.34.0
