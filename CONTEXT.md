@@ -10,7 +10,7 @@ This repository implements the **CXI DRA driver** — a Kubernetes Dynamic Resou
 | Kubernetes API | `resource.k8s.io/v1` (DRA), `k8s.io/dynamic-resource-allocation` kubelet plugin framework |
 | Hardware integration | CGO bindings to libcxi (`tags cxi` build); CDI (Container Device Interface); NRI (Node Resource Interface) via containerd |
 | Deployment | Helm chart (`deploy/helm/cxi-dra-driver`, recommended) or raw manifests (`deploy/kubernetes/`) |
-| CI | GitHub Actions — `build.yaml` (`go vet`, `go test ./...`, per-architecture native image builds merged into a multi-arch (amd64/arm64) manifest on ghcr, tagged by short commit SHA + `main`) and `release-chart.yaml` (Helm chart lint/publish; promotes a SHA image to the official `appVersion` tag when a chart release is cut); `golangci-lint` is not run in CI |
+| CI | GitHub Actions on two instances that share `main`. Internal (`github.hpe.com`): `pr-checks.yaml` (`go vet`, `make lint`, `go test ./...` on every PR) and `sync-public.yaml` (pushes each merge to the public repository), both on ephemeral `create-runner` VMs. Public (`github.com/HewlettPackard`): `build.yaml` (`go vet`, `make lint`, `go test ./...`, per-architecture native image builds merged into a multi-arch (amd64/arm64) manifest on ghcr, tagged by short commit SHA + `main`) and `release-chart.yaml` (Helm chart lint/publish; promotes a SHA image to the official `appVersion` tag when a chart release is cut) |
 
 ## Annotated layout
 
@@ -94,7 +94,7 @@ make build          # CGO_ENABLED=1, tags=cxi — real hardware build; needs lib
 make build-mock      # CGO_ENABLED=0 — no libcxi, for kind/local dev
 make build-cni       # CGO_ENABLED=0 — slingshot-cni host CNI plugin binary; honours GOARCH; the image build compiles it itself (`make image` does not depend on this target)
 go test ./...        # unit tests (also run in CI)
-golangci-lint run    # lint (local only — not run in CI; use GOOS=linux on a non-Linux workstation)
+make lint            # golangci-lint at the version pinned in the Makefile, against the Linux build on any host (also run in CI)
 make vet             # go vet ./...
 make image / push    # production container build via Dockerfile (self-contained; nothing to stage in bin/) / push to $(IMAGE):$(TAG)
 make image-mock      # no-hardware image via Dockerfile.mock (for kind)
@@ -110,12 +110,12 @@ See [README.md](README.md) for the full Helm-based install path and per-value re
 - `internal/cni` is tested in three layers: `cmd_test.go` drives `ADD`/`DEL`/`CHECK` against in-memory `linkManager`/`ipamDelegate` fakes (any platform); `ipam_test.go` execs a fake `whereabouts` binary built from `testdata/fakewhereabouts` to verify the real CNI delegate contract (any platform, needs `go` on `PATH`); `network_linux_test.go` drives the real netlink code against a throwaway named netns and a dummy parent (Linux **as root** only — skips otherwise; run it via a privileged container from a non-Linux workstation, see `docs/cni/cni-plugin.md`).
 - `internal/nri` has no unit tests, and `internal/cxi`'s libcxi paths are hardware-dependent (exercised via `mock.go`/`--mock-devices` at the integration level); `internal/cxi`'s sysfs discovery and HSN pairing are unit-tested against a fake sysfs tree. `internal/nri`'s plugin lifecycle is integration-tested against a live cluster by the sibling `cxi-dra-integration-tests` repo.
 - Mocking: `internal/cxi/mock.go` and `service_mock.go` provide synthetic devices and no-op service CRUD for tests and `--mock-devices` kind/dev runs (`MockVFTopology`/`--mock-vfs` for the VF path) — reuse these instead of hand-rolling fakes.
-- CI (`.github/workflows/build.yaml`) runs `go vet` and `go test ./...` on every PR, then builds the image natively per architecture (it does not run `golangci-lint`); it does not and cannot reach a live cluster.
+- CI runs `go vet`, `make lint` and `go test ./...` before merge on the internal instance (`.github/workflows/pr-checks.yaml`, every PR) and again on the public repository (`.github/workflows/build.yaml`), which then builds the image natively per architecture; neither can reach a live cluster.
 
 ## Known gaps and constraints
 
 - `internal/cxi` and `internal/nri` have zero unit test coverage; both are only exercised by the sibling integration-test suite against a live cluster.
 - `slingshot-cni` against a **real** HSN parent and a **real** Whereabouts install is not covered by any automated test here — the root-gated netns tests use a dummy parent and a fake IPAM binary. Live-cluster verification via `cxi-dra-integration-tests` is required.
 - `slingshot-cni` does not persist which in-pod name (`<hsn_iface>` vs `<hsn_iface>_inet`) `ADD` chose; `DEL`/`CHECK` re-derive it by probing. Ambiguous only if both names exist as IPVLAN links from a prior life.
-- No CodeQL/SAST scanning runs in CI, and `golangci-lint` is not run in CI either; there is no `.golangci.yml`, `.github/CODEOWNERS`, or `.gitleaks.toml` in the repo. `GOOS=linux golangci-lint run` (default linters) is clean; a plain run on a non-Linux workstation still reports two `staticcheck` SA4023 findings at `internal/nri/plugin.go:471` because `netsysfs.PodInterfaces` is an always-erroring stub there — a false positive, so lint with `GOOS=linux`.
+- No CodeQL/SAST scanning runs in CI; there is no `.golangci.yml` (so `make lint` runs golangci-lint's default linters, and is clean), `.github/CODEOWNERS`, or `.gitleaks.toml` in the repo. `make lint` always analyses the Linux build, so the `*_linux.go` files are linted from a non-Linux workstation too.
 - This file, `AGENTS.md`, `ARCHITECTURE.md`, `.github/copilot-instructions.md`, and the `.github/instructions/*.md`/`.github/agents/*.md` files were added as part of an AI-readiness pass — keep them in sync with `README.md` as the source of truth for commands and flags.

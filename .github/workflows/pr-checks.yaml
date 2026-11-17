@@ -1,0 +1,77 @@
+name: PR checks
+
+# Internal (github.hpe.com) pre-merge gate: vet, lint and unit tests on every
+# pull request to main. The public repository runs the same three commands in
+# build.yaml's `check` job, which is skipped here because the internal instance
+# has no hosted runners.
+#
+# Keep this workflow disabled on the public repository
+# (`gh workflow disable pr-checks.yaml -R HewlettPackard/cxi-dra-driver`):
+# github.com cannot resolve the hpc-sw reusable workflow, so a triggered run
+# fails at startup, before the `if:` below is evaluated, and mails every
+# watcher that no jobs were run.
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  # Provisions an ephemeral VM and registers it as a runner; outputs its name.
+  # Requires the WORKFLOW (and optionally GCP_SA_KEY) repo secrets.
+  create-runner:
+    if: github.repository == 'hpe/cxi-dra-driver'
+    uses: hpc-sw/create_runners/.github/workflows/create_runners.yaml@master
+    with:
+      machine_size: small
+      machine_type: x86
+      # VM lifetime ceiling; above the summed step timeouts below so the VM is
+      # reclaimed even if the job never completes.
+      max_duration_in_hours: "2"
+      disk_size_in_gb: 30
+      run_as_root: false
+    secrets: inherit
+
+  # Named differently from build.yaml's `check` so a required status check can
+  # never be satisfied by that job's skipped run on the internal instance.
+  vet-lint-and-unit-test:
+    needs: create-runner
+    runs-on: ['${{ needs.create-runner.outputs.runner_name }}', 'ignore']
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # cache: false because setup-go's built-in caching needs the Actions cache
+      # service, which is not relied on here. The steps below still share one
+      # GOCACHE within the job, so lint and test do not recompile the tree.
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      # Separate from vet so a blocked module proxy shows up here, quickly and
+      # with the offending URL in the log, instead of as a silent vet hang.
+      - name: Download modules
+        timeout-minutes: 10
+        run: |
+          go env GOPROXY GOSUMDB GONOSUMDB GOFLAGS
+          go mod download -x
+
+      # Untagged build only, as in build.yaml: the cxi path needs libcxi headers.
+      - name: Vet
+        timeout-minutes: 15
+        run: go vet ./...
+
+      # The golangci-lint version is pinned in the Makefile.
+      - name: Lint
+        timeout-minutes: 15
+        run: make lint
+
+      # The runner is not root, so internal/cni's real-netlink tests skip.
+      - name: Test
+        timeout-minutes: 20
+        run: go test ./...

@@ -22,7 +22,7 @@ CNI_CMD_PATH = ./cmd/slingshot-cni
 # x86-64 nodes (or vice versa).
 GOARCH ?= $(shell go env GOARCH)
 
-.PHONY: build build-mock build-hook build-cni image image-mock push deploy clean kind-load kind-reload
+.PHONY: build build-mock build-hook build-cni image image-mock push deploy clean kind-load kind-reload lint
 
 # -buildvcs=false: the production binary is often built as root on a Slingshot
 # node from a tree owned by a different user, which makes git refuse VCS queries
@@ -64,6 +64,19 @@ tidy:
 
 vet:
 	go vet ./...
+
+# Pinned so CI (.github/workflows/build.yaml and pr-checks.yaml) and local runs
+# use the same linter.
+GOLANGCI_LINT_VERSION ?= v2.15.0
+
+# golangci-lint needs a newer Go than go.mod asks for, so the toolchain download
+# is allowed explicitly: actions/setup-go v6+ and the golang images export
+# GOTOOLCHAIN=local. The linter is built for the host (GOOS/GOARCH cleared) but
+# always analyses the Linux build, the only one the driver ships; elsewhere the
+# *_linux.go files (the real netlink path among them) would go unlinted.
+lint:
+	GOOS= GOARCH= GOTOOLCHAIN=auto go run -exec 'env GOOS=linux' \
+		github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION) run ./...
 
 # kind-load: build dev image and load it into the kind cluster.
 # Uses the mock Dockerfile: kind nodes have no CXI hardware, so the driver runs

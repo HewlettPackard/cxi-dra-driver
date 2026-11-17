@@ -276,24 +276,46 @@ Every field is a hard cap enforced by the kernel's per-service quota **except** 
 
 This repository sits at the bottom of a two-repository test pyramid:
 
-1. **Unit tests** (this repo, `go test ./...`) — fast, offline, no cluster or hardware. Cover `internal/driver` (state machines: claim binding, consumable-capacity publishing, VNI allocation), `internal/cdi` (spec generation, config parsing, hook installation), `internal/cni` (`ADD`/`DEL`/`CHECK` orchestration with fakes, the IPAM delegate contract, and — Linux root only — real netlink), `internal/netsysfs` (synthetic tree construction), and `cmd/cxi-cdi-hook` (ldcache refresh logic). Run automatically in CI (`.github/workflows/build.yaml`).
+1. **Unit tests** (this repo, `go test ./...`) — fast, offline, no cluster or hardware. Cover `internal/driver` (state machines: claim binding, consumable-capacity publishing, VNI allocation), `internal/cdi` (spec generation, config parsing, hook installation), `internal/cni` (`ADD`/`DEL`/`CHECK` orchestration with fakes, the IPAM delegate contract, and — Linux root only — real netlink), `internal/netsysfs` (synthetic tree construction), and `cmd/cxi-cdi-hook` (ldcache refresh logic). Run automatically in CI (`.github/workflows/pr-checks.yaml` before merge, `.github/workflows/build.yaml` on the public repository).
 2. **Integration / end-to-end tests** (sibling `cxi-dra-integration-tests` repo, not present in this workspace by default) — deploy this driver's built image to a live Kubernetes cluster and exercise `internal/nri`, the real (`tags cxi`) hardware path of `internal/cxi`, and the full pod-lifecycle flow from §3. This repo's own CI **cannot** run these — there is no live-cluster access from GitHub Actions.
 
 There is no in-repo `examples/` directory or smoke-test harness; `deploy/kubernetes/test/` (a sample `ResourceClaim` + pod) plays that role for manual verification during development, not as an automated example suite.
 
 ## 15. CI/CD pipeline
 
-`.github/workflows/build.yaml` runs on every push to `main` (no path filter, so every merge publishes), every `v*` tag, manual dispatch, and every PR touching `Dockerfile`, `Dockerfile.mock`, `.dockerignore`, the workflow itself, `go.mod`, `go.sum`, `cmd/**`, or `internal/**`, as three jobs:
+CI spans two GitHub instances that share one `main`. Development happens on the internal mirror (`github.hpe.com/hpe/cxi-dra-driver`); every merge there is pushed to the public repository (`github.com/HewlettPackard/cxi-dra-driver`), which builds and publishes the image and chart. Every workflow file exists on both sides and is gated to one of them:
 
-1. **`check`** — checkout, set up Go (version read from `go.mod`), `go vet ./...`, `go test ./...` (untagged build, so no libcxi needed). `golangci-lint` is **not** run in CI.
-2. **`build`** — a matrix of one native job per architecture (`linux/amd64` on `ubuntu-24.04`, `linux/arm64` on `ubuntu-24.04-arm`, no QEMU), each running a Docker Buildx build of `Dockerfile` with GitHub Actions layer caching scoped per arch. Pushes log in to `ghcr.io` with `GITHUB_TOKEN` and push by digest; PRs build without pushing.
-3. **`merge`** — push events only. Combines the per-arch digests into one multi-arch manifest list on `ghcr.io/hewlettpackard/cxi-dra-driver`, tagged with the short commit SHA (immutable) and the branch (`main`, moving), plus semver tags for `v*` git tags (`docker/metadata-action`). It never applies the official version tag.
+| Workflow | Runs on | Trigger | Purpose |
+|----------|---------|---------|---------|
+| `pr-checks.yaml` | internal | PR to `main` | `go vet`, `make lint`, `go test ./...` |
+| `sync-public.yaml` | internal | push to `main` | push `main` to the public repository |
+| `build.yaml` | public | push to `main`, `v*` tag, manual; PR (`check` only) | `go vet`, `make lint`, `go test ./...`; image build and publish except on PRs |
+| `release-chart.yaml` | public | PR, after `Build` on `main`, manual | Helm chart lint and release |
+
+**Public-only workflows** carry `if: github.repository == 'HewlettPackard/cxi-dra-driver'` on their entry job (`check`, `lint`); the jobs that `need` it are skipped along with it. The internal instance has no GitHub-hosted runners, so without the guard those jobs would queue there until they timed out; with it the run concludes as skipped.
+
+**Internal-only workflows** follow the `create-runner` pattern: a `create-runner` job calls `hpc-sw/create_runners/.github/workflows/create_runners.yaml@master`, which provisions an ephemeral VM and registers it as a runner (it needs the `WORKFLOW` repo secret and optionally `GCP_SA_KEY`), and the working job `needs` it and runs on `['${{ needs.create-runner.outputs.runner_name }}', 'ignore']`. `create-runner` is guarded by `if: github.repository == 'hpe/cxi-dra-driver'`, but that guard is not enough on the public side: github.com cannot resolve the `hpc-sw` reusable workflow, so a triggered run fails at startup, before any `if:` is evaluated, and mails every watcher that no jobs were run. Each internal-only workflow must therefore be disabled once on the public repository (the setting persists across syncs), including any added later, after its first sync:
+
+```bash
+gh workflow disable sync-public.yaml -R HewlettPackard/cxi-dra-driver
+gh workflow disable pr-checks.yaml -R HewlettPackard/cxi-dra-driver
+```
+
+`.github/workflows/pr-checks.yaml` is the pre-merge gate. On every PR to `main` it runs `go vet ./...`, `make lint` and `go test ./...` in one job (so the three share a build cache) on a `small` ephemeral VM; `make lint` runs `golangci-lint` at the version pinned in the `Makefile`.
+
+`.github/workflows/sync-public.yaml` runs on every push to internal `main` and pushes it to the public repository's `main` over SSH with the `PUBLIC_REPO_DEPLOY_KEY` deploy key, using pinned GitHub host keys and falling back to `ssh.github.com:443` when port 22 is blocked. It is a plain fast-forward push, so it is rejected if the public `main` has commits the internal one lacks.
+
+`.github/workflows/build.yaml` runs on every push to `main` (no path filter, so every merge publishes), every `v*` tag, manual dispatch, and every PR touching `Dockerfile`, `Dockerfile.mock`, `.dockerignore`, the workflow itself, `go.mod`, `go.sum`, `cmd/**`, or `internal/**`. Pull requests run `check` only; the image is built once the change is on `main`. The three jobs:
+
+1. **`check`** — checkout, set up Go (version read from `go.mod`), `go vet ./...`, `make lint`, `go test ./...` (untagged build, so no libcxi needed).
+2. **`build`** — not run for pull requests. A matrix of one native job per architecture (`linux/amd64` on `ubuntu-24.04`, `linux/arm64` on `ubuntu-24.04-arm`, no QEMU), each running a Docker Buildx build of `Dockerfile` with GitHub Actions layer caching scoped per arch, logging in to `ghcr.io` with `GITHUB_TOKEN` and pushing by digest.
+3. **`merge`** — not run for pull requests. Combines the per-arch digests into one multi-arch manifest list on `ghcr.io/hewlettpackard/cxi-dra-driver`, tagged with the short commit SHA (immutable) and the branch (`main`, moving), plus semver tags for `v*` git tags (`docker/metadata-action`). It never applies the official version tag.
 
 `Dockerfile` is self-contained (it builds libcxi from pinned SHS sources and also builds `cxi-cdi-hook` and `slingshot-cni`), so nothing is staged in `bin/` first. `Dockerfile.mock` is the no-hardware image for kind and is not built by this workflow.
 
-`.github/workflows/release-chart.yaml` handles the Helm chart and the official image version. A `lint` job (`helm lint` plus `helm template` for the DaemonSet default, a Deployment with an alternate driver name, and the CNI templates) runs on PRs touching `deploy/helm/**`. The `release` job runs via `workflow_run` after `Build` succeeds on `main` (so the short-SHA image for that commit exists) and is a no-op when the git tag `cxi-dra-driver-<chart version>` already exists. Otherwise it retags `ghcr.io/hewlettpackard/cxi-dra-driver:<short-sha>` as `:<appVersion>` (skipped if that tag already exists — version tags are immutable), pushes the chart to `oci://ghcr.io/hewlettpackard/charts/cxi-dra-driver`, and creates the GitHub release. Cutting a release therefore means bumping `version` (and `appVersion` for a new driver image) in `Chart.yaml` and merging. Both workflows authenticate with `GITHUB_TOKEN`; no repository secrets or variables are required.
+`.github/workflows/release-chart.yaml` handles the Helm chart and the official image version. A `lint` job (`helm lint` plus `helm template` for the DaemonSet default, a Deployment with an alternate driver name, and the CNI templates) runs on PRs touching `deploy/helm/**`. The `release` job runs via `workflow_run` after `Build` succeeds on `main` (so the short-SHA image for that commit exists) and is a no-op when the git tag `cxi-dra-driver-<chart version>` already exists. Otherwise it retags `ghcr.io/hewlettpackard/cxi-dra-driver:<short-sha>` as `:<appVersion>` (skipped if that tag already exists — version tags are immutable), pushes the chart to `oci://ghcr.io/hewlettpackard/charts/cxi-dra-driver`, and creates the GitHub release. Cutting a release therefore means bumping `version` (and `appVersion` for a new driver image) in `Chart.yaml` and merging. `build.yaml` and `release-chart.yaml` authenticate with `GITHUB_TOKEN`; no repository secrets or variables are required on the public side.
 
-The `check` job is the only automated correctness gate; the image build does not run any tests inside the container.
+`pr-checks.yaml` (before merge) and `build.yaml`'s `check` job (after the sync, and on public PRs) are the only automated correctness gates and run the same three commands; the image build does not run any tests inside the container.
 
 ## 16. Historical note
 
