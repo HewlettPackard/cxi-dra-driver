@@ -36,9 +36,14 @@ permissions:
   contents: read
 
 jobs:
+  # Public GitHub only, for the same reason as build.yaml's `check` job: the
+  # internal mirror has no hosted runners. `release` needs this job and is
+  # skipped along with it.
   lint:
     name: Lint and template
-    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    if: >-
+      github.repository == 'HewlettPackard/cxi-dra-driver' &&
+      (github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success')
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout

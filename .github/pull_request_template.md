@@ -10,7 +10,7 @@
 
 - [ ] `go test ./...`
 - [ ] `make vet`
-- [ ] `golangci-lint run` (local only; not run in CI)
+- [ ] `make lint`
 - [ ] `make image` or `make build` (describe on PR), if this touches `internal/cxi`'s `_cgo.go` files
 - [ ] Verified against `cxi-dra-integration-tests`
 

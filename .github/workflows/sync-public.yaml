@@ -1,5 +1,10 @@
 name: Sync public repository
 
+# Internal (github.hpe.com) only. Keep this workflow disabled on the public
+# repository (`gh workflow disable sync-public.yaml -R HewlettPackard/cxi-dra-driver`):
+# github.com cannot resolve the hpc-sw reusable workflow, so a triggered run
+# fails at startup, before the `if:` below is evaluated, and mails every
+# watcher that no jobs were run.
 on:
   push:
     branches: [main]

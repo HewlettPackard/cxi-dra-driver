@@ -37,6 +37,7 @@ make build-mock    # CGO_ENABLED=0 — no libcxi required, for kind/local dev
 make build-hook    # cxi-cdi-hook is always CGO-free regardless of driver build mode
 make build-cni     # slingshot-cni is always CGO-free; honours GOARCH (the image builds it itself)
 make vet           # go vet ./...
+make lint          # golangci-lint at the version pinned in the Makefile, against the Linux build on any host
 make image         # production container build: self-contained multi-stage Dockerfile (builds libcxi from pinned SHS sources, driver, cxi-cdi-hook, slingshot-cni; Debian runtime; amd64/arm64)
 make image-mock    # no-hardware image from Dockerfile.mock (used by make kind-load / deploy/kind/setup.sh)
 ```
@@ -45,10 +46,10 @@ make image-mock    # no-hardware image from Dockerfile.mock (used by make kind-l
 
 ```bash
 go test ./...              # unit tests across internal/cdi, internal/cni, internal/driver, internal/netsysfs, cmd/cxi-cdi-hook
-golangci-lint run          # lint; not run in CI
+make lint                  # lint; also run in CI
 ```
 
-CI (`.github/workflows/build.yaml`) runs `go vet` and `go test ./...`, then builds the image natively per architecture and merges a multi-arch manifest to ghcr (tagged by short commit SHA and `main`); it does **not** run `golangci-lint`. `.github/workflows/release-chart.yaml` lints/templates and publishes the Helm chart and is the only place the official image version tag (chart `appVersion`) is applied. `internal/cxi` and `internal/nri` have no unit tests (hardware/cluster-dependent; exercised via `mock.go` and the sibling `cxi-dra-integration-tests` repo). `internal/cni`'s real-netlink tests (`network_linux_test.go`) need Linux + root and skip otherwise — run them via a privileged container from a non-Linux workstation (see [docs/cni/cni-plugin.md](../docs/cni/cni-plugin.md) § Testing); its orchestration and IPAM-delegate tests run anywhere.
+CI spans two GitHub instances that share `main`. On the internal mirror (`github.hpe.com/hpe/cxi-dra-driver`), `.github/workflows/pr-checks.yaml` runs `go vet`, `make lint` and `go test ./...` on every PR to `main`, and `sync-public.yaml` pushes each merge to the public repository; both run on an ephemeral VM through the `create-runner` pattern. On the public repository (`github.com/HewlettPackard/cxi-dra-driver`), `.github/workflows/build.yaml` runs `go vet`, `make lint` and `go test ./...`, then builds the image natively per architecture and merges a multi-arch manifest to ghcr (tagged by short commit SHA and `main`). `.github/workflows/release-chart.yaml` lints/templates and publishes the Helm chart and is the only place the official image version tag (chart `appVersion`) is applied. See [ARCHITECTURE.md](../ARCHITECTURE.md) § CI/CD pipeline for how each workflow is gated to its side. `internal/cxi` and `internal/nri` have no unit tests (hardware/cluster-dependent; exercised via `mock.go` and the sibling `cxi-dra-integration-tests` repo). `internal/cni`'s real-netlink tests (`network_linux_test.go`) need Linux + root and skip otherwise — run them via a privileged container from a non-Linux workstation (see [docs/cni/cni-plugin.md](../docs/cni/cni-plugin.md) § Testing); its orchestration and IPAM-delegate tests run anywhere.
 
 ## Critical anti-patterns
 
@@ -111,3 +112,4 @@ Report vulnerabilities per [SECURITY.md](../SECURITY.md). Treat `internal/driver
 | A notable user-facing change | `CHANGELOG.md` |
 | RBAC, `DeviceClass`, or admission-policy content (incl. the VNI allocator Lease name `<driverName>-vni-allocator-leader`) | both `deploy/helm/cxi-dra-driver/` and `deploy/kubernetes/` (and `deploy/kind/test-vni.sh`) |
 | `Dockerfile` libcxi pins, bundled ldconfig runtime, or build workflows | `README.md` § Building, `ARCHITECTURE.md` § CI/CD pipeline |
+| Add a workflow | Gate it to one side: public-only jobs get the `github.repository == 'HewlettPackard/cxi-dra-driver'` guard; internal-only workflows use the `create-runner` pattern and must be disabled on the public repository (`gh workflow disable <file> -R HewlettPackard/cxi-dra-driver`). Update `ARCHITECTURE.md` § CI/CD pipeline |

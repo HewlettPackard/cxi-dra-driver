@@ -7,7 +7,7 @@
 
 ## Before opening a PR
 
-- Run `go test ./...`, `make vet`, and `golangci-lint run`. CI (`.github/workflows/build.yaml`) enforces only `go vet` and `go test`; `golangci-lint` is a local check, so run it yourself.
+- Run `go test ./...`, `make vet`, and `make lint` (golangci-lint at the version pinned in the `Makefile`). CI runs the same three on pull requests: `.github/workflows/pr-checks.yaml` internally, `.github/workflows/build.yaml` on the public repository.
 - If your change touches `internal/cxi`'s `_cgo.go` files, check that `make image` still builds (it compiles libcxi from pinned SHS sources in-container), or run `make build` on a Slingshot node with libcxi headers, or note in the PR that neither was possible.
 - If your change affects pod lifecycle behavior (`internal/driver`, `internal/nri`, `internal/cdi`), verify it against the sibling `cxi-dra-integration-tests` suite — this repo's own CI cannot reach a live cluster.
 - Use `.github/pull_request_template.md` to structure the description.
