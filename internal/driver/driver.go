@@ -339,6 +339,7 @@ func (d *Driver) Run(ctx context.Context) error {
 		kubeletplugin.DriverName(d.driverName),
 		kubeletplugin.PluginDataDirectoryPath(d.pluginDir),
 		kubeletplugin.RegistrarDirectoryPath(d.registrarDir),
+		kubeletplugin.HealthService(false),
 	}
 	if d.podUID != "" {
 		opts = append(opts, kubeletplugin.RollingUpdate(types.UID(d.podUID)))
@@ -382,4 +383,9 @@ func (d *Driver) Run(ctx context.Context) error {
 // (e.g. ResourceSlice controller failures).
 func (d *Driver) HandleError(_ context.Context, err error, msg string) {
 	d.logf("background error: %s: %v", msg, err)
+}
+
+// WatchHealthStatus reports that the driver does not provide device health.
+func (d *Driver) WatchHealthStatus(_ context.Context, _ chan<- kubeletplugin.DeviceHealthReport) error {
+	return kubeletplugin.ErrHealthNotSupported
 }

@@ -7,7 +7,7 @@ CONTAINER_CLI ?= $(shell command -v docker 2>/dev/null || command -v podman-hpc 
 # BUILD_ARGS is passed through to the container build. Use it to redirect the
 # base images at an internal mirror on air-gapped sites, or on a machine
 # without Docker Hub credentials:
-#   make image BUILD_ARGS='--build-arg GO_IMAGE=mirror.gcr.io/library/golang:1.24-bookworm \
+#   make image BUILD_ARGS='--build-arg GO_IMAGE=mirror.gcr.io/library/golang:1.26-bookworm \
 #                          --build-arg RUNTIME_IMAGE=mirror.gcr.io/library/debian:bookworm-slim'
 BUILD_ARGS ?=
 

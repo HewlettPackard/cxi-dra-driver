@@ -1,13 +1,29 @@
 package driver
 
 import (
+	"context"
+	"errors"
 	"strings"
 	"testing"
 
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/dynamic-resource-allocation/kubeletplugin"
 
 	"github.com/HewlettPackard/cxi-dra-driver/internal/cxi"
 )
+
+var _ kubeletplugin.DRAPlugin = (*Driver)(nil)
+
+func TestWatchHealthStatusNotSupported(t *testing.T) {
+	reports := make(chan kubeletplugin.DeviceHealthReport, 1)
+	err := newDriverForTest().WatchHealthStatus(context.Background(), reports)
+	if !errors.Is(err, kubeletplugin.ErrHealthNotSupported) {
+		t.Fatalf("WatchHealthStatus() error = %v, want ErrHealthNotSupported", err)
+	}
+	if len(reports) != 0 {
+		t.Fatalf("WatchHealthStatus() sent %d reports, want none", len(reports))
+	}
+}
 
 // newDriverForTest returns a Driver with just the pending map initialised —
 // the only state checkAndAddPending, RemovePending, and reconcileClaimDevices

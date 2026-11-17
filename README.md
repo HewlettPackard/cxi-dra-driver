@@ -73,7 +73,7 @@ MutatingAdmissionPolicy (in-process in API server)
 - For [SR-IOV VF mode](#sr-iov-vf-mode): parents and VFs provisioned on the nodes before the driver starts, and an SHS release later than 15.0.0 (15.0.0 is not supported for VF mode)
 - Container runtime with CDI and NRI support (containerd ≥ 2.0)
 - NRI enabled in containerd config (see below)
-- Docker or Podman (to build the image); Go 1.24+ only if building the binary outside a container
+- Docker or Podman (to build the image); Go 1.26+ only if building the binary outside a container
 
 ## Building
 
@@ -99,7 +99,7 @@ well as on a Slingshot node, for either architecture.
 On a machine with no Docker Hub access, redirect the base images:
 
 ```bash
-make image BUILD_ARGS='--build-arg GO_IMAGE=mirror.gcr.io/library/golang:1.24-bookworm \
+make image BUILD_ARGS='--build-arg GO_IMAGE=mirror.gcr.io/library/golang:1.26-bookworm \
                        --build-arg RUNTIME_IMAGE=mirror.gcr.io/library/debian:bookworm-slim'
 ```
 

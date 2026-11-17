@@ -16,8 +16,8 @@
 
 # Base images are build args so an air-gapped Slingshot site (or a laptop
 # without Docker Hub credentials) can point them at an internal mirror, e.g.
-#   --build-arg GO_IMAGE=mirror.gcr.io/library/golang:1.24-bookworm
-ARG GO_IMAGE=golang:1.24-bookworm
+#   --build-arg GO_IMAGE=mirror.gcr.io/library/golang:1.26-bookworm
+ARG GO_IMAGE=golang:1.26-bookworm
 ARG RUNTIME_IMAGE=debian:bookworm-slim
 
 FROM ${GO_IMAGE} AS libcxi-build
