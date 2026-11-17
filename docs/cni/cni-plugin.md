@@ -212,6 +212,6 @@ Prerequisites on each node:
 To run the root-gated tests from a non-Linux workstation:
 
 ```bash
-podman run --rm --privileged -v "$PWD":/src -w /src golang:1.24-alpine \
+podman run --rm --privileged -v "$PWD":/src -w /src golang:1.26-alpine \
   go test ./internal/cni/
 ```

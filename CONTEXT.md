@@ -6,7 +6,7 @@ This repository implements the **CXI DRA driver** — a Kubernetes Dynamic Resou
 
 | Layer | Technology |
 |-------|-----------|
-| Language | Go 1.24 |
+| Language | Go 1.26 |
 | Kubernetes API | `resource.k8s.io/v1` (DRA), `k8s.io/dynamic-resource-allocation` kubelet plugin framework |
 | Hardware integration | CGO bindings to libcxi (`tags cxi` build); CDI (Container Device Interface); NRI (Node Resource Interface) via containerd |
 | Deployment | Helm chart (`deploy/helm/cxi-dra-driver`, recommended) or raw manifests (`deploy/kubernetes/`) |

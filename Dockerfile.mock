@@ -11,7 +11,7 @@
 # The production image is Dockerfile -- it builds libcxi from source and needs
 # no host libraries, so it also builds fine on a laptop.
 
-ARG GO_IMAGE=golang:1.24-alpine
+ARG GO_IMAGE=golang:1.26-alpine
 ARG RUNTIME_IMAGE=alpine:3.21
 
 FROM ${GO_IMAGE} AS builder
