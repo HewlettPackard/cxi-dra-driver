@@ -57,7 +57,7 @@ See [values.yaml](values.yaml) for the full set. Most-used:
 | `workload.kind` | `DaemonSet` | `DaemonSet` or `Deployment` |
 | `workload.replicas` | `10` | Deployment replica count |
 | `workload.antiAffinity.enabled` | `true` | spread pods onto distinct nodes |
-| `image.repository` / `image.tag` | `ghcr.io/hewlettpackard/cxi-dra-driver` / `""` (= `appVersion`, `0.0.1`) | driver image; the version tag is immutable and applied at chart release. Every build of `main` is also tagged with its commit sha (and `main`), set one as `image.tag` to run an unreleased build |
+| `image.repository` / `image.tag` | `ghcr.io/hewlettpackard/cxi-dra-driver` / `""` (= `appVersion`, `0.1.0`) | driver image; the version tag is immutable and applied at chart release. Every build of `main` is also tagged with its commit sha (and `main`), set one as `image.tag` to run an unreleased build |
 | `namespace` | `kube-system` | driver components namespace |
 | `priorityClassName` | `system-node-critical` | set `""` if installing outside kube-system |
 | `driver.vniRange.start/end` | `100`/`300` | per-namespace VNI pool |

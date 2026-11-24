@@ -80,7 +80,7 @@ MutatingAdmissionPolicy (in-process in API server)
 CI publishes multi-arch (`linux/amd64` + `linux/arm64`) images to
 `ghcr.io/hewlettpackard/cxi-dra-driver` on every merge to `main` (tagged with
 the short commit sha and `main`), and the chart release workflow promotes one
-of those to the official version tag (the chart's `appVersion`, e.g. `0.0.1`),
+of those to the official version tag (the chart's `appVersion`, e.g. `0.1.0`),
 so most users never need to build anything.
 
 ### Container image (recommended)
@@ -207,7 +207,7 @@ Most-used values (full list in the [chart README](deploy/helm/cxi-dra-driver/REA
 | `driverName` | `cxi.slingshot.hpe.com` | DRA driver name; drives every owned object name |
 | `workload.kind` | `DaemonSet` | `DaemonSet` (one pod per node) or `Deployment` |
 | `workload.replicas` | `10` | replica count (Deployment only) |
-| `image.repository` / `image.tag` | `ghcr.io/hewlettpackard/cxi-dra-driver` / `""` (= chart `appVersion`, `0.0.1`) | driver image; the version tag is immutable and applied at chart release. Set a commit-sha tag (or `main`) to run an unreleased build |
+| `image.repository` / `image.tag` | `ghcr.io/hewlettpackard/cxi-dra-driver` / `""` (= chart `appVersion`, `0.1.0`) | driver image; the version tag is immutable and applied at chart release. Set a commit-sha tag (or `main`) to run an unreleased build |
 | `driver.vniRange.start` / `.end` | `100` / `300` | per-namespace VNI pool |
 | `driver.systemSvcIDs` | `[1,2,3,4]` | blessed system services (never reaped; their usage is reserved) |
 | `admissionPolicy.excludedNamespaces` | `[kube-system]` | namespaces the policies (capacity conversion and VNI selector) ignore |
